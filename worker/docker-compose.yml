@@ -5,7 +5,7 @@ services:
     restart: unless-stopped
     environment:
       ENGINE_BASE_DIR: /app/runtime
-      LOVABLE_API_BASE: ${LOVABLE_API_BASE}
+      APP_API_BASE: ${APP_API_BASE}
       ENGINE_SERVICE_TOKEN: ${ENGINE_SERVICE_TOKEN}
       ENGINE_USER_ID: ${ENGINE_USER_ID}
     volumes:

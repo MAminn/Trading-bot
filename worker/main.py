@@ -7,13 +7,13 @@ unchanged except that BASE_DIR is now read from the `ENGINE_BASE_DIR` env var.
 
 Before delegating to live_code.main(), we monkey-patch
 `live_code.append_csv_row` so that EVERY new signal / trade / position row
-is also POSTed to the Lovable Cloud ingest endpoints. This makes the
+is also POSTed to the app ingest endpoints. This makes the
 dashboard reflect the exact decisions of the frozen engine, in real time.
 
 Required environment:
   ENGINE_BASE_DIR   = /app/runtime           (set by Dockerfile)
-  LOVABLE_API_BASE  = https://project--<id>.lovable.app
-  ENGINE_SERVICE_TOKEN = <bearer token, same value as the Lovable secret>
+  APP_API_BASE      = https://YOUR_DOMAIN_OR_SERVER_IP
+  ENGINE_SERVICE_TOKEN = <bearer token, same value as the frontend secret>
   ENGINE_USER_ID    = <Supabase auth user UUID — which account owns the signals>
 """
 from __future__ import annotations
@@ -45,6 +45,7 @@ log = logging.getLogger("worker")
 
 if __name__ == "__main__":
     attach_ingester(live_code)
-    log.info("[boot] ENGINE_BASE_DIR=%s LOVABLE_API_BASE=%s",
-             os.environ.get("ENGINE_BASE_DIR"), os.environ.get("LOVABLE_API_BASE"))
+    log.info("[boot] ENGINE_BASE_DIR=%s APP_API_BASE=%s",
+             os.environ.get("ENGINE_BASE_DIR"),
+             os.environ.get("APP_API_BASE") or os.environ.get("LOVABLE_API_BASE"))
     live_code.main()

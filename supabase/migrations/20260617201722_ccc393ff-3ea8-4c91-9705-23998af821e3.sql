@@ -1,19 +1,11 @@
-CREATE EXTENSION IF NOT EXISTS pg_cron;
-CREATE EXTENSION IF NOT EXISTS pg_net;
-
--- Remove any prior schedule with same name
-DO $$ BEGIN
+-- Hostinger deployment: old Lovable demo cron disabled.
+-- This migration previously scheduled `engine-builtin-tick` to POST to a
+-- hard-coded *.lovable.app demo-tick URL. On the Hostinger VPS the Python
+-- worker drives the engine directly, so no external cron is needed.
+-- This is now a safe no-op cleanup that only unschedules the old job if it
+-- exists and never calls any external URL.
+DO $$
+BEGIN
   PERFORM cron.unschedule('engine-builtin-tick');
-EXCEPTION WHEN OTHERS THEN NULL; END $$;
-
-SELECT cron.schedule(
-  'engine-builtin-tick',
-  '* * * * *',
-  $$
-  SELECT net.http_post(
-    url := 'https://project--e6e62973-7761-48f9-a0d1-e6b08bd22dff.lovable.app/api/public/engine/demo-tick',
-    headers := '{"Content-Type": "application/json", "apikey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlmdnZqeW1kYmhmeXhxanR2ZHlmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA5OTE2NTksImV4cCI6MjA5NjU2NzY1OX0.BcjmDsDYD1m8dosPUAIjraRIRNlenJrXrqpEXTAZEDY"}'::jsonb,
-    body := '{}'::jsonb
-  ) AS request_id;
-  $$
-);
+EXCEPTION WHEN OTHERS THEN NULL;
+END $$;
