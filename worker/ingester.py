@@ -1,9 +1,9 @@
 """
-Bridge between the frozen Python engine and the Lovable Cloud HTTP API.
+Bridge between the frozen Python engine and the app HTTP API.
 
 live_code.py writes signals/trades to local CSVs via `append_csv_row(path, row, columns)`.
 We wrap that function so that, in addition to the local write, each new row is
-POSTed to one of the Lovable `/api/public/engine/ingest.*` endpoints.
+POSTed to one of the app `/api/public/engine/ingest.*` endpoints.
 
 Mapping (by filename):
   *signal_monitor*  -> POST /api/public/engine/ingest.signal
@@ -23,7 +23,7 @@ import requests
 
 log = logging.getLogger("ingester")
 
-API_BASE = os.environ.get("LOVABLE_API_BASE", "").rstrip("/")
+API_BASE = (os.environ.get("APP_API_BASE", "") or os.environ.get("LOVABLE_API_BASE", "")).rstrip("/")
 SERVICE_TOKEN = os.environ.get("ENGINE_SERVICE_TOKEN", "")
 USER_ID = os.environ.get("ENGINE_USER_ID", "")
 TIMEOUT = float(os.environ.get("INGEST_TIMEOUT", "10"))

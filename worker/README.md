@@ -2,12 +2,13 @@
 
 This folder contains your **real** frozen trading engine
 (`engine/live_code.py` — V22_LONG + SHORT_NO_FILTER + Mandatory ML)
-packaged as a Docker container that you run **outside** Lovable.
+packaged as a Docker container that you run on the **Hostinger VPS**
+alongside the Node/TanStack Start app.
 
-Lovable Cloud (Cloudflare Workers) cannot run Python / pandas / xgboost /
+The Node app cannot run Python / pandas / xgboost /
 sklearn. That is why this lives in its own container. The container computes
 signals exactly the way your training pipeline does, then POSTs them to the
-Lovable `/api/public/engine/ingest.*` endpoints so they appear in the
+app `/api/public/engine/ingest.*` endpoints so they appear in the
 dashboard.
 
 ## Layout
@@ -23,21 +24,24 @@ worker/
     eth_feature_shortlist_outputs/
   data/                   # bundled Tardis LSR CSVs (3y of 15m account ratios)
   main.py                 # entrypoint: imports live_code, attaches ingester
-  ingester.py             # bridges append_csv_row -> Lovable HTTP ingest
+  ingester.py             # bridges append_csv_row -> app HTTP ingest
   requirements.txt
   Dockerfile
 ```
 
 ## Required environment
 
-| Var | Example | Purpose |
-|---|---|---|
-| `ENGINE_BASE_DIR` | `/app/runtime` | already set in the Dockerfile |
-| `LOVABLE_API_BASE` | `https://project--e6e62973-7761-48f9-a0d1-e6b08bd22dff.lovable.app` | where to POST signals |
-| `ENGINE_SERVICE_TOKEN` | matches the Lovable `ENGINE_SERVICE_TOKEN` secret | bearer for ingest endpoints |
-| `ENGINE_USER_ID` | your Supabase auth user UUID | which account owns the signals |
+| Var                    | Example                                            | Purpose                        |
+| ---------------------- | -------------------------------------------------- | ------------------------------ |
+| `ENGINE_BASE_DIR`      | `/app/runtime`                                     | already set in the Dockerfile  |
+| `APP_API_BASE`         | `https://YOUR_DOMAIN_OR_SERVER_IP`                 | where to POST signals          |
+| `ENGINE_SERVICE_TOKEN` | matches the frontend `ENGINE_SERVICE_TOKEN` secret | bearer for ingest endpoints    |
+| `ENGINE_USER_ID`       | your Supabase auth user UUID                       | which account owns the signals |
 
 Optional: `INGEST_TIMEOUT` (default 10s).
+
+> Backward compatibility: if `APP_API_BASE` is not set, the worker still
+> falls back to the legacy `LOVABLE_API_BASE` variable.
 
 ## Local run
 
@@ -45,7 +49,7 @@ Optional: `INGEST_TIMEOUT` (default 10s).
 cd worker
 docker build -t v22-engine .
 docker run --rm \
-  -e LOVABLE_API_BASE="https://project--e6e62973-7761-48f9-a0d1-e6b08bd22dff.lovable.app" \
+  -e APP_API_BASE="https://YOUR_DOMAIN_OR_SERVER_IP" \
   -e ENGINE_SERVICE_TOKEN="$ENGINE_SERVICE_TOKEN" \
   -e ENGINE_USER_ID="<your-uuid>" \
   v22-engine
@@ -53,40 +57,32 @@ docker run --rm \
 
 You should see the same boot logs as `live_code.py` locally
 (`🟢 Live ETHUSDT 15m V22 NEW EXPORT ENGINE up`), followed by a bar every
-15 minutes. Every signal/trade row also POSTs to Lovable; check the
+15 minutes. Every signal/trade row also POSTs to the app; check the
 dashboard's Live Signal Feed.
 
-## Deploy to Render (recommended, easiest)
+## Deploy on the Hostinger VPS
 
-1. Push this repo to GitHub.
-2. Render → **New +** → **Background Worker**.
-3. Repository = this repo, Root Directory = `worker`, Runtime = **Docker**.
-4. Environment variables: add the four vars above.
-5. Plan: Starter ($7/mo) is enough — engine is idle ~99% of each 15m.
-6. Click **Create Background Worker**. First build ≈ 5 min.
+The worker runs as a Docker Compose service on the same VPS as the Node app.
+See the repository-root `VPS_DEPLOYMENT.md` for the full architecture and
+step-by-step install. In short:
 
-To rotate artifacts later: replace files under `worker/runtime/model files/`,
-push, Render rebuilds automatically.
+1. Clone the repo to `/opt/trading-bot` on the VPS.
+2. Upload the git-ignored model/data artifacts (see
+   `ARTIFACT_UPLOAD_CHECKLIST.md`) into `worker/runtime` and `worker/data`.
+3. Create `worker/.env` from `worker/.env.example` and set `APP_API_BASE`,
+   `ENGINE_SERVICE_TOKEN`, and `ENGINE_USER_ID`.
+4. From `worker/`, run `docker compose up -d`.
 
-## Deploy to Fly.io (alternative)
-
-```bash
-cd worker
-fly launch --no-deploy --copy-config --name v22-engine
-fly secrets set \
-  LOVABLE_API_BASE="https://project--e6e62973-7761-48f9-a0d1-e6b08bd22dff.lovable.app" \
-  ENGINE_SERVICE_TOKEN="$ENGINE_SERVICE_TOKEN" \
-  ENGINE_USER_ID="<your-uuid>"
-fly deploy
-```
+To rotate artifacts later: replace the files under
+`worker/runtime/model files/` on the VPS and run `docker compose up -d --build`.
 
 ## Verifying it works
 
 After the container has been running for at least one closed 15m bar:
 
-- `docker logs` (or Render/Fly logs) shows `[BAR mode] ...` lines from
+- `docker logs` shows `[BAR mode] ...` lines from
   live_code's `log_bar_mode`.
-- Lovable dashboard's **Live Signal Feed** receives a new row per bar
+- The dashboard's **Live Signal Feed** receives a new row per bar
   (`POST /api/public/engine/ingest.signal`).
 - When the engine opens or closes a position, a row appears in
   **History** (`POST /api/public/engine/ingest.trade`).
@@ -104,5 +100,5 @@ live from Binance REST every 15m boundary.
 
 ## Cost
 
-≈ $5–7 / month on Render Starter or Fly.io. The container is mostly idle
-between bars.
+The container is mostly idle between bars and runs on the same Hostinger VPS
+as the Node app, so it adds no separate hosting cost.
