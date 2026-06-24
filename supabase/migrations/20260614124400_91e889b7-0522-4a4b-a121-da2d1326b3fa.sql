@@ -1,0 +1,1 @@
+DROP POLICY IF EXISTS "authenticated read models" ON public.model_versions;

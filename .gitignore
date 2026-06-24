@@ -1,0 +1,48 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+.output
+.vinxi
+.tanstack/**
+.nitro
+*.local
+
+# Wrangler / Cloudflare
+.wrangler/
+.dev.vars
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Python / backend (trading bot)
+.env
+backend/.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Model artifacts, datasets, and audit/log outputs (backend + worker)
+model files/
+**/model files/
+*.joblib
+*.csv
+live_audit*/
+**/live_audit*/

@@ -1,0 +1,6 @@
+
+ALTER TABLE public.engine_config
+  ADD COLUMN IF NOT EXISTS demo_mode boolean NOT NULL DEFAULT false;
+
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+CREATE EXTENSION IF NOT EXISTS pg_net;

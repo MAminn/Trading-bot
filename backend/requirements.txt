@@ -1,0 +1,8 @@
+# Runtime dependencies for live_code.py (ETHUSDT 15m live monitor)
+# Install with: pip install -r requirements.txt
+numpy
+pandas
+requests
+joblib
+scikit-learn
+xgboost
