@@ -12,4 +12,10 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  // Force-enable Nitro with the standalone Node server preset for self-hosted
+  // (Hostinger VPS) production. Without this, a non-Lovable build skips Nitro
+  // entirely and never emits a runnable Node server that listens on a port.
+  // The `node-server` preset emits `.output/server/index.mjs`, started with
+  // `node .output/server/index.mjs` (honours PORT, defaults to 3000).
+  nitro: { preset: "node-server" },
 });
