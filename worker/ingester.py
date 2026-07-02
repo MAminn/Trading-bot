@@ -3,11 +3,11 @@ Bridge between the frozen Python engine and the app HTTP API.
 
 live_code.py writes signals/trades to local CSVs via `append_csv_row(path, row, columns)`.
 We wrap that function so that, in addition to the local write, each new row is
-POSTed to one of the app `/api/public/engine/ingest.*` endpoints.
+POSTed to one of the app `/api/public/engine/ingest/*` endpoints.
 
 Mapping (by filename):
-  *signal_monitor*  -> POST /api/public/engine/ingest.signal
-  *trade_log*       -> POST /api/public/engine/ingest.trade
+  *signal_monitor*  -> POST /api/public/engine/ingest/signal
+  *trade_log*       -> POST /api/public/engine/ingest/trade
 
 Open-position snapshots are derived from the engine's in-memory state and are
 emitted from `process_one_signal_bar` via the trade_log + signal flow.
@@ -54,9 +54,9 @@ def _post(path: str, payload: Dict[str, Any]) -> None:
 def _route_for_path(path_str: str) -> Optional[str]:
     p = path_str.lower()
     if "trade_log" in p:
-        return "/api/public/engine/ingest.trade"
+        return "/api/public/engine/ingest/trade"
     if "signal_monitor" in p:
-        return "/api/public/engine/ingest.signal"
+        return "/api/public/engine/ingest/signal"
     return None
 
 
