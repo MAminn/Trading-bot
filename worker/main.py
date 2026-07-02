@@ -87,4 +87,8 @@ if __name__ == "__main__":
     log.info("[boot] ENGINE_BASE_DIR=%s APP_API_BASE=%s",
              os.environ.get("ENGINE_BASE_DIR"),
              os.environ.get("APP_API_BASE") or os.environ.get("LOVABLE_API_BASE"))
+    # Historical CSVs serialize cvd cumsum features at ~2^-16 granularity; observed
+    # max drift 1.53e-05 on multi-million-magnitude values (relative ~1e-11).
+    # Keep AUDIT_STRICT=True; widen absolute tolerance just past the quantum.
+    live_code.AUDIT_TOL = 5e-5
     live_code.main()
