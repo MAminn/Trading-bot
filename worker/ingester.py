@@ -79,6 +79,50 @@ def _normalize_row(row: Dict[str, Any], columns: Optional[List[str]]) -> Dict[st
     return out
 
 
+_DATETIME_KEYS = ("bar_time", "signal_t", "entry_t", "exit_t")
+
+
+def _to_iso_z(value: Any) -> Any:
+    """Normalize a datetime string to strict ISO-8601 UTC with 'Z' suffix.
+
+    Zod's .datetime() rejects '+00:00' offsets. Unparseable values pass through.
+    """
+    if not isinstance(value, str):
+        return value
+    from datetime import datetime, timezone
+    s = value.strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    base = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    if dt.microsecond:
+        base += "." + dt.strftime("%f")[:3]
+    return base + "Z"
+
+
+def _transform_for_route(route: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Reshape a CSV row into the payload the app's Zod schemas accept."""
+    out = dict(payload)
+    if route.endswith("/signal"):
+        if "t" in out:
+            out["bar_time"] = out.pop("t")
+        out.pop("event_json", None)
+    elif route.endswith("/trade"):
+        if "net_pnl_rate_after_round_trip_cost" in out:
+            out["net_pnl_rate"] = out.pop("net_pnl_rate_after_round_trip_cost")
+        out.pop("logged_at_utc", None)
+        out.pop("leverage_scenarios_json", None)
+    for k in _DATETIME_KEYS:
+        if k in out:
+            out[k] = _to_iso_z(out[k])
+    # Zod .optional() fields reject null; missing keys are valid.
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def attach_ingester(live_code_module) -> None:
     """Monkey-patch live_code.append_csv_row to mirror writes to Lovable."""
     original = live_code_module.append_csv_row
@@ -91,7 +135,7 @@ def attach_ingester(live_code_module) -> None:
             if route is None:
                 return
             with _lock:
-                _post(route, _normalize_row(row, columns))
+                _post(route, _transform_for_route(route, _normalize_row(row, columns)))
         except Exception as exc:  # noqa: BLE001
             log.warning("[ingest] patch error: %s", exc)
 
