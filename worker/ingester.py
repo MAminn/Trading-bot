@@ -14,9 +14,11 @@ emitted from `process_one_signal_bar` via the trade_log + signal flow.
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -30,6 +32,12 @@ TIMEOUT = float(os.environ.get("INGEST_TIMEOUT", "10"))
 
 _session = requests.Session()
 _lock = threading.Lock()
+
+HEARTBEAT_PATH = "/api/public/engine/heartbeat"
+HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "60"))
+
+_last_position = "FLAT"
+_heartbeat_started = False
 
 
 def _post(path: str, payload: Dict[str, Any]) -> None:
@@ -123,6 +131,40 @@ def _transform_for_route(route: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in out.items() if v is not None}
 
 
+def _heartbeat_loop() -> None:
+    while True:
+        try:
+            _post(HEARTBEAT_PATH, {
+                "status": "running",
+                "current_position": _last_position,
+                "message": "worker alive",
+            })
+        except Exception as exc:  # noqa: BLE001
+            log.warning("[heartbeat] error: %s", exc)
+        time.sleep(HEARTBEAT_INTERVAL)
+
+
+def _send_shutdown_heartbeat() -> None:
+    try:
+        _post(HEARTBEAT_PATH, {
+            "status": "stopped",
+            "current_position": _last_position,
+            "message": "worker shutdown",
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _start_heartbeat() -> None:
+    global _heartbeat_started
+    if _heartbeat_started:
+        return
+    _heartbeat_started = True
+    threading.Thread(target=_heartbeat_loop, name="heartbeat", daemon=True).start()
+    atexit.register(_send_shutdown_heartbeat)
+    log.info("[heartbeat] started (interval=%ss)", HEARTBEAT_INTERVAL)
+
+
 def attach_ingester(live_code_module) -> None:
     """Monkey-patch live_code.append_csv_row to mirror writes to Lovable."""
     original = live_code_module.append_csv_row
@@ -134,10 +176,16 @@ def attach_ingester(live_code_module) -> None:
             route = _route_for_path(str(path))
             if route is None:
                 return
+            if route.endswith("/signal"):
+                pos = row.get("position_after") if isinstance(row, dict) else None
+                if pos in ("FLAT", "LONG", "SHORT"):
+                    global _last_position
+                    _last_position = pos
             with _lock:
                 _post(route, _transform_for_route(route, _normalize_row(row, columns)))
         except Exception as exc:  # noqa: BLE001
             log.warning("[ingest] patch error: %s", exc)
 
     live_code_module.append_csv_row = patched
+    _start_heartbeat()
     log.info("[ingest] attached. base=%s user=%s", API_BASE or "(none)", USER_ID or "(none)")
