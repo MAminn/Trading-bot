@@ -120,10 +120,7 @@ export function heartbeatFresh(ts: string | null | undefined) {
 
 export type LiveState = "running" | "starting" | "stale" | "error" | "stopped";
 
-export function liveState(
-  s: EngineStatusRow | null | undefined,
-  isRunning?: boolean,
-): LiveState {
+export function liveState(s: EngineStatusRow | null | undefined, isRunning?: boolean): LiveState {
   if (!s) return isRunning ? "starting" : "stopped";
   if (s.status === "error") return "error";
   if (s.status === "running" && heartbeatFresh(s.last_heartbeat)) return "running";
@@ -138,10 +135,7 @@ export function useEngineStatus() {
   return useQuery({
     queryKey: ["engine", "status"],
     queryFn: async () => {
-      const { data, error } = await supabase
-        .from("engine_status")
-        .select("*")
-        .maybeSingle();
+      const { data, error } = await supabase.from("engine_status").select("*").maybeSingle();
       if (error) throw error;
       return (data as EngineStatusRow | null) ?? null;
     },
@@ -153,10 +147,7 @@ export function useEngineConfig() {
   return useQuery({
     queryKey: ["engine", "config"],
     queryFn: async () => {
-      const { data, error } = await supabase
-        .from("engine_config")
-        .select("*")
-        .maybeSingle();
+      const { data, error } = await supabase.from("engine_config").select("*").maybeSingle();
       if (error) throw error;
       return (data as EngineConfigRow | null) ?? null;
     },
@@ -175,6 +166,29 @@ export function useSignals(limit = 50) {
         .limit(limit);
       if (error) throw error;
       return (data ?? []) as SignalRow[];
+    },
+    refetchInterval: POLL,
+  });
+}
+
+/**
+ * Newest sided signal (rule_side ±1), regardless of how many flat bars have
+ * been written since. The recent-signals feed is row-limited, so the latest
+ * actionable signal can fall outside it — this query fetches it directly.
+ */
+export function useLatestActionableSignal() {
+  return useQuery({
+    queryKey: ["engine", "signals", "latest-actionable"],
+    queryFn: async () => {
+      const { data, error } = await supabase
+        .from("user_signals")
+        .select("*")
+        .in("rule_side", [1, -1])
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return (data as SignalRow | null) ?? null;
     },
     refetchInterval: POLL,
   });
@@ -218,16 +232,25 @@ export function useEngineRealtime() {
   useEffect(() => {
     const channel = supabase
       .channel("engine-feed")
-      .on("postgres_changes", { event: "*", schema: "public", table: "engine_status" },
-        () => qc.invalidateQueries({ queryKey: ["engine", "status"] }))
-      .on("postgres_changes", { event: "*", schema: "public", table: "engine_config" },
-        () => qc.invalidateQueries({ queryKey: ["engine", "config"] }))
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "user_signals" },
-        () => qc.invalidateQueries({ queryKey: ["engine", "signals"] }))
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "user_trades" },
-        () => qc.invalidateQueries({ queryKey: ["engine", "trades"] }))
-      .on("postgres_changes", { event: "*", schema: "public", table: "open_positions" },
-        () => qc.invalidateQueries({ queryKey: ["engine", "open_positions"] }))
+      .on("postgres_changes", { event: "*", schema: "public", table: "engine_status" }, () =>
+        qc.invalidateQueries({ queryKey: ["engine", "status"] }),
+      )
+      .on("postgres_changes", { event: "*", schema: "public", table: "engine_config" }, () =>
+        qc.invalidateQueries({ queryKey: ["engine", "config"] }),
+      )
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "user_signals" },
+        // Prefix match invalidates every ["engine", "signals", ...] query,
+        // including the "latest-actionable" single-row query.
+        () => qc.invalidateQueries({ queryKey: ["engine", "signals"] }),
+      )
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "user_trades" }, () =>
+        qc.invalidateQueries({ queryKey: ["engine", "trades"] }),
+      )
+      .on("postgres_changes", { event: "*", schema: "public", table: "open_positions" }, () =>
+        qc.invalidateQueries({ queryKey: ["engine", "open_positions"] }),
+      )
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
@@ -256,8 +279,20 @@ export function useUpdateConfig() {
   const qc = useQueryClient();
   const fn = useServerFn(updateEngineConfigFn);
   return useMutation({
-    mutationFn: (patch: Partial<Pick<EngineConfigRow, "capital_usd" | "capital_allocation_pct" | "leverage" | "max_daily_loss_usd" | "max_position_size_usd" | "mode" | "demo_mode">>) =>
-      fn({ data: patch }),
+    mutationFn: (
+      patch: Partial<
+        Pick<
+          EngineConfigRow,
+          | "capital_usd"
+          | "capital_allocation_pct"
+          | "leverage"
+          | "max_daily_loss_usd"
+          | "max_position_size_usd"
+          | "mode"
+          | "demo_mode"
+        >
+      >,
+    ) => fn({ data: patch }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["engine", "config"] }),
   });
 }
@@ -324,8 +359,13 @@ export function computeMetrics(trades: TradeRow[], startingCapital = 10_000): En
   sorted.forEach((t, i) => {
     const pnl = Number(t.net_pnl_rate) * startingCapital;
     equity += pnl;
-    if (pnl > 0) { wins++; grossWin += pnl; }
-    else if (pnl < 0) { losses++; grossLoss += Math.abs(pnl); }
+    if (pnl > 0) {
+      wins++;
+      grossWin += pnl;
+    } else if (pnl < 0) {
+      losses++;
+      grossLoss += Math.abs(pnl);
+    }
     peak = Math.max(peak, equity);
     const dd = ((equity - peak) / peak) * 100;
     if (dd < maxDD) maxDD = dd;
@@ -390,12 +430,12 @@ export function signalStatus(
 }
 
 export const STATUS_META: Record<SignalStatus, { label: string; cls: string }> = {
-  NO_SETUP:    { label: "NO SETUP",   cls: "bg-muted/30 text-muted-foreground" },
-  REJECTED:    { label: "ML VETO",    cls: "bg-destructive/10 text-destructive/80" },
-  ACCEPTED:    { label: "ACCEPTED",   cls: "bg-primary/15 text-primary" },
-  OPEN:        { label: "OPEN",       cls: "bg-warning/20 text-warning" },
-  CLOSED_WIN:  { label: "WIN",        cls: "bg-success/15 text-success" },
-  CLOSED_LOSS: { label: "LOSS",       cls: "bg-destructive/15 text-destructive" },
+  NO_SETUP: { label: "NO SETUP", cls: "bg-muted/30 text-muted-foreground" },
+  REJECTED: { label: "ML VETO", cls: "bg-destructive/10 text-destructive/80" },
+  ACCEPTED: { label: "ACCEPTED", cls: "bg-primary/15 text-primary" },
+  OPEN: { label: "OPEN", cls: "bg-warning/20 text-warning" },
+  CLOSED_WIN: { label: "WIN", cls: "bg-success/15 text-success" },
+  CLOSED_LOSS: { label: "LOSS", cls: "bg-destructive/15 text-destructive" },
 };
 
 /**
@@ -408,7 +448,11 @@ export function useSignalTimeline(tradeId: string | null | undefined) {
     enabled: !!tradeId,
     queryFn: async () => {
       const [sigs, opens, trades] = await Promise.all([
-        supabase.from("user_signals").select("*").eq("trade_id", tradeId!).order("created_at", { ascending: true }),
+        supabase
+          .from("user_signals")
+          .select("*")
+          .eq("trade_id", tradeId!)
+          .order("created_at", { ascending: true }),
         supabase.from("open_positions").select("*").eq("trade_id", tradeId!).maybeSingle(),
         supabase.from("user_trades").select("*").eq("trade_id", tradeId!).maybeSingle(),
       ]);
