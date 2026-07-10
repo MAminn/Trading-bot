@@ -19,6 +19,7 @@ import {
   useEngineStatus,
   useEngineConfig,
   useSignals,
+  useLatestActionableSignal,
   useTrades,
   useOpenPositions,
   useSetRunning,
@@ -48,6 +49,7 @@ function Dashboard() {
   const status = useEngineStatus();
   const config = useEngineConfig();
   const signals = useSignals(50);
+  const actionable = useLatestActionableSignal();
   const trades = useTrades(500);
   const opens = useOpenPositions();
   const eth = useLivePrice("ETHUSDT");
@@ -85,9 +87,19 @@ function Dashboard() {
       : enrichedSignals;
 
   // Newest bar (usually a flat no_signal row) vs newest actionable signal
-  // (rule_side !== 0). The Current Signal card features the actionable one.
+  // (rule_side ±1), fetched directly so it isn't limited to the feed window.
   const latestBar = enrichedSignals[0];
-  const latestActionable = enrichedSignals.find((e) => (e.sig.rule_side ?? 0) !== 0);
+  const latestActionable = actionable.data
+    ? {
+        sig: actionable.data,
+        status: signalStatus(actionable.data, {
+          open: actionable.data.trade_id ? (openByTid.get(actionable.data.trade_id) ?? null) : null,
+          trade: actionable.data.trade_id
+            ? (tradeByTid.get(actionable.data.trade_id) ?? null)
+            : null,
+        }),
+      }
+    : undefined;
   const isRunning = !!config.data?.is_running;
 
   async function toggle() {
