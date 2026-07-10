@@ -1,18 +1,40 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
 import {
-  Play, Square, ArrowUpRight, ArrowDownRight, CircleDot, Activity,
-  AlertTriangle, Cpu, Inbox,
+  Play,
+  Square,
+  ArrowUpRight,
+  ArrowDownRight,
+  CircleDot,
+  Activity,
+  AlertTriangle,
+  Cpu,
+  Inbox,
 } from "lucide-react";
 import { Sparkline } from "@/components/Sparkline";
 
 import { SignalStatusBadge } from "@/components/SignalStatusBadge";
 import { SignalTimelinePanel } from "@/components/SignalTimelinePanel";
 import {
-  useEngineStatus, useEngineConfig, useSignals, useTrades, useOpenPositions, useSetRunning,
-  useCloseAllPositions, useClosePosition,
-  computeMetrics, fmtUSD, fmtPct, fmtAgo, liveState, signalSideLabel, tradePnlUsd, signalStatus,
+  useEngineStatus,
+  useEngineConfig,
+  useSignals,
+  useTrades,
+  useOpenPositions,
+  useSetRunning,
+  useCloseAllPositions,
+  useClosePosition,
+  computeMetrics,
+  fmtUSD,
+  fmtPct,
+  fmtAgo,
+  liveState,
+  signalSideLabel,
+  tradePnlUsd,
+  signalStatus,
+  STATUS_META,
   type SignalRow,
+  type SignalStatus,
 } from "@/lib/engine";
 import { useLivePrice } from "@/lib/live-price";
 import { toast } from "sonner";
@@ -53,15 +75,19 @@ function Dashboard() {
   const enrichedSignals = (signals.data ?? []).map((s) => ({
     sig: s,
     status: signalStatus(s, {
-      open: s.trade_id ? openByTid.get(s.trade_id) ?? null : null,
-      trade: s.trade_id ? tradeByTid.get(s.trade_id) ?? null : null,
+      open: s.trade_id ? (openByTid.get(s.trade_id) ?? null) : null,
+      trade: s.trade_id ? (tradeByTid.get(s.trade_id) ?? null) : null,
     }),
   }));
-  const visibleSignals = signalFilter === "accepted"
-    ? enrichedSignals.filter((e) => e.status !== "NO_SETUP" && e.status !== "REJECTED")
-    : enrichedSignals;
+  const visibleSignals =
+    signalFilter === "accepted"
+      ? enrichedSignals.filter((e) => e.status !== "NO_SETUP" && e.status !== "REJECTED")
+      : enrichedSignals;
 
-  const lastSignal = signals.data?.[0];
+  // Newest bar (usually a flat no_signal row) vs newest actionable signal
+  // (rule_side !== 0). The Current Signal card features the actionable one.
+  const latestBar = enrichedSignals[0];
+  const latestActionable = enrichedSignals.find((e) => (e.sig.rule_side ?? 0) !== 0);
   const isRunning = !!config.data?.is_running;
 
   async function toggle() {
@@ -75,7 +101,10 @@ function Dashboard() {
 
   async function handleCloseAll() {
     const n = opens.data?.length ?? 0;
-    if (n === 0) { toast.info("No open positions to close"); return; }
+    if (n === 0) {
+      toast.info("No open positions to close");
+      return;
+    }
     if (!window.confirm(`Close all ${n} open position${n === 1 ? "" : "s"} at market?`)) return;
     try {
       const r = await closeAll.mutateAsync();
@@ -106,8 +135,12 @@ function Dashboard() {
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             Engine <span className="font-mono text-foreground">{state.toUpperCase()}</span> ·
-            heartbeat <span className="font-mono text-foreground">{fmtAgo(status.data?.last_heartbeat)}</span> ·
-            position <span className="font-mono text-foreground">{status.data?.current_position ?? "FLAT"}</span>
+            heartbeat{" "}
+            <span className="font-mono text-foreground">{fmtAgo(status.data?.last_heartbeat)}</span>{" "}
+            · position{" "}
+            <span className="font-mono text-foreground">
+              {status.data?.current_position ?? "FLAT"}
+            </span>
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -118,11 +151,15 @@ function Dashboard() {
               isRunning
                 ? "bg-destructive text-destructive-foreground"
                 : "bg-gradient-to-r from-primary to-accent text-primary-foreground"
-            }`}>
+            }`}
+          >
             {isRunning ? <Square className="h-4 w-4" /> : <Play className="h-4 w-4" />}
             {isRunning ? "Stop engine" : "Start engine"}
           </button>
-          <Link to="/app/engine" className="rounded-lg border border-border bg-card/40 px-3 py-2 text-sm hover:bg-card/70">
+          <Link
+            to="/app/engine"
+            className="rounded-lg border border-border bg-card/40 px-3 py-2 text-sm hover:bg-card/70"
+          >
             Engine →
           </Link>
         </div>
@@ -133,7 +170,9 @@ function Dashboard() {
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
           <div>
             <div className="font-medium text-warning">Engine is running but stale</div>
-            <p className="mt-0.5 text-muted-foreground">No heartbeat in the last 3 minutes — check the engine.</p>
+            <p className="mt-0.5 text-muted-foreground">
+              No heartbeat in the last 3 minutes — check the engine.
+            </p>
           </div>
         </div>
       )}
@@ -142,7 +181,9 @@ function Dashboard() {
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
           <div>
             <div className="font-medium text-destructive">Engine reported an error</div>
-            <p className="mt-0.5 text-muted-foreground">{status.data?.message ?? "See worker logs for details."}</p>
+            <p className="mt-0.5 text-muted-foreground">
+              {status.data?.message ?? "See worker logs for details."}
+            </p>
           </div>
         </div>
       )}
@@ -151,41 +192,83 @@ function Dashboard() {
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
           <div>
             <div className="font-medium">Engine stopped</div>
-            <p className="mt-0.5 text-muted-foreground">Press <strong>Start engine</strong> to flip the flag the Python worker polls. Signals appear here at the next bar close.</p>
+            <p className="mt-0.5 text-muted-foreground">
+              Press <strong>Start engine</strong> to flip the flag the Python worker polls. Signals
+              appear here at the next bar close.
+            </p>
           </div>
         </div>
       )}
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        <BigStat label="Equity" value={fmtUSD(equity)} delta={fmtPct((metrics.netPnl / capital) * 100, true)} up={metrics.netPnl >= 0} icon={<Activity className="h-4 w-4" />} />
-        <BigStat label="Today P&L" value={fmtUSD(todayPnl, true)} delta="closed today" up={todayPnl >= 0} icon={todayPnl >= 0 ? <ArrowUpRight className="h-4 w-4" /> : <ArrowDownRight className="h-4 w-4" />} />
-        <BigStat label="Win rate" value={metrics.totalTrades ? `${metrics.winRate.toFixed(1)}%` : "—"} delta={`${metrics.totalTrades} trades`} up={metrics.winRate >= 50} icon={<Activity className="h-4 w-4" />} />
-        <BigStat label="Max drawdown" value={metrics.totalTrades ? fmtPct(metrics.maxDrawdown) : "—"} delta={`PF ${Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : "∞"}`} icon={<ArrowDownRight className="h-4 w-4" />} muted />
+        <BigStat
+          label="Equity"
+          value={fmtUSD(equity)}
+          delta={fmtPct((metrics.netPnl / capital) * 100, true)}
+          up={metrics.netPnl >= 0}
+          icon={<Activity className="h-4 w-4" />}
+        />
+        <BigStat
+          label="Today P&L"
+          value={fmtUSD(todayPnl, true)}
+          delta="closed today"
+          up={todayPnl >= 0}
+          icon={
+            todayPnl >= 0 ? (
+              <ArrowUpRight className="h-4 w-4" />
+            ) : (
+              <ArrowDownRight className="h-4 w-4" />
+            )
+          }
+        />
+        <BigStat
+          label="Win rate"
+          value={metrics.totalTrades ? `${metrics.winRate.toFixed(1)}%` : "—"}
+          delta={`${metrics.totalTrades} trades`}
+          up={metrics.winRate >= 50}
+          icon={<Activity className="h-4 w-4" />}
+        />
+        <BigStat
+          label="Max drawdown"
+          value={metrics.totalTrades ? fmtPct(metrics.maxDrawdown) : "—"}
+          delta={`PF ${Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : "∞"}`}
+          icon={<ArrowDownRight className="h-4 w-4" />}
+          muted
+        />
       </div>
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="card-elevated p-6 lg:col-span-2">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-xs uppercase tracking-widest text-muted-foreground">Equity curve</div>
+              <div className="text-xs uppercase tracking-widest text-muted-foreground">
+                Equity curve
+              </div>
               <div className="mt-1 font-display text-2xl font-semibold">{fmtUSD(equity)}</div>
             </div>
-            <span className="text-xs text-muted-foreground">starting {fmtUSD(capital)} · {metrics.equityCurve.length} closed trades</span>
+            <span className="text-xs text-muted-foreground">
+              starting {fmtUSD(capital)} · {metrics.equityCurve.length} closed trades
+            </span>
           </div>
           <div className="mt-4">
             {metrics.equityCurve.length >= 2 ? (
               <Sparkline data={metrics.equityCurve.map((p) => p.v)} height={220} />
             ) : (
-              <EmptyBox icon={<Activity className="h-5 w-5" />} title="No closed trades yet" sub="Equity curve appears after the first trade closes." />
+              <EmptyBox
+                icon={<Activity className="h-5 w-5" />}
+                title="No closed trades yet"
+                sub="Equity curve appears after the first trade closes."
+              />
             )}
           </div>
         </div>
 
-        <CurrentSignalCard signal={lastSignal} live={state === "running"} />
+        <CurrentSignalCard
+          featured={latestActionable ?? latestBar}
+          latestBar={latestBar}
+          live={state === "running"}
+        />
       </div>
-
-
-
 
       <div className="grid gap-6 lg:grid-cols-3">
         <div className="card-elevated p-6 lg:col-span-2">
@@ -201,7 +284,9 @@ function Dashboard() {
                   {f === "all" ? "All" : "Accepted only"}
                 </button>
               ))}
-              <Link to="/app/history" className="text-primary hover:underline">View history →</Link>
+              <Link to="/app/history" className="text-primary hover:underline">
+                View history →
+              </Link>
               <button
                 type="button"
                 onClick={handleCloseAll}
@@ -209,7 +294,9 @@ function Dashboard() {
                 className="rounded-full border border-destructive/40 bg-destructive/10 px-3 py-1 font-medium text-destructive hover:bg-destructive/20 disabled:opacity-50"
                 title="Close every open position at market"
               >
-                {closeAll.isPending ? "Closing…" : `Close all positions${opens.data?.length ? ` (${opens.data.length})` : ""}`}
+                {closeAll.isPending
+                  ? "Closing…"
+                  : `Close all positions${opens.data?.length ? ` (${opens.data.length})` : ""}`}
               </button>
             </div>
           </div>
@@ -236,9 +323,15 @@ function Dashboard() {
                         onClick={() => s.trade_id && setTimelineId(s.trade_id)}
                         className={`hover:bg-card/40 ${s.trade_id ? "cursor-pointer" : ""}`}
                       >
-                        <td className="px-4 py-3 text-muted-foreground">{new Date(s.bar_time).toLocaleString()}</td>
+                        <td className="px-4 py-3 text-muted-foreground">
+                          {new Date(s.bar_time).toLocaleString()}
+                        </td>
                         <td className="px-4 py-3">
-                          <span className={`rounded px-1.5 py-0.5 ${side === "LONG" ? "bg-success/15 text-success" : side === "SHORT" ? "bg-destructive/15 text-destructive" : "bg-muted/20 text-muted-foreground"}`}>{side}</span>
+                          <span
+                            className={`rounded px-1.5 py-0.5 ${side === "LONG" ? "bg-success/15 font-bold text-success" : side === "SHORT" ? "bg-destructive/15 font-bold text-destructive" : "bg-muted/20 text-muted-foreground"}`}
+                          >
+                            {side}
+                          </span>
                         </td>
                         <td className="px-4 py-3 text-muted-foreground">{s.rule_reason ?? "—"}</td>
                         <td className="px-4 py-3 text-right text-muted-foreground">
@@ -269,7 +362,15 @@ function Dashboard() {
                 </tbody>
               </table>
             ) : (
-              <EmptyBox icon={<Inbox className="h-5 w-5" />} title="No signals yet" sub={state === "running" ? "Engine is running — a signal will appear at the next bar close." : "Engine is idle. Signals appear here when it's running."} />
+              <EmptyBox
+                icon={<Inbox className="h-5 w-5" />}
+                title="No signals yet"
+                sub={
+                  state === "running"
+                    ? "Engine is running — a signal will appear at the next bar close."
+                    : "Engine is idle. Signals appear here when it's running."
+                }
+              />
             )}
           </div>
         </div>
@@ -277,11 +378,17 @@ function Dashboard() {
         <div className="card-elevated p-6">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-xs uppercase tracking-widest text-muted-foreground">ETH / USDT</div>
-              <div className="mt-1 font-mono text-2xl font-semibold">
-                {eth?.price ? `$${eth.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : "—"}
+              <div className="text-xs uppercase tracking-widest text-muted-foreground">
+                ETH / USDT
               </div>
-              <div className={`text-xs ${(eth?.changePct ?? 0) >= 0 ? "text-success" : "text-destructive"}`}>
+              <div className="mt-1 font-mono text-2xl font-semibold">
+                {eth?.price
+                  ? `$${eth.price.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                  : "—"}
+              </div>
+              <div
+                className={`text-xs ${(eth?.changePct ?? 0) >= 0 ? "text-success" : "text-destructive"}`}
+              >
                 {eth ? fmtPct(eth.changePct, true) : "—"} · 24h
               </div>
             </div>
@@ -301,9 +408,22 @@ function Dashboard() {
         {metrics.totalTrades > 0 ? (
           <div className="mt-4 grid gap-3 md:grid-cols-2 lg:grid-cols-4">
             <Stat label="Win rate" value={`${metrics.winRate.toFixed(1)}%`} bar={metrics.winRate} />
-            <Stat label="Profit factor" value={Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : "∞"} bar={Math.min(100, metrics.profitFactor * 30)} />
-            <Stat label="Net P&L" value={fmtUSD(metrics.netPnl, true)} bar={Math.min(100, Math.abs(metrics.netPnl / capital) * 100)} />
-            <Stat label="Max drawdown" value={fmtPct(metrics.maxDrawdown)} bar={Math.min(100, Math.abs(metrics.maxDrawdown) * 5)} tone="warn" />
+            <Stat
+              label="Profit factor"
+              value={Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : "∞"}
+              bar={Math.min(100, metrics.profitFactor * 30)}
+            />
+            <Stat
+              label="Net P&L"
+              value={fmtUSD(metrics.netPnl, true)}
+              bar={Math.min(100, Math.abs(metrics.netPnl / capital) * 100)}
+            />
+            <Stat
+              label="Max drawdown"
+              value={fmtPct(metrics.maxDrawdown)}
+              bar={Math.min(100, Math.abs(metrics.maxDrawdown) * 5)}
+              tone="warn"
+            />
           </div>
         ) : (
           <EmptyBox title="No trades yet" sub="Metrics populate after the first closed trade." />
@@ -317,29 +437,58 @@ function Dashboard() {
   );
 }
 
-function CurrentSignalCard({ signal, live }: { signal: SignalRow | undefined; live: boolean }) {
-  if (!signal) {
+function CurrentSignalCard({
+  featured,
+  latestBar,
+  live,
+}: {
+  featured: { sig: SignalRow; status: SignalStatus } | undefined;
+  latestBar: { sig: SignalRow; status: SignalStatus } | undefined;
+  live: boolean;
+}) {
+  if (!featured) {
     return (
       <div className="card-elevated relative overflow-hidden p-6">
-        <div className="text-xs uppercase tracking-widest text-muted-foreground">Current signal</div>
+        <div className="text-xs uppercase tracking-widest text-muted-foreground">
+          Current signal
+        </div>
         <div className="mt-6">
-          <EmptyBox title="Waiting for first signal" sub={live ? "Engine running — next bar close will produce a signal." : "Engine is idle."} />
+          <EmptyBox
+            title="Waiting for first signal"
+            sub={
+              live ? "Engine running — next bar close will produce a signal." : "Engine is idle."
+            }
+          />
         </div>
       </div>
     );
   }
+  const { sig: signal } = featured;
   const side = signalSideLabel(signal);
-  const accepted = signal.ml_accept !== false && signal.valid_next_entry !== false && side !== "FLAT";
-  const tone = !accepted ? "warn" : side === "LONG" ? "success" : side === "SHORT" ? "destructive" : "muted";
-  const label = !accepted ? "VETO" : side === "LONG" ? "BUY" : side === "SHORT" ? "SELL" : "FLAT";
-  const color = tone === "success" ? "text-success" : tone === "destructive" ? "text-destructive" : tone === "warn" ? "text-warning" : "text-muted-foreground";
+  // NO SETUP: flat bar (rule_side === 0). VETO: sided setup rejected by ML.
+  const isFlat = side === "FLAT";
+  const vetoed = !isFlat && signal.ml_accept === false;
+  const label = isFlat ? "NO SETUP" : vetoed ? "VETO" : side === "LONG" ? "BUY" : "SELL";
+  const color = isFlat
+    ? "text-muted-foreground"
+    : vetoed
+      ? "text-warning"
+      : side === "LONG"
+        ? "text-success"
+        : "text-destructive";
+  const showLatestBar = latestBar && latestBar.sig.id !== signal.id;
 
   return (
     <div className="card-elevated relative overflow-hidden p-6">
-      <div className="absolute -right-12 -top-12 h-44 w-44 rounded-full bg-success/20 blur-3xl" aria-hidden />
+      <div
+        className="absolute -right-12 -top-12 h-44 w-44 rounded-full bg-success/20 blur-3xl"
+        aria-hidden
+      />
       <div className="relative">
         <div className="flex items-center justify-between">
-          <div className="text-xs uppercase tracking-widest text-muted-foreground">Current signal</div>
+          <div className="text-xs uppercase tracking-widest text-muted-foreground">
+            Current signal
+          </div>
           {live && (
             <span className="inline-flex items-center gap-1.5 rounded-full border border-success/30 bg-success/10 px-2 py-0.5 text-[10px] font-medium text-success">
               <span className="live-dot h-1 w-1 rounded-full bg-success" /> LIVE
@@ -348,19 +497,40 @@ function CurrentSignalCard({ signal, live }: { signal: SignalRow | undefined; li
         </div>
         <div className="mt-4 flex items-baseline gap-3">
           <CircleDot className={`h-6 w-6 ${color}`} />
-          <div className={`font-display text-5xl font-semibold ${color}`}>{label}</div>
+          <div
+            className={`font-display font-semibold ${isFlat ? "text-4xl" : "text-5xl"} ${color}`}
+          >
+            {label}
+          </div>
         </div>
         <div className="mt-1 font-mono text-xs text-muted-foreground">
-          confidence {signal.ml_prob != null ? Number(signal.ml_prob).toFixed(2) : "—"} · {fmtAgo(signal.bar_time)}
+          confidence {signal.ml_prob != null ? Number(signal.ml_prob).toFixed(2) : "—"} ·{" "}
+          {fmtAgo(signal.bar_time)}
         </div>
+        {showLatestBar && (
+          <div className="mt-2 font-mono text-xs text-muted-foreground">
+            Latest bar: {STATUS_META[latestBar.status].label} · {fmtAgo(latestBar.sig.bar_time)}
+          </div>
+        )}
         <div className="mt-6 space-y-3">
           <Row label="Reason" value={signal.rule_reason ?? "—"} />
-          <Row label="Threshold" value={signal.ml_threshold != null ? Number(signal.ml_threshold).toFixed(2) : "—"} />
-          <Row label="Position" value={`${signal.position_before ?? "?"} → ${signal.position_after ?? "?"}`} />
+          <Row
+            label="Threshold"
+            value={signal.ml_threshold != null ? Number(signal.ml_threshold).toFixed(2) : "—"}
+          />
+          <Row
+            label="Position"
+            value={`${signal.position_before ?? "?"} → ${signal.position_after ?? "?"}`}
+          />
           {signal.opened && <Row label="Opened" value={signal.opened} valueClass="text-success" />}
-          {signal.closed_reason && <Row label="Closed" value={signal.closed_reason} valueClass="text-muted-foreground" />}
+          {signal.closed_reason && (
+            <Row label="Closed" value={signal.closed_reason} valueClass="text-muted-foreground" />
+          )}
         </div>
-        <Link to="/app/history" className="mt-6 block w-full rounded-lg border border-border bg-card/60 py-2 text-center text-sm font-medium hover:bg-card">
+        <Link
+          to="/app/history"
+          className="mt-6 block w-full rounded-lg border border-border bg-card/60 py-2 text-center text-sm font-medium hover:bg-card"
+        >
           View signal log →
         </Link>
       </div>
@@ -368,15 +538,37 @@ function CurrentSignalCard({ signal, live }: { signal: SignalRow | undefined; li
   );
 }
 
-function BigStat({ label, value, delta, up, icon, muted }: { label: string; value: string; delta: string; up?: boolean; icon: React.ReactNode; muted?: boolean }) {
+function BigStat({
+  label,
+  value,
+  delta,
+  up,
+  icon,
+  muted,
+}: {
+  label: string;
+  value: string;
+  delta: string;
+  up?: boolean;
+  icon: React.ReactNode;
+  muted?: boolean;
+}) {
   return (
     <div className="card-elevated p-5">
       <div className="flex items-center justify-between text-xs uppercase tracking-widest text-muted-foreground">
         <span>{label}</span>
-        <span className={muted ? "text-muted-foreground" : up ? "text-success" : "text-destructive"}>{icon}</span>
+        <span
+          className={muted ? "text-muted-foreground" : up ? "text-success" : "text-destructive"}
+        >
+          {icon}
+        </span>
       </div>
       <div className="mt-2 font-mono text-2xl font-semibold">{value}</div>
-      <div className={`mt-1 text-xs ${muted ? "text-muted-foreground" : up ? "text-success" : "text-destructive"}`}>{delta}</div>
+      <div
+        className={`mt-1 text-xs ${muted ? "text-muted-foreground" : up ? "text-success" : "text-destructive"}`}
+      >
+        {delta}
+      </div>
     </div>
   );
 }
@@ -399,7 +591,17 @@ function Mini({ label, value }: { label: string; value: string }) {
   );
 }
 
-function Stat({ label, value, bar, tone }: { label: string; value: string; bar: number; tone?: "warn" }) {
+function Stat({
+  label,
+  value,
+  bar,
+  tone,
+}: {
+  label: string;
+  value: string;
+  bar: number;
+  tone?: "warn";
+}) {
   const color = tone === "warn" ? "bg-warning" : "bg-gradient-to-r from-primary to-accent";
   return (
     <div>
@@ -408,7 +610,10 @@ function Stat({ label, value, bar, tone }: { label: string; value: string; bar: 
         <span className="font-mono font-semibold">{value}</span>
       </div>
       <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-card">
-        <div className={`h-full ${color}`} style={{ width: `${Math.min(100, Math.max(4, bar))}%` }} />
+        <div
+          className={`h-full ${color}`}
+          style={{ width: `${Math.min(100, Math.max(4, bar))}%` }}
+        />
       </div>
     </div>
   );
@@ -417,7 +622,9 @@ function Stat({ label, value, bar, tone }: { label: string; value: string; bar: 
 function EmptyBox({ title, sub, icon }: { title: string; sub?: string; icon?: React.ReactNode }) {
   return (
     <div className="flex flex-col items-center justify-center gap-2 px-6 py-10 text-center">
-      <div className="grid h-9 w-9 place-items-center rounded-full bg-card text-muted-foreground">{icon ?? <Inbox className="h-4 w-4" />}</div>
+      <div className="grid h-9 w-9 place-items-center rounded-full bg-card text-muted-foreground">
+        {icon ?? <Inbox className="h-4 w-4" />}
+      </div>
       <div className="text-sm font-medium">{title}</div>
       {sub && <div className="max-w-xs text-xs text-muted-foreground">{sub}</div>}
     </div>
