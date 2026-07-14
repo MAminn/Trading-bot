@@ -46,3 +46,4 @@ model files/
 *.csv
 live_audit*/
 **/live_audit*/
+worker/data/

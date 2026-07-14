@@ -1,9 +1,10 @@
-"""Signal consumer: polls the app for pending signals and logs order *intents*.
+"""Signal consumer: polls the app for pending signals and records order intents.
 
 Binance access is limited to one unsigned, read-only mark-price fetch
-(/fapi/v1/premiumIndex) used for sizing. Everything else goes to the app's API
-(signals/pending, config, ingest/order). Orders are computed and persisted as
-intents; nothing is placed, cancelled, or modified on any exchange.
+(/fapi/v1/premiumIndex) used for sizing plus the TESTNET_TRADE placement call.
+Everything else goes to the app's API (signals/pending, config, ingest/order,
+ingest/order_update). TESTNET_READ stays pure-read; TESTNET_TRADE records
+intents, places allowed MARKET orders, and persists the outcome.
 
 The config endpoint response contains decrypted Binance credentials, so the
 raw response is never logged; only max_position_size_usd is extracted.
