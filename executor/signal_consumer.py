@@ -35,12 +35,14 @@ class SignalConsumer:
         user_id: str,
         execution_mode: str,
         symbol: str = "ETHUSDT",
+        start_after: str | None = None,
     ):
         self._base = app_api_base.rstrip("/")
         self._user_id = user_id
         self._execution_mode = execution_mode
         self._symbol = symbol
-        self._cursor: str | None = None  # created_at of last processed signal
+        # created_at of last processed signal; optionally seeded via CONSUMER_START_AFTER
+        self._cursor: str | None = start_after
         self._cycles = 0
         self._max_position_size_usd: Decimal | None = None
         self._session = requests.Session()
