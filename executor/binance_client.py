@@ -1,8 +1,8 @@
 """Binance USD-M Futures REST client.
 
-Self-contained: uses only `requests`. Reads plus exactly two account-
-configuration writes (leverage, margin type). Order placement does not exist
-in this client — there is no /fapi/v1/order call anywhere.
+Self-contained: uses only `requests`. Reads, two account-configuration writes
+(leverage, margin type), and a single MARKET order placement. No cancel, batch,
+or other order endpoints exist in this client.
 
 The api_secret is used exclusively for HMAC signing and is never logged or
 included in exception messages.
@@ -156,8 +156,8 @@ class BinanceFuturesClient:
         return [p for p in positions if p.get("symbol") == symbol]
 
     # ------------------------------------------------------------------ #
-    # account-configuration writes — the ONLY write endpoints in this build.
-    # Order placement (/fapi/v1/order) does not exist in this client.
+    # account-configuration writes + a single MARKET order placement.
+    # No cancel, batch, or other order endpoints exist in this client.
     # ------------------------------------------------------------------ #
 
     def set_leverage(self, symbol: str, leverage: int) -> dict:
@@ -180,3 +180,20 @@ class BinanceFuturesClient:
             if exc.code == -4046:
                 return {"code": -4046, "msg": "No need to change margin type"}
             raise
+
+    def place_market_order(
+        self, symbol: str, side: str, qty, client_order_id: str
+    ) -> dict:
+        """POST /fapi/v1/order (signed) as a MARKET order. side is BUY or SELL."""
+        return self._request(
+            "POST",
+            "/fapi/v1/order",
+            {
+                "symbol": symbol,
+                "side": side,
+                "type": "MARKET",
+                "quantity": qty,
+                "newClientOrderId": client_order_id,
+            },
+            signed=True,
+        )

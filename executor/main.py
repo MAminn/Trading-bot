@@ -127,6 +127,8 @@ def run_testnet(mode: str) -> int:
         SYMBOL,
         start_after=start_after,
         risk_guard=risk_guard,
+        # Placement is enabled only in TESTNET_TRADE; read modes get no trader.
+        binance_trader=client if mode == "TESTNET_TRADE" else None,
     )
 
     def enforce_account_config() -> None:
