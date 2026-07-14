@@ -67,8 +67,9 @@ class SignalConsumer:
         self._user_id = user_id
         self._execution_mode = execution_mode
         self._symbol = symbol
-        # created_at of last processed signal; optionally seeded via CONSUMER_START_AFTER
-        self._cursor: str | None = start_after
+        # created_at of last processed signal; optionally seeded via CONSUMER_START_AFTER.
+        # Always stored in canonical Z-form — the pending route rejects +00:00 offsets.
+        self._cursor: str | None = to_z_iso(start_after) if start_after else None
         self._cycles = 0
         self._max_position_size_usd: Decimal | None = None
         self._session = requests.Session()
@@ -89,6 +90,8 @@ class SignalConsumer:
             )
         except OSError as exc:
             raise SignalConsumerError(f"GET {path} failed: {exc}") from exc
+        if resp.status_code == 400:
+            log.error("GET %s validation error (HTTP 400): %s", path, resp.text[:2000])
         if not 200 <= resp.status_code < 300:
             raise SignalConsumerError(f"GET {path} -> HTTP {resp.status_code}")
         return resp.json()
@@ -199,4 +202,5 @@ class SignalConsumer:
             self._post_order(order)
             # Advance cursor only after the intent is persisted (or confirmed duplicate)
             # so a mid-batch failure resumes from the right place next cycle.
-            self._cursor = signal["created_at"]
+            # Normalized to Z-form: the pending route rejects +00:00 offsets.
+            self._cursor = to_z_iso(signal["created_at"])
