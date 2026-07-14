@@ -1,14 +1,16 @@
-"""Signal consumer: polls the app for pending signals and logs order *intents*.
+"""Signal consumer: polls the app for pending signals and records order intents.
 
 Binance access is limited to one unsigned, read-only mark-price fetch
-(/fapi/v1/premiumIndex) used for sizing. Everything else goes to the app's API
-(signals/pending, config, ingest/order). Orders are computed and persisted as
-intents; nothing is placed, cancelled, or modified on any exchange.
+(/fapi/v1/premiumIndex) used for sizing plus the TESTNET_TRADE placement call.
+Everything else goes to the app's API (signals/pending, config, ingest/order,
+ingest/order_update). TESTNET_READ stays pure-read; TESTNET_TRADE records
+intents, places allowed MARKET orders, and persists the outcome.
 
 The config endpoint response contains decrypted Binance credentials, so the
 raw response is never logged; only max_position_size_usd is extracted.
 """
 
+import hashlib
 import logging
 import time
 from datetime import datetime, timezone
@@ -65,6 +67,7 @@ class SignalConsumer:
         symbol: str = "ETHUSDT",
         start_after: str | None = None,
         risk_guard=None,
+        binance_trader=None,
     ):
         self._base = app_api_base.rstrip("/")
         self._user_id = user_id
@@ -72,6 +75,9 @@ class SignalConsumer:
         self._symbol = symbol
         # Optional RiskGuard (trade-capable modes only); None keeps read modes pure.
         self._risk_guard = risk_guard
+        # Authenticated client for order placement; supplied ONLY in TESTNET_TRADE.
+        # None in TESTNET_READ/OFF keeps those paths free of any write calls.
+        self._binance_trader = binance_trader
         self._last_order_time: float | None = None
         # created_at of last processed signal; optionally seeded via CONSUMER_START_AFTER.
         # Always stored in canonical Z-form — the pending route rejects +00:00 offsets.
@@ -113,7 +119,9 @@ class SignalConsumer:
             "config refreshed | max_position_size_usd=%s", self._max_position_size_usd
         )
 
-    def _post_order(self, order: dict) -> None:
+    def _post_order(self, order: dict) -> bool:
+        """POST the intent. Returns True if newly created (201), False if the
+        app reports it as a duplicate (409)."""
         payload = {k: v for k, v in order.items() if v is not None}
         try:
             resp = self._session.post(
@@ -125,13 +133,34 @@ class SignalConsumer:
             raise SignalConsumerError(f"POST ingest/order failed: {exc}") from exc
         if resp.status_code == 409:
             log.info("duplicate intent, skipping | key=%s", order["idempotency_key"])
-            return
+            return False
         if resp.status_code == 400:
             log.error(
                 "ingest/order validation error (HTTP 400): %s", resp.text[:2000]
             )
         if not 200 <= resp.status_code < 300:
             raise SignalConsumerError(f"POST ingest/order -> HTTP {resp.status_code}")
+        return True
+
+    def _post_order_update(self, update: dict) -> None:
+        """POST to ingest/order_update. Failures are logged and swallowed — the
+        Binance order state is authoritative; reconciliation is a later step."""
+        payload = {k: v for k, v in update.items() if v is not None}
+        try:
+            resp = self._session.post(
+                f"{self._base}/api/public/engine/ingest/order_update",
+                json=payload,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+        except OSError as exc:
+            log.error("order_update POST failed: %s", exc)
+            return
+        if resp.status_code == 400:
+            log.error(
+                "order_update validation error (HTTP 400): %s", resp.text[:2000]
+            )
+        if not 200 <= resp.status_code < 300:
+            log.error("order_update POST -> HTTP %d", resp.status_code)
 
     # ------------------------------------------------------------------ #
     # intent computation
@@ -163,6 +192,55 @@ class SignalConsumer:
             order["status"] = "SKIPPED"
             order["error"] = "below min notional"
         return order
+
+    # ------------------------------------------------------------------ #
+    # order placement (TESTNET_TRADE only)
+    # ------------------------------------------------------------------ #
+
+    def _place_order(self, order: dict) -> None:
+        """Place a MARKET order for an allowed, newly-created intent and record
+        the result via ingest/order_update. TESTNET_TRADE only. Never retries a
+        given key (the client_order_id makes retries rejectable anyway)."""
+        idempotency_key = order["idempotency_key"]
+        # 35 chars, alphanumeric: "x" + 32 hex chars of sha256(idempotency_key).
+        client_order_id = "x" + hashlib.sha256(
+            idempotency_key.encode("utf-8")
+        ).hexdigest()[:32]
+        mapped_side = "BUY" if order["side"] == "LONG" else "SELL"
+
+        try:
+            result = self._binance_trader.place_market_order(
+                self._symbol, mapped_side, order["qty"], client_order_id
+            )
+        except (BinanceAPIError, OSError) as exc:
+            log.error("order placement failed | key=%s | %s", idempotency_key, exc)
+            self._post_order_update(
+                {
+                    "user_id": self._user_id,
+                    "idempotency_key": idempotency_key,
+                    "status": "FAILED",
+                    "error": str(exc)[:1000],
+                }
+            )
+            return
+
+        binance_id = result.get("orderId")
+        binance_status = result.get("status")
+        log.info(
+            "ORDER SENT | %s | qty=%s | binance_id=%s | status=%s",
+            order["side"],
+            order["qty"],
+            binance_id,
+            binance_status,
+        )
+        self._post_order_update(
+            {
+                "user_id": self._user_id,
+                "idempotency_key": idempotency_key,
+                "status": "FILLED" if binance_status == "FILLED" else "SENT",
+                "binance_order_id": str(binance_id) if binance_id is not None else None,
+            }
+        )
 
     # ------------------------------------------------------------------ #
     # public entrypoint
@@ -219,10 +297,14 @@ class SignalConsumer:
                 order["notional_usd"],
                 order["idempotency_key"],
             )
-            self._post_order(order)
-            if self._risk_guard is not None and order["status"] == "INTENT_LOGGED":
-                # Feed the guard's min-interval check from allowed intents only.
-                self._last_order_time = time.time()
+            created = self._post_order(order)
+            if created and order["status"] == "INTENT_LOGGED":
+                if self._risk_guard is not None:
+                    # Feed the guard's min-interval check from allowed intents only.
+                    self._last_order_time = time.time()
+                # Placement is enabled only in TESTNET_TRADE (trader supplied there).
+                if self._binance_trader is not None:
+                    self._place_order(order)
             # Advance cursor only after the intent is persisted (or confirmed duplicate)
             # so a mid-batch failure resumes from the right place next cycle.
             # Normalized to Z-form: the pending route rejects +00:00 offsets.

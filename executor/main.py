@@ -2,8 +2,7 @@
 
 Binance USD-M Futures execution service.
 Implemented modes: OFF, TESTNET_READ (read-only), TESTNET_TRADE (account
-enforcement + risk guard; order placement NOT implemented). LIVE_* modes
-refuse to start.
+enforcement + risk guard + order placement). LIVE_* modes refuse to start.
 """
 
 import logging
@@ -66,7 +65,7 @@ def _extract_filters(symbol_info: dict) -> tuple[str, str, str]:
 
 def run_testnet(mode: str) -> int:
     """Runs TESTNET_READ (pure read) and TESTNET_TRADE (read + account
-    enforcement + risk guard). Order placement is not implemented."""
+    enforcement + risk guard + order placement)."""
     from binance_client import BinanceAPIError, BinanceFuturesClient
     from signal_consumer import SignalConsumer, SignalConsumerError
 
@@ -106,7 +105,7 @@ def run_testnet(mode: str) -> int:
     log.info("executor starting | mode=%s | symbol=%s", mode, SYMBOL)
     log.info("base_url=%s (hardcoded for this mode)", TESTNET_BASE_URL)
     if mode == "TESTNET_TRADE":
-        log.info("account enforcement + risk guard active; order placement NOT implemented")
+        log.info("account enforcement + risk guard + order placement active")
     else:
         log.info("read-only mode: no write calls to Binance")
     log.info("=" * 60)
@@ -127,6 +126,8 @@ def run_testnet(mode: str) -> int:
         SYMBOL,
         start_after=start_after,
         risk_guard=risk_guard,
+        # Placement is enabled only in TESTNET_TRADE; read modes get no trader.
+        binance_trader=client if mode == "TESTNET_TRADE" else None,
     )
 
     def enforce_account_config() -> None:
