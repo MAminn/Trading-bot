@@ -2,7 +2,7 @@
 
 Self-contained: uses only `requests`. Reads plus exactly two account-
 configuration writes (leverage, margin type). Order placement does not exist
-in this client — there is no /fapi/v1/order call anywhere.
+in this client — there are no order-placement calls anywhere.
 
 The api_secret is used exclusively for HMAC signing and is never logged or
 included in exception messages.
@@ -157,7 +157,7 @@ class BinanceFuturesClient:
 
     # ------------------------------------------------------------------ #
     # account-configuration writes — the ONLY write endpoints in this build.
-    # Order placement (/fapi/v1/order) does not exist in this client.
+    # Order placement endpoints do not exist in this client (see risk rollout plan).
     # ------------------------------------------------------------------ #
 
     def set_leverage(self, symbol: str, leverage: int) -> dict:
