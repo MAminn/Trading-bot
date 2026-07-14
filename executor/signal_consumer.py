@@ -1,6 +1,7 @@
 """Signal consumer: polls the app for pending signals and logs order *intents*.
 
-This module never talks to Binance at all — it only calls the app's API
+Binance access is limited to one unsigned, read-only mark-price fetch
+(/fapi/v1/premiumIndex) used for sizing. Everything else goes to the app's API
 (signals/pending, config, ingest/order). Orders are computed and persisted as
 intents; nothing is placed, cancelled, or modified on any exchange.
 
@@ -13,6 +14,8 @@ from decimal import ROUND_DOWN, Decimal
 
 import requests
 
+from binance_client import BinanceAPIError, BinanceFuturesClient
+
 log = logging.getLogger("executor.consumer")
 
 REQUEST_TIMEOUT_SECONDS = 10
@@ -21,6 +24,12 @@ CONFIG_REFRESH_EVERY_CYCLES = 10
 STEP_SIZE = Decimal("0.001")
 MIN_NOTIONAL_USD = Decimal("20")
 NOTIONAL_CAP_USD = Decimal("100")
+
+# The execution mode determines the Binance base URL used for the unsigned
+# mark-price read — never configurable via env.
+MODE_BINANCE_BASE_URLS = {
+    "TESTNET_READ": "https://testnet.binancefuture.com",
+}
 
 
 class SignalConsumerError(Exception):
@@ -47,6 +56,10 @@ class SignalConsumer:
         self._max_position_size_usd: Decimal | None = None
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {engine_service_token}"})
+        # Credential-less client used exclusively for the unsigned mark-price read.
+        self._binance = BinanceFuturesClient(
+            MODE_BINANCE_BASE_URLS[execution_mode], "", ""
+        )
 
     # ------------------------------------------------------------------ #
     # app API helpers
@@ -124,9 +137,12 @@ class SignalConsumer:
     # public entrypoint
     # ------------------------------------------------------------------ #
 
-    def poll_once(self, mark_price) -> None:
+    def poll_once(self, mark_price=None) -> None:
         """One poll cycle: refresh config as scheduled, fetch pending signals,
-        log each as an order intent. Raises SignalConsumerError on failure."""
+        log each as an order intent. Raises SignalConsumerError on failure.
+
+        The mark_price argument is deprecated and ignored — the price is
+        fetched from /fapi/v1/premiumIndex once per cycle."""
         if self._max_position_size_usd is None or self._cycles % CONFIG_REFRESH_EVERY_CYCLES == 0:
             self._refresh_config()
         self._cycles += 1
@@ -138,14 +154,15 @@ class SignalConsumer:
         if not signals:
             return
 
+        # One mark-price fetch per cycle, before sizing anything. If it is
+        # unavailable, fail the whole cycle: nothing is posted, no signal is
+        # SKIPPED, and the cursor does not move — the unified retry logic in
+        # main.py will re-run the cycle.
         try:
-            ref_price = Decimal(str(mark_price))
-        except (TypeError, ArithmeticError):
-            ref_price = Decimal(0)
-        if ref_price <= 0:
-            raise SignalConsumerError(
-                f"no valid mark price available, cannot size {len(signals)} pending signal(s)"
-            )
+            ref_price = Decimal(str(self._binance.get_mark_price(self._symbol)))
+        except (BinanceAPIError, OSError) as exc:
+            log.error("mark price unavailable, retrying cycle")
+            raise SignalConsumerError(f"mark price fetch failed: {exc}") from exc
 
         for signal in signals:
             order = self._build_intent(signal, ref_price)
