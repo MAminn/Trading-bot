@@ -10,6 +10,7 @@ raw response is never logged; only max_position_size_usd is extracted.
 """
 
 import logging
+from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 
 import requests
@@ -34,6 +35,22 @@ MODE_BINANCE_BASE_URLS = {
 
 class SignalConsumerError(Exception):
     """Raised on any app-API failure so the caller's retry rules apply."""
+
+
+def to_z_iso(ts) -> str:
+    """Return a canonical UTC ISO 8601 string with a Z suffix.
+
+    Accepts a datetime or an ISO string (with Z or +00:00-style offset).
+    The app's Zod validator (z.string().datetime()) rejects +00:00 offsets.
+    """
+    if isinstance(ts, datetime):
+        dt = ts
+    else:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.isoformat() + "Z"
 
 
 class SignalConsumer:
@@ -88,10 +105,11 @@ class SignalConsumer:
         )
 
     def _post_order(self, order: dict) -> None:
+        payload = {k: v for k, v in order.items() if v is not None}
         try:
             resp = self._session.post(
                 f"{self._base}/api/public/engine/ingest/order",
-                json=order,
+                json=payload,
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
         except OSError as exc:
@@ -99,6 +117,10 @@ class SignalConsumer:
         if resp.status_code == 409:
             log.info("duplicate intent, skipping | key=%s", order["idempotency_key"])
             return
+        if resp.status_code == 400:
+            log.error(
+                "ingest/order validation error (HTTP 400): %s", resp.text[:2000]
+            )
         if not 200 <= resp.status_code < 300:
             raise SignalConsumerError(f"POST ingest/order -> HTTP {resp.status_code}")
 
@@ -108,7 +130,7 @@ class SignalConsumer:
 
     def _build_intent(self, signal: dict, ref_price: Decimal) -> dict:
         side = "LONG" if signal.get("rule_side") == 1 else "SHORT"
-        bar_time = signal["bar_time"]
+        bar_time = to_z_iso(signal["bar_time"])
         idempotency_key = f"{self._user_id}:{bar_time}:{side}:OPEN"
 
         notional_target = min(self._max_position_size_usd, NOTIONAL_CAP_USD)
