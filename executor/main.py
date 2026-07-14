@@ -74,67 +74,73 @@ def run_testnet_read() -> int:
 
     client = BinanceFuturesClient(TESTNET_BASE_URL, api_key, api_secret)
 
-    # Startup: clock sync, exchange info, account snapshot, positions.
-    offset = client.sync_clock()
-    log.info("clock synced | offset=%dms", offset)
+    def cycle(first_success: bool) -> None:
+        """One unified fetch cycle. Startup-only work runs until the first success."""
+        if not first_success:
+            offset = client.sync_clock()
+            log.info("clock synced | offset=%dms", offset)
 
-    symbol_info = client.get_exchange_info(SYMBOL)
-    tick_size, step_size, min_notional = _extract_filters(symbol_info)
-    log.info(
-        "%s filters | tick_size=%s | step_size=%s | min_notional=%s | "
-        "price_precision=%s | quantity_precision=%s",
-        SYMBOL,
-        tick_size,
-        step_size,
-        min_notional,
-        symbol_info.get("pricePrecision"),
-        symbol_info.get("quantityPrecision"),
-    )
+            symbol_info = client.get_exchange_info(SYMBOL)
+            tick_size, step_size, min_notional = _extract_filters(symbol_info)
+            log.info(
+                "%s filters | tick_size=%s | step_size=%s | min_notional=%s | "
+                "price_precision=%s | quantity_precision=%s",
+                SYMBOL,
+                tick_size,
+                step_size,
+                min_notional,
+                symbol_info.get("pricePrecision"),
+                symbol_info.get("quantityPrecision"),
+            )
 
-    account = client.get_account()
-    log.info(
-        "account | total_wallet_balance=%s | available_balance=%s",
-        account.get("totalWalletBalance"),
-        account.get("availableBalance"),
-    )
+        positions = client.get_positions(SYMBOL)
+        account = client.get_account()
 
-    for pos in client.get_positions(SYMBOL):
+        if not first_success:
+            log.info(
+                "account | total_wallet_balance=%s | available_balance=%s",
+                account.get("totalWalletBalance"),
+                account.get("availableBalance"),
+            )
+            for pos in positions:
+                log.info(
+                    "%s position | amt=%s | entry_price=%s | leverage=%s | margin_type=%s",
+                    SYMBOL,
+                    pos.get("positionAmt"),
+                    pos.get("entryPrice"),
+                    pos.get("leverage"),
+                    pos.get("marginType"),
+                )
+
+        pos_amt = positions[0].get("positionAmt") if positions else "0"
         log.info(
-            "%s position | amt=%s | entry_price=%s | leverage=%s | margin_type=%s",
+            "executor alive | mode=TESTNET_READ | %s pos=%s | bal=%s | clock_offset=%dms",
             SYMBOL,
-            pos.get("positionAmt"),
-            pos.get("entryPrice"),
-            pos.get("leverage"),
-            pos.get("marginType"),
+            pos_amt,
+            account.get("availableBalance"),
+            client.clock_offset_ms,
         )
 
-    # Status loop.
+    # Unified cycle loop: startup and recurring fetches share one failure counter.
+    first_success = False
     consecutive_failures = 0
     while True:
-        time.sleep(HEARTBEAT_INTERVAL_SECONDS)
         try:
-            positions = client.get_positions(SYMBOL)
-            account = client.get_account()
-            pos_amt = positions[0].get("positionAmt") if positions else "0"
-            log.info(
-                "executor alive | mode=TESTNET_READ | %s pos=%s | bal=%s | clock_offset=%dms",
-                SYMBOL,
-                pos_amt,
-                account.get("availableBalance"),
-                client.clock_offset_ms,
-            )
+            cycle(first_success)
+            first_success = True
             consecutive_failures = 0
         except (BinanceAPIError, OSError) as exc:
             consecutive_failures += 1
             log.error(
-                "status cycle failed (%d/%d consecutive): %s",
+                "cycle failed (%d/%d consecutive): %s",
                 consecutive_failures,
                 MAX_CONSECUTIVE_FAILURES,
                 exc,
             )
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                log.error("%d consecutive failures — giving up", MAX_CONSECUTIVE_FAILURES)
+                log.error("10 consecutive failed cycles — exiting")
                 return 1
+        time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
 def main() -> int:
