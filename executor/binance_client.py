@@ -1,7 +1,8 @@
-"""Read-only Binance USD-M Futures REST client.
+"""Binance USD-M Futures REST client.
 
-Self-contained: uses only `requests`. GET endpoints only — this client has no
-ability to place orders or change account state.
+Self-contained: uses only `requests`. Reads plus exactly two account-
+configuration writes (leverage, margin type). Order placement does not exist
+in this client — there is no /fapi/v1/order call anywhere.
 
 The api_secret is used exclusively for HMAC signing and is never logged or
 included in exception messages.
@@ -35,7 +36,7 @@ class BinanceAPIError(Exception):
 
 
 class BinanceFuturesClient:
-    """Read-only USD-M Futures client (GET endpoints only)."""
+    """USD-M Futures client: reads + leverage/margin-type configuration only."""
 
     def __init__(self, base_url: str, api_key: str, api_secret: str):
         self._base_url = base_url.rstrip("/")
@@ -75,17 +76,20 @@ class BinanceFuturesClient:
         return BinanceAPIError(response.status_code, code, message)
 
     def _get(self, path: str, params: dict | None = None, signed: bool = False):
-        """Perform a GET request. Retries once after a clock re-sync on -1021."""
+        return self._request("GET", path, params, signed)
+
+    def _request(self, method: str, path: str, params: dict | None = None, signed: bool = False):
+        """Perform a request. Retries once after a clock re-sync on -1021."""
         try:
-            return self._do_get(path, params, signed)
+            return self._do_request(method, path, params, signed)
         except BinanceAPIError as exc:
             if signed and exc.code == CLOCK_DESYNC_ERROR_CODE:
                 log.warning("clock desync (-1021) detected, re-syncing and retrying")
                 self.sync_clock()
-                return self._do_get(path, params, signed)
+                return self._do_request(method, path, params, signed)
             raise
 
-    def _do_get(self, path: str, params: dict | None, signed: bool):
+    def _do_request(self, method: str, path: str, params: dict | None, signed: bool):
         params = dict(params or {})
         if signed:
             params["recvWindow"] = RECV_WINDOW_MS
@@ -93,8 +97,11 @@ class BinanceFuturesClient:
             query_string = urllib.parse.urlencode(params)
             params["signature"] = self._sign(query_string)
 
-        response = self._session.get(
-            f"{self._base_url}{path}", params=params, timeout=REQUEST_TIMEOUT_SECONDS
+        response = self._session.request(
+            method,
+            f"{self._base_url}{path}",
+            params=params,
+            timeout=REQUEST_TIMEOUT_SECONDS,
         )
         if not 200 <= response.status_code < 300:
             raise self._parse_error(response)
@@ -107,7 +114,7 @@ class BinanceFuturesClient:
     def sync_clock(self) -> int:
         """Sync local clock offset against server time. Returns offset in ms."""
         local_before = int(time.time() * 1000)
-        server_time = self._do_get("/fapi/v1/time", None, signed=False)["serverTime"]
+        server_time = self._do_request("GET", "/fapi/v1/time", None, signed=False)["serverTime"]
         local_after = int(time.time() * 1000)
         local_mid = (local_before + local_after) // 2
         self._clock_offset_ms = server_time - local_mid
@@ -147,3 +154,29 @@ class BinanceFuturesClient:
         """GET /fapi/v2/positionRisk (signed), filtered to the given symbol."""
         positions = self._get("/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
         return [p for p in positions if p.get("symbol") == symbol]
+
+    # ------------------------------------------------------------------ #
+    # account-configuration writes — the ONLY write endpoints in this build.
+    # Order placement (/fapi/v1/order) does not exist in this client.
+    # ------------------------------------------------------------------ #
+
+    def set_leverage(self, symbol: str, leverage: int) -> dict:
+        """POST /fapi/v1/leverage (signed)."""
+        return self._request(
+            "POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage}, signed=True
+        )
+
+    def set_margin_type(self, symbol: str, margin_type: str) -> dict:
+        """POST /fapi/v1/marginType (signed). Error -4046 (no change needed)
+        is treated as success."""
+        try:
+            return self._request(
+                "POST",
+                "/fapi/v1/marginType",
+                {"symbol": symbol, "marginType": margin_type},
+                signed=True,
+            )
+        except BinanceAPIError as exc:
+            if exc.code == -4046:
+                return {"code": -4046, "msg": "No need to change margin type"}
+            raise
