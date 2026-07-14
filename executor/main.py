@@ -56,12 +56,23 @@ def _extract_filters(symbol_info: dict) -> tuple[str, str, str]:
 
 def run_testnet_read() -> int:
     from binance_client import BinanceAPIError, BinanceFuturesClient
+    from signal_consumer import SignalConsumer, SignalConsumerError
 
     api_key = os.environ.get("BINANCE_TESTNET_API_KEY", "").strip()
     api_secret = os.environ.get("BINANCE_TESTNET_API_SECRET", "").strip()
     if not api_key or not api_secret:
         log.error(
             "BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET must be set "
+            "for TESTNET_READ mode"
+        )
+        return 1
+
+    app_api_base = os.environ.get("APP_API_BASE", "").strip()
+    engine_service_token = os.environ.get("ENGINE_SERVICE_TOKEN", "").strip()
+    engine_user_id = os.environ.get("ENGINE_USER_ID", "").strip()
+    if not app_api_base or not engine_service_token or not engine_user_id:
+        log.error(
+            "APP_API_BASE, ENGINE_SERVICE_TOKEN and ENGINE_USER_ID must be set "
             "for TESTNET_READ mode"
         )
         return 1
@@ -73,6 +84,9 @@ def run_testnet_read() -> int:
     log.info("=" * 60)
 
     client = BinanceFuturesClient(TESTNET_BASE_URL, api_key, api_secret)
+    consumer = SignalConsumer(
+        app_api_base, engine_service_token, engine_user_id, "TESTNET_READ", SYMBOL
+    )
 
     def cycle(first_success: bool) -> None:
         """One unified fetch cycle. Startup-only work runs until the first success."""
@@ -121,6 +135,10 @@ def run_testnet_read() -> int:
             client.clock_offset_ms,
         )
 
+        # Consumer poll: log order intents for any pending signals.
+        mark_price = positions[0].get("markPrice") if positions else None
+        consumer.poll_once(mark_price)
+
     # Unified cycle loop: startup and recurring fetches share one failure counter.
     first_success = False
     consecutive_failures = 0
@@ -129,7 +147,7 @@ def run_testnet_read() -> int:
             cycle(first_success)
             first_success = True
             consecutive_failures = 0
-        except (BinanceAPIError, OSError) as exc:
+        except (BinanceAPIError, SignalConsumerError, OSError) as exc:
             consecutive_failures += 1
             log.error(
                 "cycle failed (%d/%d consecutive): %s",
