@@ -1,8 +1,8 @@
 """Binance USD-M Futures REST client.
 
-Self-contained: uses only `requests`. Reads, two account-configuration writes
-(leverage, margin type), and a single MARKET order placement. No cancel, batch,
-or other order endpoints exist in this client.
+Self-contained: uses only `requests`. Reads plus exactly two account-
+configuration writes (leverage, margin type) and a single MARKET order
+placement. No cancel, batch, or other order endpoints exist in this client.
 
 The api_secret is used exclusively for HMAC signing and is never logged or
 included in exception messages.
@@ -36,7 +36,7 @@ class BinanceAPIError(Exception):
 
 
 class BinanceFuturesClient:
-    """USD-M Futures client: reads + leverage/margin-type configuration only."""
+    """USD-M Futures client: reads + config writes + one MARKET order path."""
 
     def __init__(self, base_url: str, api_key: str, api_secret: str):
         self._base_url = base_url.rstrip("/")
@@ -156,7 +156,7 @@ class BinanceFuturesClient:
         return [p for p in positions if p.get("symbol") == symbol]
 
     # ------------------------------------------------------------------ #
-    # account-configuration writes + a single MARKET order placement.
+    # account-configuration writes plus a single MARKET order placement.
     # No cancel, batch, or other order endpoints exist in this client.
     # ------------------------------------------------------------------ #
 
@@ -184,7 +184,7 @@ class BinanceFuturesClient:
     def place_market_order(
         self, symbol: str, side: str, qty, client_order_id: str
     ) -> dict:
-        """POST /fapi/v1/order (signed) as a MARKET order. side is BUY or SELL."""
+        """Place a signed MARKET order. side is BUY or SELL."""
         return self._request(
             "POST",
             "/fapi/v1/order",
