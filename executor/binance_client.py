@@ -43,7 +43,8 @@ class BinanceFuturesClient:
         self._api_secret = api_secret.encode("utf-8")
         self._clock_offset_ms = 0
         self._session = requests.Session()
-        self._session.headers.update({"X-MBX-APIKEY": self._api_key})
+        if self._api_key:
+            self._session.headers.update({"X-MBX-APIKEY": self._api_key})
 
     @property
     def clock_offset_ms(self) -> int:
@@ -123,6 +124,20 @@ class BinanceFuturesClient:
             if entry.get("symbol") == symbol:
                 return entry
         raise BinanceAPIError(200, None, f"symbol {symbol} not found in exchangeInfo")
+
+    def get_mark_price(self, symbol: str) -> float:
+        """GET /fapi/v1/premiumIndex (unsigned) — returns the symbol's markPrice as float."""
+        data = self._get("/fapi/v1/premiumIndex", {"symbol": symbol})
+        raw = data.get("markPrice")
+        try:
+            price = float(raw)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price <= 0:
+            raise BinanceAPIError(
+                200, None, f"missing or non-positive markPrice {raw!r} for {symbol}"
+            )
+        return price
 
     def get_account(self) -> dict:
         """GET /fapi/v2/account (signed)."""
