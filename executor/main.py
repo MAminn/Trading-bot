@@ -77,6 +77,17 @@ def run_testnet_read() -> int:
         )
         return 1
 
+    start_after = os.environ.get("CONSUMER_START_AFTER", "").strip() or None
+    if start_after is not None:
+        try:
+            datetime.fromisoformat(start_after.replace("Z", "+00:00"))
+        except ValueError:
+            log.error(
+                "CONSUMER_START_AFTER=%r is not a valid ISO 8601 timestamp", start_after
+            )
+            return 1
+        log.info("consumer cursor override: starting after %s", start_after)
+
     log.info("=" * 60)
     log.info("executor starting | mode=TESTNET_READ | symbol=%s", SYMBOL)
     log.info("base_url=%s (hardcoded for this mode)", TESTNET_BASE_URL)
@@ -85,7 +96,12 @@ def run_testnet_read() -> int:
 
     client = BinanceFuturesClient(TESTNET_BASE_URL, api_key, api_secret)
     consumer = SignalConsumer(
-        app_api_base, engine_service_token, engine_user_id, "TESTNET_READ", SYMBOL
+        app_api_base,
+        engine_service_token,
+        engine_user_id,
+        "TESTNET_READ",
+        SYMBOL,
+        start_after=start_after,
     )
 
     def cycle(first_success: bool) -> None:
