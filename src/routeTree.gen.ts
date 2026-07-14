@@ -28,6 +28,7 @@ import { Route as ApiPublicEngineConfigRouteImport } from './routes/api/public/e
 import { Route as ApiPublicEngineSignalsPendingRouteImport } from './routes/api/public/engine/signals.pending'
 import { Route as ApiPublicEngineIngestTradeRouteImport } from './routes/api/public/engine/ingest.trade'
 import { Route as ApiPublicEngineIngestSignalRouteImport } from './routes/api/public/engine/ingest.signal'
+import { Route as ApiPublicEngineIngestOrder_updateRouteImport } from './routes/api/public/engine/ingest.order_update'
 import { Route as ApiPublicEngineIngestOrderRouteImport } from './routes/api/public/engine/ingest.order'
 import { Route as ApiPublicEngineIngestOpen_positionsRouteImport } from './routes/api/public/engine/ingest.open_positions'
 
@@ -130,6 +131,12 @@ const ApiPublicEngineIngestSignalRoute =
     path: '/api/public/engine/ingest/signal',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ApiPublicEngineIngestOrder_updateRoute =
+  ApiPublicEngineIngestOrder_updateRouteImport.update({
+    id: '/api/public/engine/ingest/order_update',
+    path: '/api/public/engine/ingest/order_update',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiPublicEngineIngestOrderRoute =
   ApiPublicEngineIngestOrderRouteImport.update({
     id: '/api/public/engine/ingest/order',
@@ -162,6 +169,7 @@ export interface FileRoutesByFullPath {
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
   '/api/public/engine/ingest/open_positions': typeof ApiPublicEngineIngestOpen_positionsRoute
   '/api/public/engine/ingest/order': typeof ApiPublicEngineIngestOrderRoute
+  '/api/public/engine/ingest/order_update': typeof ApiPublicEngineIngestOrder_updateRoute
   '/api/public/engine/ingest/signal': typeof ApiPublicEngineIngestSignalRoute
   '/api/public/engine/ingest/trade': typeof ApiPublicEngineIngestTradeRoute
   '/api/public/engine/signals/pending': typeof ApiPublicEngineSignalsPendingRoute
@@ -184,6 +192,7 @@ export interface FileRoutesByTo {
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
   '/api/public/engine/ingest/open_positions': typeof ApiPublicEngineIngestOpen_positionsRoute
   '/api/public/engine/ingest/order': typeof ApiPublicEngineIngestOrderRoute
+  '/api/public/engine/ingest/order_update': typeof ApiPublicEngineIngestOrder_updateRoute
   '/api/public/engine/ingest/signal': typeof ApiPublicEngineIngestSignalRoute
   '/api/public/engine/ingest/trade': typeof ApiPublicEngineIngestTradeRoute
   '/api/public/engine/signals/pending': typeof ApiPublicEngineSignalsPendingRoute
@@ -208,6 +217,7 @@ export interface FileRoutesById {
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
   '/api/public/engine/ingest/open_positions': typeof ApiPublicEngineIngestOpen_positionsRoute
   '/api/public/engine/ingest/order': typeof ApiPublicEngineIngestOrderRoute
+  '/api/public/engine/ingest/order_update': typeof ApiPublicEngineIngestOrder_updateRoute
   '/api/public/engine/ingest/signal': typeof ApiPublicEngineIngestSignalRoute
   '/api/public/engine/ingest/trade': typeof ApiPublicEngineIngestTradeRoute
   '/api/public/engine/signals/pending': typeof ApiPublicEngineSignalsPendingRoute
@@ -233,6 +243,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/heartbeat'
     | '/api/public/engine/ingest/open_positions'
     | '/api/public/engine/ingest/order'
+    | '/api/public/engine/ingest/order_update'
     | '/api/public/engine/ingest/signal'
     | '/api/public/engine/ingest/trade'
     | '/api/public/engine/signals/pending'
@@ -255,6 +266,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/heartbeat'
     | '/api/public/engine/ingest/open_positions'
     | '/api/public/engine/ingest/order'
+    | '/api/public/engine/ingest/order_update'
     | '/api/public/engine/ingest/signal'
     | '/api/public/engine/ingest/trade'
     | '/api/public/engine/signals/pending'
@@ -278,6 +290,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/heartbeat'
     | '/api/public/engine/ingest/open_positions'
     | '/api/public/engine/ingest/order'
+    | '/api/public/engine/ingest/order_update'
     | '/api/public/engine/ingest/signal'
     | '/api/public/engine/ingest/trade'
     | '/api/public/engine/signals/pending'
@@ -293,6 +306,7 @@ export interface RootRouteChildren {
   ApiPublicEngineHeartbeatRoute: typeof ApiPublicEngineHeartbeatRoute
   ApiPublicEngineIngestOpen_positionsRoute: typeof ApiPublicEngineIngestOpen_positionsRoute
   ApiPublicEngineIngestOrderRoute: typeof ApiPublicEngineIngestOrderRoute
+  ApiPublicEngineIngestOrder_updateRoute: typeof ApiPublicEngineIngestOrder_updateRoute
   ApiPublicEngineIngestSignalRoute: typeof ApiPublicEngineIngestSignalRoute
   ApiPublicEngineIngestTradeRoute: typeof ApiPublicEngineIngestTradeRoute
   ApiPublicEngineSignalsPendingRoute: typeof ApiPublicEngineSignalsPendingRoute
@@ -433,6 +447,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiPublicEngineIngestSignalRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/public/engine/ingest/order_update': {
+      id: '/api/public/engine/ingest/order_update'
+      path: '/api/public/engine/ingest/order_update'
+      fullPath: '/api/public/engine/ingest/order_update'
+      preLoaderRoute: typeof ApiPublicEngineIngestOrder_updateRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/public/engine/ingest/order': {
       id: '/api/public/engine/ingest/order'
       path: '/api/public/engine/ingest/order'
@@ -487,6 +508,8 @@ const rootRouteChildren: RootRouteChildren = {
   ApiPublicEngineIngestOpen_positionsRoute:
     ApiPublicEngineIngestOpen_positionsRoute,
   ApiPublicEngineIngestOrderRoute: ApiPublicEngineIngestOrderRoute,
+  ApiPublicEngineIngestOrder_updateRoute:
+    ApiPublicEngineIngestOrder_updateRoute,
   ApiPublicEngineIngestSignalRoute: ApiPublicEngineIngestSignalRoute,
   ApiPublicEngineIngestTradeRoute: ApiPublicEngineIngestTradeRoute,
   ApiPublicEngineSignalsPendingRoute: ApiPublicEngineSignalsPendingRoute,
