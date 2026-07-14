@@ -10,6 +10,7 @@ raw response is never logged; only max_position_size_usd is extracted.
 """
 
 import logging
+import time
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
 
@@ -30,6 +31,7 @@ NOTIONAL_CAP_USD = Decimal("100")
 # mark-price read — never configurable via env.
 MODE_BINANCE_BASE_URLS = {
     "TESTNET_READ": "https://testnet.binancefuture.com",
+    "TESTNET_TRADE": "https://testnet.binancefuture.com",
 }
 
 
@@ -62,11 +64,15 @@ class SignalConsumer:
         execution_mode: str,
         symbol: str = "ETHUSDT",
         start_after: str | None = None,
+        risk_guard=None,
     ):
         self._base = app_api_base.rstrip("/")
         self._user_id = user_id
         self._execution_mode = execution_mode
         self._symbol = symbol
+        # Optional RiskGuard (trade-capable modes only); None keeps read modes pure.
+        self._risk_guard = risk_guard
+        self._last_order_time: float | None = None
         # created_at of last processed signal; optionally seeded via CONSUMER_START_AFTER.
         # Always stored in canonical Z-form — the pending route rejects +00:00 offsets.
         self._cursor: str | None = to_z_iso(start_after) if start_after else None
@@ -162,12 +168,14 @@ class SignalConsumer:
     # public entrypoint
     # ------------------------------------------------------------------ #
 
-    def poll_once(self, mark_price=None) -> None:
+    def poll_once(self, mark_price=None, position_amt=None) -> None:
         """One poll cycle: refresh config as scheduled, fetch pending signals,
         log each as an order intent. Raises SignalConsumerError on failure.
 
-        The mark_price argument is deprecated and ignored — the price is
-        fetched from /fapi/v1/premiumIndex once per cycle."""
+        position_amt: current position amount for the symbol, used by the
+        risk guard in trade-capable modes. The mark_price argument is
+        deprecated and ignored — the price is fetched from
+        /fapi/v1/premiumIndex once per cycle."""
         if self._max_position_size_usd is None or self._cycles % CONFIG_REFRESH_EVERY_CYCLES == 0:
             self._refresh_config()
         self._cycles += 1
@@ -191,6 +199,18 @@ class SignalConsumer:
 
         for signal in signals:
             order = self._build_intent(signal, ref_price)
+            if self._risk_guard is not None and order["status"] == "INTENT_LOGGED":
+                allowed, reason = self._risk_guard.evaluate(
+                    order, position_amt, self._last_order_time
+                )
+                if allowed:
+                    log.info("RISK | ALLOWED | %s", order["idempotency_key"])
+                else:
+                    log.info(
+                        "RISK | REJECTED | %s | %s", reason, order["idempotency_key"]
+                    )
+                    order["status"] = "SKIPPED"
+                    order["error"] = reason
             log.info(
                 "INTENT | %s OPEN | qty=%s | ref_price=%s | notional=%s | key=%s",
                 order["side"],
@@ -200,6 +220,9 @@ class SignalConsumer:
                 order["idempotency_key"],
             )
             self._post_order(order)
+            if self._risk_guard is not None and order["status"] == "INTENT_LOGGED":
+                # Feed the guard's min-interval check from allowed intents only.
+                self._last_order_time = time.time()
             # Advance cursor only after the intent is persisted (or confirmed duplicate)
             # so a mid-batch failure resumes from the right place next cycle.
             # Normalized to Z-form: the pending route rejects +00:00 offsets.

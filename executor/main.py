@@ -1,7 +1,9 @@
 """Executor service entrypoint.
 
 Binance USD-M Futures execution service.
-Implemented modes: OFF, TESTNET_READ (read-only). All other modes refuse to start.
+Implemented modes: OFF, TESTNET_READ (read-only), TESTNET_TRADE (account
+enforcement + risk guard; order placement NOT implemented). LIVE_* modes
+refuse to start.
 """
 
 import logging
@@ -11,7 +13,7 @@ import time
 from datetime import datetime, timezone
 
 ALLOWED_MODES = ("OFF", "TESTNET_READ", "TESTNET_TRADE", "LIVE_READ", "LIVE_DRYRUN", "LIVE")
-IMPLEMENTED_MODES = ("OFF", "TESTNET_READ")
+IMPLEMENTED_MODES = ("OFF", "TESTNET_READ", "TESTNET_TRADE")
 
 HEARTBEAT_INTERVAL_SECONDS = 60
 MAX_CONSECUTIVE_FAILURES = 10
@@ -26,6 +28,14 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("executor")
+
+
+class EnforcementError(Exception):
+    """Account-config enforcement failed in a retryable way."""
+
+
+class FatalConfigError(Exception):
+    """Account config could not be verified — refuse to run trade-capable."""
 
 
 def run_off() -> int:
@@ -54,7 +64,9 @@ def _extract_filters(symbol_info: dict) -> tuple[str, str, str]:
     return tick_size, step_size, min_notional
 
 
-def run_testnet_read() -> int:
+def run_testnet(mode: str) -> int:
+    """Runs TESTNET_READ (pure read) and TESTNET_TRADE (read + account
+    enforcement + risk guard). Order placement is not implemented."""
     from binance_client import BinanceAPIError, BinanceFuturesClient
     from signal_consumer import SignalConsumer, SignalConsumerError
 
@@ -63,7 +75,8 @@ def run_testnet_read() -> int:
     if not api_key or not api_secret:
         log.error(
             "BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET must be set "
-            "for TESTNET_READ mode"
+            "for %s mode",
+            mode,
         )
         return 1
 
@@ -73,7 +86,8 @@ def run_testnet_read() -> int:
     if not app_api_base or not engine_service_token or not engine_user_id:
         log.error(
             "APP_API_BASE, ENGINE_SERVICE_TOKEN and ENGINE_USER_ID must be set "
-            "for TESTNET_READ mode"
+            "for %s mode",
+            mode,
         )
         return 1
 
@@ -89,23 +103,62 @@ def run_testnet_read() -> int:
         log.info("consumer cursor override: starting after %s", start_after)
 
     log.info("=" * 60)
-    log.info("executor starting | mode=TESTNET_READ | symbol=%s", SYMBOL)
+    log.info("executor starting | mode=%s | symbol=%s", mode, SYMBOL)
     log.info("base_url=%s (hardcoded for this mode)", TESTNET_BASE_URL)
-    log.info("read-only build: no order endpoints exist in this codebase")
+    if mode == "TESTNET_TRADE":
+        log.info("account enforcement + risk guard active; order placement NOT implemented")
+    else:
+        log.info("read-only mode: no write calls to Binance")
     log.info("=" * 60)
 
     client = BinanceFuturesClient(TESTNET_BASE_URL, api_key, api_secret)
+
+    risk_guard = None
+    if mode == "TESTNET_TRADE":
+        from risk_guard import RiskGuard
+
+        risk_guard = RiskGuard()
+
     consumer = SignalConsumer(
         app_api_base,
         engine_service_token,
         engine_user_id,
-        "TESTNET_READ",
+        mode,
         SYMBOL,
         start_after=start_after,
+        risk_guard=risk_guard,
     )
+
+    def enforce_account_config() -> None:
+        """One-time TESTNET_TRADE prerequisite: isolated margin, leverage 1."""
+        positions = client.get_positions(SYMBOL)
+        amt = float(positions[0].get("positionAmt", 0) or 0) if positions else 0.0
+        if amt != 0:
+            log.error("cannot enforce margin type with open position")
+            raise EnforcementError("open position blocks account-config enforcement")
+
+        client.set_margin_type(SYMBOL, "ISOLATED")
+        client.set_leverage(SYMBOL, 1)
+
+        positions = client.get_positions(SYMBOL)
+        pos = positions[0] if positions else {}
+        leverage = str(pos.get("leverage", ""))
+        margin_type = str(pos.get("marginType", "")).lower()
+        if leverage != "1" or margin_type != "isolated":
+            log.error(
+                "account config verification failed | leverage=%s (want 1) | "
+                "margin=%s (want isolated)",
+                leverage,
+                margin_type,
+            )
+            raise FatalConfigError("account configuration verification failed")
+        log.info("ENFORCED | %s | leverage=1 | margin=ISOLATED", SYMBOL)
+
+    enforced = False
 
     def cycle(first_success: bool) -> None:
         """One unified fetch cycle. Startup-only work runs until the first success."""
+        nonlocal enforced
         if not first_success:
             offset = client.sync_clock()
             log.info("clock synced | offset=%dms", offset)
@@ -122,6 +175,12 @@ def run_testnet_read() -> int:
                 symbol_info.get("pricePrecision"),
                 symbol_info.get("quantityPrecision"),
             )
+
+        # TESTNET_TRADE only: one-time account enforcement, before anything
+        # else in the cycle. Must succeed before the mode does any other work.
+        if mode == "TESTNET_TRADE" and not enforced:
+            enforce_account_config()
+            enforced = True
 
         positions = client.get_positions(SYMBOL)
         account = client.get_account()
@@ -144,7 +203,8 @@ def run_testnet_read() -> int:
 
         pos_amt = positions[0].get("positionAmt") if positions else "0"
         log.info(
-            "executor alive | mode=TESTNET_READ | %s pos=%s | bal=%s | clock_offset=%dms",
+            "executor alive | mode=%s | %s pos=%s | bal=%s | clock_offset=%dms",
+            mode,
             SYMBOL,
             pos_amt,
             account.get("availableBalance"),
@@ -152,8 +212,11 @@ def run_testnet_read() -> int:
         )
 
         # Consumer poll: log order intents for any pending signals.
-        mark_price = positions[0].get("markPrice") if positions else None
-        consumer.poll_once(mark_price)
+        try:
+            position_amt = float(pos_amt or 0)
+        except (TypeError, ValueError):
+            position_amt = 0.0
+        consumer.poll_once(position_amt=position_amt)
 
     # Unified cycle loop: startup and recurring fetches share one failure counter.
     first_success = False
@@ -163,7 +226,9 @@ def run_testnet_read() -> int:
             cycle(first_success)
             first_success = True
             consecutive_failures = 0
-        except (BinanceAPIError, SignalConsumerError, OSError) as exc:
+        except FatalConfigError:
+            return 1
+        except (BinanceAPIError, SignalConsumerError, EnforcementError, OSError) as exc:
             consecutive_failures += 1
             log.error(
                 "cycle failed (%d/%d consecutive): %s",
@@ -196,7 +261,7 @@ def main() -> int:
 
     if mode == "OFF":
         return run_off()
-    return run_testnet_read()
+    return run_testnet(mode)
 
 
 if __name__ == "__main__":
