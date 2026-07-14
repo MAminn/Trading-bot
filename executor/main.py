@@ -131,12 +131,34 @@ def run_testnet(mode: str) -> int:
     )
 
     def enforce_account_config() -> None:
-        """One-time TESTNET_TRADE prerequisite: isolated margin, leverage 1."""
+        """One-time TESTNET_TRADE prerequisite: isolated margin, leverage 1.
+
+        Verify-first: if the account is already correct, make zero write calls
+        (works even with an open position). Only reconfigure when the account is
+        wrong and no position is open; refuse to trade otherwise.
+        """
         positions = client.get_positions(SYMBOL)
-        amt = float(positions[0].get("positionAmt", 0) or 0) if positions else 0.0
+        pos = positions[0] if positions else {}
+        amt = float(pos.get("positionAmt", 0) or 0)
+        leverage = str(pos.get("leverage", ""))
+        margin_type = str(pos.get("marginType", "")).lower()
+
+        if leverage == "1" and margin_type == "isolated":
+            log.info(
+                "ENFORCED | %s | leverage=1 | margin=ISOLATED | verified, no change needed",
+                SYMBOL,
+            )
+            return
+
         if amt != 0:
-            log.error("cannot enforce margin type with open position")
-            raise EnforcementError("open position blocks account-config enforcement")
+            log.error(
+                "HALT | %s position open with wrong account config "
+                "(leverage=%s, margin=%s) — refusing to trade",
+                SYMBOL,
+                leverage,
+                margin_type,
+            )
+            raise FatalConfigError("position open with wrong account config")
 
         client.set_margin_type(SYMBOL, "ISOLATED")
         client.set_leverage(SYMBOL, 1)
@@ -153,7 +175,7 @@ def run_testnet(mode: str) -> int:
                 margin_type,
             )
             raise FatalConfigError("account configuration verification failed")
-        log.info("ENFORCED | %s | leverage=1 | margin=ISOLATED", SYMBOL)
+        log.info("ENFORCED | %s | leverage=1 | margin=ISOLATED | applied", SYMBOL)
 
     enforced = False
 
