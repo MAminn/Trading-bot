@@ -44,7 +44,7 @@ export const Route = createFileRoute("/api/public/engine/signals/pending")({
             "id, bar_time, rule_side, ml_accept, opened, closed_reason, position_before, position_after, created_at",
           )
           .eq("user_id", parsed.user_id)
-          .in("rule_side", [1, -1])
+          .or("rule_side.in.(1,-1),closed_reason.not.is.null")
           .gt("created_at", after)
           .order("created_at", { ascending: true })
           .limit(20);
