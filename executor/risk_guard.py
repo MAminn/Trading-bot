@@ -26,6 +26,28 @@ class RiskGuard:
             qty = float(intended_order.get("qty") or 0)
         except (TypeError, ValueError):
             qty = 0.0
+
+        intent = intended_order.get("intent")
+
+        # CLOSE is a reducing order: exempt from notional caps, the min-interval
+        # rule, and the one-position rule. It only needs a real position to
+        # reduce in the matching direction.
+        if intent == "CLOSE":
+            try:
+                position_amt = float(current_position_amt or 0)
+            except (TypeError, ValueError):
+                return False, "unreadable current position"
+            side = intended_order.get("side")
+            matches = (side == "SHORT" and position_amt < 0) or (
+                side == "LONG" and position_amt > 0
+            )
+            if not matches:
+                return False, "no matching position to close"
+            if qty <= 0:
+                return False, "qty must be positive"
+            return True, "ok"
+
+        # OPEN: all existing checks, unchanged.
         if qty <= 0:
             return False, "qty must be positive"
 
@@ -42,7 +64,7 @@ class RiskGuard:
             position_amt = float(current_position_amt or 0)
         except (TypeError, ValueError):
             return False, "unreadable current position"
-        if intended_order.get("intent") == "OPEN" and position_amt != 0:
+        if position_amt != 0:
             return False, "position already open"
 
         if (
