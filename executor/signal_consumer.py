@@ -29,6 +29,11 @@ STEP_SIZE = Decimal("0.001")
 MIN_NOTIONAL_USD = Decimal("20")
 NOTIONAL_CAP_USD = Decimal("100")
 
+# After placing an order, poll the position until Binance reflects the fill so a
+# same-cycle follow-up (e.g. a CLOSE after an OPEN) sizes against the real state.
+SETTLE_MAX_POLLS = 10
+SETTLE_POLL_INTERVAL_SECONDS = 1
+
 # The execution mode determines the Binance base URL used for the unsigned
 # mark-price read — never configurable via env.
 MODE_BINANCE_BASE_URLS = {
@@ -226,10 +231,13 @@ class SignalConsumer:
     # order placement (TESTNET_TRADE only)
     # ------------------------------------------------------------------ #
 
-    def _place_order(self, order: dict) -> None:
+    def _place_order(self, order: dict):
         """Place a MARKET order for an allowed, newly-created intent and record
         the result via ingest/order_update. TESTNET_TRADE only. Never retries a
-        given key (the client_order_id makes retries rejectable anyway)."""
+        given key (the client_order_id makes retries rejectable anyway).
+
+        Returns the position amount after the order settles (see _settle_open /
+        _settle_close), or None if the placement itself failed."""
         idempotency_key = order["idempotency_key"]
         # 35 chars, alphanumeric: "x" + 32 hex chars of sha256(idempotency_key).
         client_order_id = "x" + hashlib.sha256(
@@ -257,7 +265,7 @@ class SignalConsumer:
                     "error": str(exc)[:1000],
                 }
             )
-            return
+            return None
 
         binance_id = result.get("orderId")
         binance_status = result.get("status")
@@ -277,6 +285,63 @@ class SignalConsumer:
                 "binance_order_id": str(binance_id) if binance_id is not None else None,
             }
         )
+        # Wait for the position to reflect this order before the caller moves on
+        # to any further signal in the same cycle. Returns the settled amount.
+        if is_close:
+            return self._settle_close()
+        return self._settle_open(order["side"])
+
+    # ------------------------------------------------------------------ #
+    # settle helpers: reconcile the local view with Binance after placement
+    # ------------------------------------------------------------------ #
+
+    def _read_position_amt(self):
+        """Fresh signed read of the symbol's position amount; None on read error."""
+        try:
+            positions = self._binance_trader.get_positions(self._symbol)
+        except (BinanceAPIError, OSError) as exc:
+            log.error("settle position read failed: %s", exc)
+            return None
+        if not positions:
+            return 0.0
+        try:
+            return float(positions[0].get("positionAmt", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+
+    def _settle_open(self, side: str) -> float:
+        """Poll until the just-placed OPEN shows up as a nonzero position with
+        the matching sign (negative for SHORT, positive for LONG). Returns the
+        settled amount. If it does not settle within SETTLE_MAX_POLLS, raise so
+        the cycle fails without advancing the cursor: the OPEN was already posted
+        and placed (safe under idempotency), and any pending CLOSE stays
+        unprocessed for the retry."""
+        for n in range(1, SETTLE_MAX_POLLS + 1):
+            amt = self._read_position_amt()
+            if amt is not None and (
+                (side == "SHORT" and amt < 0) or (side == "LONG" and amt > 0)
+            ):
+                log.info("SETTLED | pos=%s after %d polls", amt, n)
+                return amt
+            if n < SETTLE_MAX_POLLS:
+                time.sleep(SETTLE_POLL_INTERVAL_SECONDS)
+        log.error("open order not yet reflected in position — failing cycle for retry")
+        raise SignalConsumerError("open order not settled")
+
+    def _settle_close(self) -> float:
+        """Poll until the just-placed CLOSE flattens the position. Returns the
+        last-read amount. A lingering nonzero here is not a cycle failure —
+        reconciliation catches it later — so this only warns and continues."""
+        amt = 0.0
+        for n in range(1, SETTLE_MAX_POLLS + 1):
+            amt = self._read_position_amt()
+            if amt == 0.0:
+                log.info("SETTLED | pos=%s after %d polls", amt, n)
+                return 0.0
+            if n < SETTLE_MAX_POLLS:
+                time.sleep(SETTLE_POLL_INTERVAL_SECONDS)
+        log.warning("WARN | close sent but position not yet flat")
+        return amt if amt is not None else 0.0
 
     # ------------------------------------------------------------------ #
     # public entrypoint
@@ -311,6 +376,10 @@ class SignalConsumer:
             log.error("mark price unavailable, retrying cycle")
             raise SignalConsumerError(f"mark price fetch failed: {exc}") from exc
 
+        # Track the position amount across the batch: placements settle mid-cycle,
+        # so a later signal (e.g. a CLOSE after an OPEN) must size against the
+        # settled value, not the stale cycle-start read.
+        current_amt = position_amt
         for signal in signals:
             # A signal may carry both a close (closed_reason + position_after
             # FLAT) and an entry (rule_side +/-1) — e.g. a reversal. Process the
@@ -320,7 +389,7 @@ class SignalConsumer:
                 signal.get("closed_reason") is not None
                 and signal.get("position_after") == "FLAT"
             ):
-                close_order = self._build_close_intent(signal, ref_price, position_amt)
+                close_order = self._build_close_intent(signal, ref_price, current_amt)
                 if close_order is None:
                     log.warning(
                         "CLOSE signal with unusable position_before=%r, skipping | "
@@ -329,18 +398,22 @@ class SignalConsumer:
                         signal.get("bar_time"),
                     )
                 else:
-                    self._process_intent(close_order, position_amt)
+                    current_amt = self._process_intent(close_order, current_amt)
 
             if signal.get("rule_side") in (1, -1):
-                self._process_intent(self._build_intent(signal, ref_price), position_amt)
+                current_amt = self._process_intent(
+                    self._build_intent(signal, ref_price), current_amt
+                )
 
             # Advance cursor only after the intent(s) are persisted (or confirmed
             # duplicate) so a mid-batch failure resumes from the right place next
             # cycle. Normalized to Z-form: the pending route rejects +00:00 offsets.
             self._cursor = to_z_iso(signal["created_at"])
 
-    def _process_intent(self, order: dict, position_amt) -> None:
-        """Guard, persist, and (in TESTNET_TRADE) place a single intent."""
+    def _process_intent(self, order: dict, position_amt):
+        """Guard, persist, and (in TESTNET_TRADE) place a single intent. Returns
+        the current position amount, updated to the settled value after a
+        placement so a same-cycle follow-up sizes against the real state."""
         if self._risk_guard is not None and order["status"] == "INTENT_LOGGED":
             allowed, reason = self._risk_guard.evaluate(
                 order, position_amt, self._last_order_time
@@ -370,4 +443,7 @@ class SignalConsumer:
                 self._last_order_time = time.time()
             # Placement is enabled only in TESTNET_TRADE (trader supplied there).
             if self._binance_trader is not None:
-                self._place_order(order)
+                settled = self._place_order(order)
+                if settled is not None:
+                    return settled
+        return position_amt
