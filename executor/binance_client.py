@@ -182,18 +182,18 @@ class BinanceFuturesClient:
             raise
 
     def place_market_order(
-        self, symbol: str, side: str, qty, client_order_id: str
+        self, symbol: str, side: str, qty, client_order_id: str, reduce_only: bool = False
     ) -> dict:
-        """Place a signed MARKET order. side is BUY or SELL."""
-        return self._request(
-            "POST",
-            "/fapi/v1/order",
-            {
-                "symbol": symbol,
-                "side": side,
-                "type": "MARKET",
-                "quantity": qty,
-                "newClientOrderId": client_order_id,
-            },
-            signed=True,
-        )
+        """Place a signed MARKET order. side is BUY or SELL. When reduce_only is
+        True, the order carries reduceOnly=true so it can only shrink or close a
+        position, never flip or increase it."""
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": qty,
+            "newClientOrderId": client_order_id,
+        }
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        return self._request("POST", "/fapi/v1/order", params, signed=True)

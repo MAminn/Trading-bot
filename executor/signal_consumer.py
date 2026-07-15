@@ -193,6 +193,35 @@ class SignalConsumer:
             order["error"] = "below min notional"
         return order
 
+    def _build_close_intent(self, signal: dict, ref_price: Decimal, position_amt) -> dict | None:
+        """Build a CLOSE intent for a flatten signal. The side being closed is
+        position_before (LONG or SHORT); returns None if it is neither, so the
+        caller can skip with a warning. qty is the absolute current Binance
+        position amount, rounded DOWN to step size. CLOSE is exempt from the
+        min-notional gate, so notional is informational only."""
+        side = signal.get("position_before")
+        if side not in ("LONG", "SHORT"):
+            return None
+        bar_time = to_z_iso(signal["bar_time"])
+        idempotency_key = f"{self._user_id}:{bar_time}:{side}:CLOSE"
+
+        qty = abs(Decimal(str(position_amt or 0))).quantize(STEP_SIZE, rounding=ROUND_DOWN)
+        notional = qty * ref_price
+
+        return {
+            "user_id": self._user_id,
+            "signal_bar_time": bar_time,
+            "symbol": self._symbol,
+            "side": side,
+            "intent": "CLOSE",
+            "qty": float(qty),
+            "ref_price": float(ref_price),
+            "notional_usd": float(notional),
+            "execution_mode": self._execution_mode,
+            "status": "INTENT_LOGGED",
+            "idempotency_key": idempotency_key,
+        }
+
     # ------------------------------------------------------------------ #
     # order placement (TESTNET_TRADE only)
     # ------------------------------------------------------------------ #
@@ -206,11 +235,17 @@ class SignalConsumer:
         client_order_id = "x" + hashlib.sha256(
             idempotency_key.encode("utf-8")
         ).hexdigest()[:32]
-        mapped_side = "BUY" if order["side"] == "LONG" else "SELL"
+        is_close = order["intent"] == "CLOSE"
+        if is_close:
+            # Closing LONG sells, closing SHORT buys; reduceOnly guards against flips.
+            mapped_side = "SELL" if order["side"] == "LONG" else "BUY"
+        else:
+            mapped_side = "BUY" if order["side"] == "LONG" else "SELL"
 
         try:
             result = self._binance_trader.place_market_order(
-                self._symbol, mapped_side, order["qty"], client_order_id
+                self._symbol, mapped_side, order["qty"], client_order_id,
+                reduce_only=is_close,
             )
         except (BinanceAPIError, OSError) as exc:
             log.error("order placement failed | key=%s | %s", idempotency_key, exc)
@@ -227,8 +262,9 @@ class SignalConsumer:
         binance_id = result.get("orderId")
         binance_status = result.get("status")
         log.info(
-            "ORDER SENT | %s | qty=%s | binance_id=%s | status=%s",
+            "ORDER SENT | %s %s | qty=%s | binance_id=%s | status=%s",
             order["side"],
+            order["intent"],
             order["qty"],
             binance_id,
             binance_status,
@@ -276,36 +312,62 @@ class SignalConsumer:
             raise SignalConsumerError(f"mark price fetch failed: {exc}") from exc
 
         for signal in signals:
-            order = self._build_intent(signal, ref_price)
-            if self._risk_guard is not None and order["status"] == "INTENT_LOGGED":
-                allowed, reason = self._risk_guard.evaluate(
-                    order, position_amt, self._last_order_time
-                )
-                if allowed:
-                    log.info("RISK | ALLOWED | %s", order["idempotency_key"])
-                else:
-                    log.info(
-                        "RISK | REJECTED | %s | %s", reason, order["idempotency_key"]
+            # A signal may carry both a close (closed_reason + position_after
+            # FLAT) and an entry (rule_side +/-1) — e.g. a reversal. Process the
+            # CLOSE first, then the OPEN, as independent intents each with its
+            # own idempotency key and guard evaluation.
+            if (
+                signal.get("closed_reason") is not None
+                and signal.get("position_after") == "FLAT"
+            ):
+                close_order = self._build_close_intent(signal, ref_price, position_amt)
+                if close_order is None:
+                    log.warning(
+                        "CLOSE signal with unusable position_before=%r, skipping | "
+                        "bar_time=%s",
+                        signal.get("position_before"),
+                        signal.get("bar_time"),
                     )
-                    order["status"] = "SKIPPED"
-                    order["error"] = reason
-            log.info(
-                "INTENT | %s OPEN | qty=%s | ref_price=%s | notional=%s | key=%s",
-                order["side"],
-                order["qty"],
-                order["ref_price"],
-                order["notional_usd"],
-                order["idempotency_key"],
-            )
-            created = self._post_order(order)
-            if created and order["status"] == "INTENT_LOGGED":
-                if self._risk_guard is not None:
-                    # Feed the guard's min-interval check from allowed intents only.
-                    self._last_order_time = time.time()
-                # Placement is enabled only in TESTNET_TRADE (trader supplied there).
-                if self._binance_trader is not None:
-                    self._place_order(order)
-            # Advance cursor only after the intent is persisted (or confirmed duplicate)
-            # so a mid-batch failure resumes from the right place next cycle.
-            # Normalized to Z-form: the pending route rejects +00:00 offsets.
+                else:
+                    self._process_intent(close_order, position_amt)
+
+            if signal.get("rule_side") in (1, -1):
+                self._process_intent(self._build_intent(signal, ref_price), position_amt)
+
+            # Advance cursor only after the intent(s) are persisted (or confirmed
+            # duplicate) so a mid-batch failure resumes from the right place next
+            # cycle. Normalized to Z-form: the pending route rejects +00:00 offsets.
             self._cursor = to_z_iso(signal["created_at"])
+
+    def _process_intent(self, order: dict, position_amt) -> None:
+        """Guard, persist, and (in TESTNET_TRADE) place a single intent."""
+        if self._risk_guard is not None and order["status"] == "INTENT_LOGGED":
+            allowed, reason = self._risk_guard.evaluate(
+                order, position_amt, self._last_order_time
+            )
+            if allowed:
+                log.info("RISK | ALLOWED | %s", order["idempotency_key"])
+            else:
+                log.info(
+                    "RISK | REJECTED | %s | %s", reason, order["idempotency_key"]
+                )
+                order["status"] = "SKIPPED"
+                order["error"] = reason
+        log.info(
+            "INTENT | %s %s | qty=%s | ref_price=%s | notional=%s | key=%s",
+            order["side"],
+            order["intent"],
+            order["qty"],
+            order["ref_price"],
+            order["notional_usd"],
+            order["idempotency_key"],
+        )
+        created = self._post_order(order)
+        if created and order["status"] == "INTENT_LOGGED":
+            # Feed the guard's min-interval check from allowed OPEN intents only;
+            # a CLOSE must never block the OPEN half of a same-cycle reversal.
+            if self._risk_guard is not None and order["intent"] == "OPEN":
+                self._last_order_time = time.time()
+            # Placement is enabled only in TESTNET_TRADE (trader supplied there).
+            if self._binance_trader is not None:
+                self._place_order(order)
