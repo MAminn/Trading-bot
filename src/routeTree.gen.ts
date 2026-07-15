@@ -26,6 +26,7 @@ import { Route as ApiPublicEngineEthPriceRouteImport } from './routes/api/public
 import { Route as ApiPublicEngineDemoTickRouteImport } from './routes/api/public/engine/demo-tick'
 import { Route as ApiPublicEngineConfigRouteImport } from './routes/api/public/engine/config'
 import { Route as ApiPublicEngineSignalsPendingRouteImport } from './routes/api/public/engine/signals.pending'
+import { Route as ApiPublicEngineOrdersStateRouteImport } from './routes/api/public/engine/orders.state'
 import { Route as ApiPublicEngineIngestTradeRouteImport } from './routes/api/public/engine/ingest.trade'
 import { Route as ApiPublicEngineIngestSignalRouteImport } from './routes/api/public/engine/ingest.signal'
 import { Route as ApiPublicEngineIngestOrder_updateRouteImport } from './routes/api/public/engine/ingest.order_update'
@@ -119,6 +120,12 @@ const ApiPublicEngineSignalsPendingRoute =
     path: '/api/public/engine/signals/pending',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ApiPublicEngineOrdersStateRoute =
+  ApiPublicEngineOrdersStateRouteImport.update({
+    id: '/api/public/engine/orders/state',
+    path: '/api/public/engine/orders/state',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiPublicEngineIngestTradeRoute =
   ApiPublicEngineIngestTradeRouteImport.update({
     id: '/api/public/engine/ingest/trade',
@@ -172,6 +179,7 @@ export interface FileRoutesByFullPath {
   '/api/public/engine/ingest/order_update': typeof ApiPublicEngineIngestOrder_updateRoute
   '/api/public/engine/ingest/signal': typeof ApiPublicEngineIngestSignalRoute
   '/api/public/engine/ingest/trade': typeof ApiPublicEngineIngestTradeRoute
+  '/api/public/engine/orders/state': typeof ApiPublicEngineOrdersStateRoute
   '/api/public/engine/signals/pending': typeof ApiPublicEngineSignalsPendingRoute
 }
 export interface FileRoutesByTo {
@@ -195,6 +203,7 @@ export interface FileRoutesByTo {
   '/api/public/engine/ingest/order_update': typeof ApiPublicEngineIngestOrder_updateRoute
   '/api/public/engine/ingest/signal': typeof ApiPublicEngineIngestSignalRoute
   '/api/public/engine/ingest/trade': typeof ApiPublicEngineIngestTradeRoute
+  '/api/public/engine/orders/state': typeof ApiPublicEngineOrdersStateRoute
   '/api/public/engine/signals/pending': typeof ApiPublicEngineSignalsPendingRoute
 }
 export interface FileRoutesById {
@@ -220,6 +229,7 @@ export interface FileRoutesById {
   '/api/public/engine/ingest/order_update': typeof ApiPublicEngineIngestOrder_updateRoute
   '/api/public/engine/ingest/signal': typeof ApiPublicEngineIngestSignalRoute
   '/api/public/engine/ingest/trade': typeof ApiPublicEngineIngestTradeRoute
+  '/api/public/engine/orders/state': typeof ApiPublicEngineOrdersStateRoute
   '/api/public/engine/signals/pending': typeof ApiPublicEngineSignalsPendingRoute
 }
 export interface FileRouteTypes {
@@ -246,6 +256,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/ingest/order_update'
     | '/api/public/engine/ingest/signal'
     | '/api/public/engine/ingest/trade'
+    | '/api/public/engine/orders/state'
     | '/api/public/engine/signals/pending'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -269,6 +280,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/ingest/order_update'
     | '/api/public/engine/ingest/signal'
     | '/api/public/engine/ingest/trade'
+    | '/api/public/engine/orders/state'
     | '/api/public/engine/signals/pending'
   id:
     | '__root__'
@@ -293,6 +305,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/ingest/order_update'
     | '/api/public/engine/ingest/signal'
     | '/api/public/engine/ingest/trade'
+    | '/api/public/engine/orders/state'
     | '/api/public/engine/signals/pending'
   fileRoutesById: FileRoutesById
 }
@@ -309,6 +322,7 @@ export interface RootRouteChildren {
   ApiPublicEngineIngestOrder_updateRoute: typeof ApiPublicEngineIngestOrder_updateRoute
   ApiPublicEngineIngestSignalRoute: typeof ApiPublicEngineIngestSignalRoute
   ApiPublicEngineIngestTradeRoute: typeof ApiPublicEngineIngestTradeRoute
+  ApiPublicEngineOrdersStateRoute: typeof ApiPublicEngineOrdersStateRoute
   ApiPublicEngineSignalsPendingRoute: typeof ApiPublicEngineSignalsPendingRoute
 }
 
@@ -433,6 +447,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiPublicEngineSignalsPendingRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/public/engine/orders/state': {
+      id: '/api/public/engine/orders/state'
+      path: '/api/public/engine/orders/state'
+      fullPath: '/api/public/engine/orders/state'
+      preLoaderRoute: typeof ApiPublicEngineOrdersStateRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/public/engine/ingest/trade': {
       id: '/api/public/engine/ingest/trade'
       path: '/api/public/engine/ingest/trade'
@@ -512,6 +533,7 @@ const rootRouteChildren: RootRouteChildren = {
     ApiPublicEngineIngestOrder_updateRoute,
   ApiPublicEngineIngestSignalRoute: ApiPublicEngineIngestSignalRoute,
   ApiPublicEngineIngestTradeRoute: ApiPublicEngineIngestTradeRoute,
+  ApiPublicEngineOrdersStateRoute: ApiPublicEngineOrdersStateRoute,
   ApiPublicEngineSignalsPendingRoute: ApiPublicEngineSignalsPendingRoute,
 }
 export const routeTree = rootRouteImport
