@@ -19,6 +19,7 @@ from decimal import ROUND_DOWN, Decimal
 import requests
 
 from binance_client import BinanceAPIError, BinanceFuturesClient
+from reconciler import Reconciler, ReconcilerError
 
 log = logging.getLogger("executor.consumer")
 
@@ -95,6 +96,8 @@ class SignalConsumer:
         self._binance = BinanceFuturesClient(
             MODE_BINANCE_BASE_URLS[execution_mode], "", ""
         )
+        # Reconciler shares the authenticated session; it only reads orders/state.
+        self._reconciler = Reconciler(self._base, self._session, user_id)
 
     # ------------------------------------------------------------------ #
     # app API helpers
@@ -344,17 +347,82 @@ class SignalConsumer:
         return amt if amt is not None else 0.0
 
     # ------------------------------------------------------------------ #
+    # reconciliation (runs at the start of every cycle)
+    # ------------------------------------------------------------------ #
+
+    def reconcile(self, position_amt) -> tuple[bool, str | None]:
+        """Reconcile the app's last-executed record against the live position at
+        cycle start. Returns (opens_blocked, block_reason).
+
+        Trade-capable mode (TESTNET_TRADE): closes out stale intents via
+        order_update, and blocks OPENs when the kill switch is off or the
+        position mismatches. A fetch failure raises SignalConsumerError so the
+        unified retry counter treats it as a failed cycle — the fail-safe that
+        guarantees no OPEN is placed in a cycle that could not reconcile.
+
+        Read-only mode (TESTNET_READ): log-only. It logs the RECONCILE line but
+        writes no order_update, never blocks (nothing is placed anyway), and a
+        fetch failure is swallowed."""
+        trade_capable = self._binance_trader is not None
+        try:
+            state = self._reconciler.reconcile(position_amt)
+        except ReconcilerError as exc:
+            if trade_capable:
+                log.error("reconcile failed, failing cycle: %s", exc)
+                raise SignalConsumerError(f"reconcile failed: {exc}") from exc
+            log.warning("reconcile failed (read-only, ignored): %s", exc)
+            return False, None
+
+        log.info(
+            "RECONCILE | match=%s | expected=%s | actual=%s | is_running=%s",
+            state["match"],
+            state["expected"],
+            position_amt,
+            state["is_running"],
+        )
+
+        if not trade_capable:
+            # Read-only reconciliation is purely informational.
+            return False, None
+
+        # Close out intents that were logged but never sent (stuck INTENT_LOGGED).
+        for key in state["stale_intents"]:
+            self._post_order_update(
+                {
+                    "user_id": self._user_id,
+                    "idempotency_key": key,
+                    "status": "FAILED",
+                    "error": "stale: never sent",
+                }
+            )
+            log.info("STALE INTENT CLOSED | %s", key)
+
+        reason = None
+        if not state["is_running"]:
+            reason = "kill_switch_active"
+        elif not state["match"]:
+            reason = "reconcile_mismatch"
+        return reason is not None, reason
+
+    # ------------------------------------------------------------------ #
     # public entrypoint
     # ------------------------------------------------------------------ #
 
-    def poll_once(self, mark_price=None, position_amt=None) -> None:
+    def poll_once(
+        self,
+        position_amt=None,
+        opens_blocked: bool = False,
+        block_reason: str | None = None,
+    ) -> None:
         """One poll cycle: refresh config as scheduled, fetch pending signals,
         log each as an order intent. Raises SignalConsumerError on failure.
 
-        position_amt: current position amount for the symbol, used by the
-        risk guard in trade-capable modes. The mark_price argument is
-        deprecated and ignored — the price is fetched from
-        /fapi/v1/premiumIndex once per cycle."""
+        position_amt: current position amount for the symbol, used by the risk
+        guard in trade-capable modes.
+
+        opens_blocked / block_reason: supplied by the caller from reconcile().
+        When set, OPEN intents this cycle are recorded SKIPPED with block_reason
+        and never placed; CLOSE intents are evaluated and placed as usual."""
         if self._max_position_size_usd is None or self._cycles % CONFIG_REFRESH_EVERY_CYCLES == 0:
             self._refresh_config()
         self._cycles += 1
@@ -398,11 +466,16 @@ class SignalConsumer:
                         signal.get("bar_time"),
                     )
                 else:
-                    current_amt = self._process_intent(close_order, current_amt)
+                    current_amt = self._process_intent(
+                        close_order, current_amt, opens_blocked, block_reason
+                    )
 
             if signal.get("rule_side") in (1, -1):
                 current_amt = self._process_intent(
-                    self._build_intent(signal, ref_price), current_amt
+                    self._build_intent(signal, ref_price),
+                    current_amt,
+                    opens_blocked,
+                    block_reason,
                 )
 
             # Advance cursor only after the intent(s) are persisted (or confirmed
@@ -410,10 +483,27 @@ class SignalConsumer:
             # cycle. Normalized to Z-form: the pending route rejects +00:00 offsets.
             self._cursor = to_z_iso(signal["created_at"])
 
-    def _process_intent(self, order: dict, position_amt):
+    def _process_intent(self, order: dict, position_amt, opens_blocked: bool = False, block_reason: str | None = None):
         """Guard, persist, and (in TESTNET_TRADE) place a single intent. Returns
         the current position amount, updated to the settled value after a
-        placement so a same-cycle follow-up sizes against the real state."""
+        placement so a same-cycle follow-up sizes against the real state.
+
+        A blocked OPEN (kill switch off or reconcile mismatch) is recorded
+        SKIPPED with block_reason and never placed. CLOSE intents ignore the
+        block."""
+        if (
+            order["intent"] == "OPEN"
+            and opens_blocked
+            and order["status"] == "INTENT_LOGGED"
+        ):
+            order["status"] = "SKIPPED"
+            order["error"] = block_reason
+            log.info(
+                "BLOCKED | OPEN %s | %s | key=%s",
+                order["side"],
+                block_reason,
+                order["idempotency_key"],
+            )
         if self._risk_guard is not None and order["status"] == "INTENT_LOGGED":
             allowed, reason = self._risk_guard.evaluate(
                 order, position_amt, self._last_order_time

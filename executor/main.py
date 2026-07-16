@@ -239,7 +239,15 @@ def run_testnet(mode: str) -> int:
             position_amt = float(pos_amt or 0)
         except (TypeError, ValueError):
             position_amt = 0.0
-        consumer.poll_once(position_amt=position_amt)
+        # Reconcile at cycle start, before signal processing. In TESTNET_TRADE a
+        # fetch failure raises SignalConsumerError here (failed cycle) so no OPEN
+        # is placed this cycle; in TESTNET_READ it is log-only.
+        opens_blocked, block_reason = consumer.reconcile(position_amt)
+        consumer.poll_once(
+            position_amt=position_amt,
+            opens_blocked=opens_blocked,
+            block_reason=block_reason,
+        )
 
     # Unified cycle loop: startup and recurring fetches share one failure counter.
     first_success = False
