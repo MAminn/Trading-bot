@@ -5,25 +5,30 @@ import { z } from "zod";
 
 export const setEngineRunning = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
-  .inputValidator((d: { running: boolean }) =>
-    z.object({ running: z.boolean() }).parse(d))
+  .inputValidator((d: { running: boolean }) => z.object({ running: z.boolean() }).parse(d))
   .handler(async ({ data, context }) => {
     const nowIso = new Date().toISOString();
-    const { error } = await context.supabase
+    const { data: updated, error } = await context.supabase
       .from("engine_config")
       .update({ is_running: data.running, updated_at: nowIso })
-      .eq("user_id", context.userId);
-    if (error) throw new Error(error.message);
+      .eq("user_id", context.userId)
+      .select("id");
+    if (error || !updated || updated.length === 0) {
+      throw new Error("engine_config update affected 0 rows — wrong account or missing config row");
+    }
     // Immediately reflect the desired state in engine_status so the UI pill
     // changes the moment the user presses Start/Stop, before the first tick.
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
-    await supabaseAdmin.from("engine_status").upsert({
-      user_id: context.userId,
-      status: data.running ? "running" : "stopped",
-      message: data.running ? "starting…" : "stopped by user",
-      last_heartbeat: null,
-      updated_at: nowIso,
-    }, { onConflict: "user_id" });
+    await supabaseAdmin.from("engine_status").upsert(
+      {
+        user_id: context.userId,
+        status: data.running ? "running" : "stopped",
+        message: data.running ? "starting…" : "stopped by user",
+        last_heartbeat: null,
+        updated_at: nowIso,
+      },
+      { onConflict: "user_id" },
+    );
     return { ok: true };
   });
 
@@ -158,7 +163,12 @@ export const closeAllPositions = createServerFn({ method: "POST" })
     const nowIso = new Date().toISOString();
     let closed = 0;
     for (const o of opens ?? []) {
-      try { await closeOne(supabaseAdmin, context.userId, o, ethPrice, nowIso); closed++; } catch { /* ignore */ }
+      try {
+        await closeOne(supabaseAdmin, context.userId, o, ethPrice, nowIso);
+        closed++;
+      } catch {
+        /* ignore */
+      }
     }
     return { ok: true, closed };
   });
