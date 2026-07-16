@@ -57,6 +57,7 @@ export const Route = createFileRoute("/api/public/engine/orders/state")({
           .select("idempotency_key")
           .eq("user_id", parsed.user_id)
           .eq("status", "INTENT_LOGGED")
+          .is("binance_order_id", null)
           .lt("created_at", staleBefore)
           .order("created_at", { ascending: true })
           .limit(20);
