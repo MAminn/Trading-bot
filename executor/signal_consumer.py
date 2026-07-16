@@ -33,7 +33,7 @@ NOTIONAL_CAP_USD = Decimal("100")
 # After placing an order, poll the position until Binance reflects the fill so a
 # same-cycle follow-up (e.g. a CLOSE after an OPEN) sizes against the real state.
 SETTLE_MAX_POLLS = 10
-SETTLE_POLL_INTERVAL_SECONDS = 1
+SETTLE_POLL_INTERVAL_SECONDS = 2
 
 # The execution mode determines the Binance base URL used for the unsigned
 # mark-price read — never configurable via env.
