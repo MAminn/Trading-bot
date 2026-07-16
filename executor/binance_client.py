@@ -35,6 +35,17 @@ class BinanceAPIError(Exception):
         )
 
 
+class RateLimitError(Exception):
+    """Raised on HTTP 429/418, carrying the Retry-After value in seconds."""
+
+    def __init__(self, http_status: int, retry_after: int):
+        self.http_status = http_status
+        self.retry_after = retry_after
+        super().__init__(
+            f"Binance rate limited (HTTP {http_status}, retry_after={retry_after}s)"
+        )
+
+
 class BinanceFuturesClient:
     """USD-M Futures client: reads + config writes + one MARKET order path."""
 
@@ -103,6 +114,12 @@ class BinanceFuturesClient:
             params=params,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
+        if response.status_code in (429, 418):
+            try:
+                retry_after = int(response.headers.get("Retry-After", 0))
+            except (TypeError, ValueError):
+                retry_after = 0
+            raise RateLimitError(response.status_code, retry_after)
         if not 200 <= response.status_code < 300:
             raise self._parse_error(response)
         return response.json()

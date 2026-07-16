@@ -66,7 +66,7 @@ def _extract_filters(symbol_info: dict) -> tuple[str, str, str]:
 def run_testnet(mode: str) -> int:
     """Runs TESTNET_READ (pure read) and TESTNET_TRADE (read + account
     enforcement + risk guard + order placement)."""
-    from binance_client import BinanceAPIError, BinanceFuturesClient
+    from binance_client import BinanceAPIError, BinanceFuturesClient, RateLimitError
     from signal_consumer import SignalConsumer, SignalConsumerError
 
     api_key = os.environ.get("BINANCE_TESTNET_API_KEY", "").strip()
@@ -259,6 +259,11 @@ def run_testnet(mode: str) -> int:
             consecutive_failures = 0
         except FatalConfigError:
             return 1
+        except RateLimitError as exc:
+            backoff = max(exc.retry_after, 60)
+            log.error("RATE LIMITED | backing off %ds", backoff)
+            time.sleep(backoff)
+            continue
         except (BinanceAPIError, SignalConsumerError, EnforcementError, OSError) as exc:
             consecutive_failures += 1
             log.error(
