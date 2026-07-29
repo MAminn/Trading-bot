@@ -2255,31 +2255,77 @@ def v22_live_long_candidate(row: pd.Series) -> bool:
     return False
 
 
-def v22_live_long_candidate_approx_disabled(row: pd.Series) -> bool:
+def v22_long_causal_gate_state(row: pd.Series) -> Dict[str, Any]:
+    """Return exact future V22 LONG archetype, seven gates and candidate."""
+    empty_gates = {
+        "setup_ok": False,
+        "vol_ok": False,
+        "session_ok": False,
+        "htf_ok": False,
+        "btc_ethbtc_ok": False,
+        "flow_or_oi_ok": False,
+        "funding_ok": False,
+    }
     if not valid_signal_row(row):
-        return False
+        return {
+            "candidate": False,
+            "archetype": "invalid",
+            "gates": empty_gates,
+            "mode": "V22_LOCKED_EXACT_PARITY_REPAIRED",
+        }
+
     th = V22_THRESHOLDS
     arch = v22_training_pre_entry_archetype(row)
     setup_ok = arch == "breakout"
-    atrp = row_num_any(row, ["atrp_14", "pre_atr14_pct"], np.nan)
-    range_pct = row_num_any(row, ["range_pct", "pre_range_pct"], 0.0)
-    funding_abs = row_num_any(row, ["binance_funding_rate_abs", "pre_binance_funding_rate_abs"], 0.0)
-    vol_ok = (pd.notna(atrp) and th.atr_low <= atrp <= th.atr_high) or (range_pct >= th.range_high)
-    session_ok = row_num_any(row, ["session_active_07_21", "pre_session_active_07_21"], 1.0) >= 0.5
-    htf_ok = (
-        row_num_any(row, ["ema20_slope_10_1h", "1h__ema20_slope_10"], 0.0) > 0
-        or row_num_any(row, ["ema20_slope_10_4h", "4h__ema20_slope_10"], 0.0) > 0
-        or row_num_any(row, ["trend_regime_ema50_200_4h", "4h__trend_regime_ema50_200"], 0.0) > 0
-        or row_num_any(row, ["trend_regime_ema50_200_1d", "1d__trend_regime_ema50_200"], 0.0) > 0
+    atrp = row_num_any(row, ["v22_exact_atr14_pct", "atrp_14", "pre_atr14_pct"], np.nan)
+    range_pct = row_num_any(row, ["v22_exact_range_pct", "range_pct", "pre_range_pct"], 0.0)
+    funding_abs = row_num_any(
+        row,
+        ["v22_exact_binance_funding_rate_abs", "binance_funding_rate_abs", "pre_binance_funding_rate_abs"],
+        0.0,
     )
-    btc_ethbtc_ok = row_num_any(row, ["btc_trend_score"], 0.0) >= -1 and row_num_any(row, ["ethbtc_trend_score"], 0.0) >= -3
+    vol_ok = (pd.notna(atrp) and th.atr_low <= atrp <= th.atr_high) or (range_pct >= th.range_high)
+    session_ok = row_num_any(
+        row,
+        ["v22_exact_session_active_07_21", "session_active_07_21", "pre_session_active_07_21"],
+        1.0,
+    ) >= 0.5
+    htf_ok = (
+        row_num_any(row, ["v22_exact_eth1h_ema20_slope_10", "ema20_slope_10_1h", "1h__ema20_slope_10"], 0.0) > 0
+        or row_num_any(row, ["v22_exact_eth4h_ema20_slope_10", "ema20_slope_10_4h", "4h__ema20_slope_10"], 0.0) > 0
+        or row_num_any(row, ["v22_exact_eth4h_trend_regime_ema50_200", "trend_regime_ema50_200_4h", "4h__trend_regime_ema50_200"], 0.0) > 0
+        or row_num_any(row, ["v22_exact_eth1d_trend_regime_ema50_200", "trend_regime_ema50_200_1d", "1d__trend_regime_ema50_200"], 0.0) > 0
+    )
+    btc_ethbtc_ok = (
+        row_num_any(row, ["btc_trend_score"], 0.0) >= -1
+        and row_num_any(row, ["ethbtc_trend_score"], 0.0) >= -3
+    )
     flow_or_oi_ok = (
-        row_num_any(row, ["realagg_buy_ratio_quote"], 0.5) >= 0.48
-        or row_num_any(row, ["realagg_cvd_quote_delta_z_50"], 0.0) >= -0.25
-        or row_num_any(row, ["oi_price_oi_divergence_4"], 0.0) >= 0
+        row_num_any(row, ["v22_exact_realagg_buy_ratio_quote", "realagg_buy_ratio_quote"], 0.5) >= 0.48
+        or row_num_any(row, ["v22_exact_realagg_cvd_quote_delta_z_50", "realagg_cvd_quote_delta_z_50"], 0.0) >= -0.25
+        or row_num_any(row, ["v22_exact_oi_price_oi_divergence_4", "oi_price_oi_divergence_4"], 0.0) >= 0
     )
     funding_ok = funding_abs <= th.funding_abs_hi
-    return bool(setup_ok and vol_ok and session_ok and htf_ok and btc_ethbtc_ok and flow_or_oi_ok and funding_ok)
+
+    gates = {
+        "setup_ok": bool(setup_ok),
+        "vol_ok": bool(vol_ok),
+        "session_ok": bool(session_ok),
+        "htf_ok": bool(htf_ok),
+        "btc_ethbtc_ok": bool(btc_ethbtc_ok),
+        "flow_or_oi_ok": bool(flow_or_oi_ok),
+        "funding_ok": bool(funding_ok),
+    }
+    return {
+        "candidate": bool(all(gates.values())),
+        "archetype": arch,
+        "gates": gates,
+        "mode": "V22_LOCKED_EXACT_PARITY_REPAIRED",
+    }
+
+
+def v22_live_long_candidate_approx_disabled(row: pd.Series) -> bool:
+    return bool(v22_long_causal_gate_state(row)["candidate"])
 
 
 def long_adx_breakout_trigger(row: pd.Series) -> bool:
