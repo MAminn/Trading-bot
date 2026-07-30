@@ -10,19 +10,31 @@ export const Route = createFileRoute("/app/configure")({
   component: Configure,
 });
 
-// Coupled mapping: t in [0,1]
-// leverage = round(1 + t*69)   → 1..70
-// allocation = round(10 - t*9) → 10..1   (capped at 10% of account)
-const lvFromT = (t: number) => Math.round(1 + t * 69);
-const allocFromT = (t: number) => Math.round(10 - t * 9);
-const tFromLv = (lv: number) => Math.min(1, Math.max(0, (lv - 1) / 69));
-const tFromAlloc = (a: number) => Math.min(1, Math.max(0, (10 - a) / 9));
+// Allocation is the single source of truth. Leverage is derived, never free.
+// 10 discrete states. Nothing exists between adjacent steps.
+const ALLOC_MIN = 1;
+const ALLOC_MAX = 10;
+const LEVERAGE_BY_ALLOC: Record<number, number> = {
+  10: 1, 9: 10, 8: 20, 7: 30, 6: 40, 5: 50, 4: 60, 3: 70, 2: 80, 1: 90,
+};
+const allocToIndex = (a: number) => ALLOC_MAX - a;
+const indexToAlloc = (i: number) => ALLOC_MAX - i;
+const clampAlloc = (a: number) =>
+  Math.min(ALLOC_MAX, Math.max(ALLOC_MIN, Math.round(a)));
+const allocFromLeverage = (lv: number) => {
+  let best = ALLOC_MAX, bestDiff = Infinity;
+  for (const [a, l] of Object.entries(LEVERAGE_BY_ALLOC)) {
+    const d = Math.abs(l - lv);
+    if (d < bestDiff) { bestDiff = d; best = Number(a); }
+  }
+  return best;
+};
 
 function Configure() {
   const { data: config, isLoading } = useEngineConfig();
   const update = useUpdateConfig();
   const [accountSize, setAccountSize] = useState("");
-  const [t, setT] = useState(0);
+  const [allocPct, setAllocPct] = useState<number>(ALLOC_MAX);
   const [maxLoss, setMaxLoss] = useState("");
   const [maxPos, setMaxPos] = useState("");
 
@@ -32,13 +44,18 @@ function Configure() {
     const cap = Number(config.capital_usd ?? 0);
     const acct = pct > 0 ? cap / (pct / 100) : cap;
     setAccountSize(String(Math.round(acct)));
-    setT(tFromLv(Number(config.leverage ?? 1)));
+    const rawAlloc = Number(config.capital_allocation_pct);
+    if (Number.isFinite(rawAlloc) && rawAlloc >= ALLOC_MIN && rawAlloc <= ALLOC_MAX) {
+      setAllocPct(clampAlloc(rawAlloc));
+    } else {
+      const rawLev = Number(config.leverage);
+      setAllocPct(Number.isFinite(rawLev) ? allocFromLeverage(rawLev) : ALLOC_MAX);
+    }
     setMaxLoss(String(config.max_daily_loss_usd));
     setMaxPos(String(config.max_position_size_usd));
   }, [config]);
 
-  const leverage = lvFromT(t);
-  const allocPct = allocFromT(t);
+  const leverage = LEVERAGE_BY_ALLOC[allocPct] ?? 1;
   const capitalUsd = useMemo(
     () => Math.round((Number(accountSize) || 0) * (allocPct / 100)),
     [accountSize, allocPct],
@@ -96,12 +113,12 @@ function Configure() {
                 </div>
                 <Slider
                   className="mt-3"
-                  min={0} max={1000} step={1}
-                  value={[Math.round(t * 1000)]}
-                  onValueChange={(v) => setT(v[0] / 1000)}
+                  min={0} max={9} step={1}
+                  value={[allocToIndex(allocPct)]}
+                  onValueChange={(v) => setAllocPct(indexToAlloc(v[0]))}
                 />
                 <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
-                  <span>1×</span><span>70×</span>
+                  <span>1×</span><span>90×</span>
                 </div>
               </div>
 
@@ -112,10 +129,9 @@ function Configure() {
                 </div>
                 <Slider
                   className="mt-3"
-                  min={0} max={1000} step={1}
-                  // allocation slider is inverse of t: drag right → more allocation → less leverage
-                  value={[Math.round((1 - t) * 1000)]}
-                  onValueChange={(v) => setT(1 - v[0] / 1000)}
+                  min={ALLOC_MIN} max={ALLOC_MAX} step={1}
+                  value={[allocPct]}
+                  onValueChange={(v) => setAllocPct(clampAlloc(v[0]))}
                 />
                 <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
                   <span>1%</span><span>10%</span>
@@ -130,10 +146,19 @@ function Configure() {
               </span>
             </div>
 
-            <div className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 text-xs md:grid-cols-3">
+            <p className="text-xs text-muted-foreground">
+              Allocation moves in whole percent only; leverage is derived from it.
+              Margin committed always equals your allocation — leverage multiplies
+              exposure, not capital at risk. The executor clamps leverage to the ETHUSDT
+              exchange maximum and caps order notional independently, so live order size
+              may be smaller than shown.
+            </p>
+
+            <div className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 text-xs md:grid-cols-4">
               <KV k="Strategy capital" v={fmtUSD(capitalUsd)} />
               <KV k="Leverage" v={`${leverage}×`} />
               <KV k="Allocation" v={`${allocPct}%`} />
+              <KV k="Notional" v={fmtUSD(capitalUsd * leverage)} />
             </div>
 
             <div className="space-y-3">

@@ -172,6 +172,24 @@ class BinanceFuturesClient:
         positions = self._get("/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
         return [p for p in positions if p.get("symbol") == symbol]
 
+    def get_leverage_brackets(self, symbol: str) -> list[dict]:
+        """GET /fapi/v1/leverageBracket (signed). Returns the symbol's brackets."""
+        data = self._get("/fapi/v1/leverageBracket", {"symbol": symbol}, signed=True)
+        # The endpoint returns either a list of symbol entries or a single object
+        # depending on whether the symbol filter is honoured.
+        entries = data if isinstance(data, list) else [data]
+        for entry in entries:
+            if entry.get("symbol") == symbol:
+                brackets = entry.get("brackets") or []
+                if not brackets:
+                    raise BinanceAPIError(
+                        200, None, f"no leverage brackets returned for {symbol}"
+                    )
+                return brackets
+        raise BinanceAPIError(
+            200, None, f"symbol {symbol} not found in leverageBracket response"
+        )
+
     # ------------------------------------------------------------------ #
     # account-configuration writes plus a single MARKET order placement.
     # No cancel, batch, or other order endpoints exist in this client.

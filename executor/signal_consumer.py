@@ -7,7 +7,7 @@ ingest/order_update). TESTNET_READ stays pure-read; TESTNET_TRADE records
 intents, places allowed MARKET orders, and persists the outcome.
 
 The config endpoint response contains decrypted Binance credentials, so the
-raw response is never logged; only max_position_size_usd is extracted.
+raw response is never logged; only the sizing fields are extracted.
 """
 
 import hashlib
@@ -28,7 +28,14 @@ CONFIG_REFRESH_EVERY_CYCLES = 10
 
 STEP_SIZE = Decimal("0.001")
 MIN_NOTIONAL_USD = Decimal("20")
-NOTIONAL_CAP_USD = Decimal("100")
+# Code ceiling for the first soak. Not reachable from the UI.
+HARD_CAP_USD = Decimal("500")
+# Never commit more than this fraction of available balance as margin.
+MARGIN_SAFETY_FRACTION = Decimal("0.90")
+
+# Transient keys carried on the intent dict for the risk guard only. They are
+# stripped before POSTing so they never reach the app's Zod schema.
+NON_PERSISTED_KEYS = {"leverage"}
 
 # After placing an order, poll the position until Binance reflects the fill so a
 # same-cycle follow-up (e.g. a CLOSE after an OPEN) sizes against the real state.
@@ -89,7 +96,17 @@ class SignalConsumer:
         # Always stored in canonical Z-form — the pending route rejects +00:00 offsets.
         self._cursor: str | None = to_z_iso(start_after) if start_after else None
         self._cycles = 0
+        # True between the first ensure_config() of a cycle and the end of
+        # poll_once, so repeated calls in one cycle cannot double-count.
+        self._cycle_counted = False
         self._max_position_size_usd: Decimal | None = None
+        self._leverage: Decimal | None = None
+        self._capital_usd: Decimal | None = None
+        self._alloc_pct: Decimal | None = None
+        self._max_notional_usd: Decimal | None = None
+        self._available_balance: Decimal | None = None
+        self._exchange_max_leverage: int | None = None
+        self._bracket_notional_cap: Decimal | None = None
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {engine_service_token}"})
         # Credential-less client used exclusively for the unsigned mark-price read.
@@ -119,18 +136,81 @@ class SignalConsumer:
     def _refresh_config(self) -> None:
         body = self._get("/api/public/engine/config", {"user_id": self._user_id})
         # Response includes decrypted secrets — never log it. Extract sizing only.
-        raw = (body.get("config") or {}).get("max_position_size_usd")
+        config = body.get("config") or {}
+
+        raw = config.get("max_position_size_usd")
         if raw is None:
             raise SignalConsumerError("config missing max_position_size_usd")
+        # Read but NEVER used for sizing: this field is the UI's stop-loss %.
         self._max_position_size_usd = Decimal(str(raw))
+
+        for field, attr in (
+            ("leverage", "_leverage"),
+            ("capital_allocation_pct", "_alloc_pct"),
+            ("capital_usd", "_capital_usd"),
+        ):
+            value = config.get(field)
+            if value is None:
+                raise SignalConsumerError(f"config missing {field}")
+            setattr(self, attr, Decimal(str(value)))
+
+        raw_max_notional = config.get("max_notional_usd")
+        if raw_max_notional is None:
+            # Pre-migration rows have no column; fall back to the code ceiling.
+            self._max_notional_usd = HARD_CAP_USD
+            log.info(
+                "config missing max_notional_usd, defaulting to HARD_CAP_USD=%s",
+                HARD_CAP_USD,
+            )
+        else:
+            self._max_notional_usd = Decimal(str(raw_max_notional))
+
         log.info(
-            "config refreshed | max_position_size_usd=%s", self._max_position_size_usd
+            "config refreshed | leverage=%s | alloc_pct=%s | capital_usd=%s | "
+            "max_notional_usd=%s",
+            self._leverage,
+            self._alloc_pct,
+            self._capital_usd,
+            self._max_notional_usd,
         )
+        if self._risk_guard is not None:
+            self._risk_guard.update_limits(max_notional_usd=self._max_notional_usd)
+
+    def ensure_config(self) -> None:
+        """Refresh config if due. Safe to call every cycle.
+
+        Owns the refresh schedule and the cycle counter. Idempotent within a
+        cycle: only the first call of a cycle refreshes and increments, so
+        _cycles advances exactly once per cycle however many callers there are."""
+        if self._cycle_counted:
+            return
+        if self._leverage is None or self._cycles % CONFIG_REFRESH_EVERY_CYCLES == 0:
+            self._refresh_config()
+        self._cycles += 1
+        self._cycle_counted = True
+
+    @property
+    def desired_leverage(self) -> int | None:
+        """Configured leverage as an int, or None before the first refresh."""
+        return int(self._leverage) if self._leverage is not None else None
+
+    def set_leverage_limits(self, max_leverage: int, notional_cap: Decimal) -> None:
+        """Record the exchange's authoritative bracket limits for this symbol."""
+        self._exchange_max_leverage = int(max_leverage)
+        self._bracket_notional_cap = Decimal(str(notional_cap))
+
+    def set_available_balance(self, bal: Decimal) -> None:
+        """Record the account's available balance for the margin sanity check."""
+        self._available_balance = Decimal(str(bal))
 
     def _post_order(self, order: dict) -> bool:
         """POST the intent. Returns True if newly created (201), False if the
         app reports it as a duplicate (409)."""
-        payload = {k: v for k, v in order.items() if v is not None}
+        payload = {
+            k: v
+            for k, v in order.items()
+            if v is not None and k not in NON_PERSISTED_KEYS
+        }
         try:
             resp = self._session.post(
                 f"{self._base}/api/public/engine/ingest/order",
@@ -179,7 +259,13 @@ class SignalConsumer:
         bar_time = to_z_iso(signal["bar_time"])
         idempotency_key = f"{self._user_id}:{bar_time}:{side}:OPEN"
 
-        notional_target = min(self._max_position_size_usd, NOTIONAL_CAP_USD)
+        target = self._capital_usd * self._leverage
+        caps = [target, self._max_notional_usd, HARD_CAP_USD]
+        if self._bracket_notional_cap is not None:
+            caps.append(self._bracket_notional_cap)
+        notional_target = min(caps)
+        if notional_target < target:
+            log.info("SIZE CLAMPED | target=%s -> %s", target, notional_target)
         qty = (notional_target / ref_price).quantize(STEP_SIZE, rounding=ROUND_DOWN)
         notional = qty * ref_price
 
@@ -195,10 +281,18 @@ class SignalConsumer:
             "execution_mode": self._execution_mode,
             "status": "INTENT_LOGGED",
             "idempotency_key": idempotency_key,
+            # Transient: read by the risk guard, stripped before the POST.
+            "leverage": int(self._leverage),
         }
         if notional < MIN_NOTIONAL_USD:
             order["status"] = "SKIPPED"
             order["error"] = "below min notional"
+        elif self._available_balance is not None and (
+            notional / self._leverage
+            > self._available_balance * MARGIN_SAFETY_FRACTION
+        ):
+            order["status"] = "SKIPPED"
+            order["error"] = "insufficient margin for configured size"
         return order
 
     def _build_close_intent(self, signal: dict, ref_price: Decimal, position_amt) -> dict | None:
@@ -368,6 +462,10 @@ class SignalConsumer:
             state = self._reconciler.reconcile(position_amt)
         except ReconcilerError as exc:
             if trade_capable:
+                # poll_once will not run this cycle, so close the cycle here
+                # instead — otherwise the next ensure_config() would see a
+                # stranded flag and skip its refresh.
+                self._cycle_counted = False
                 log.error("reconcile failed, failing cycle: %s", exc)
                 raise SignalConsumerError(f"reconcile failed: {exc}") from exc
             log.warning("reconcile failed (read-only, ignored): %s", exc)
@@ -423,10 +521,24 @@ class SignalConsumer:
         opens_blocked / block_reason: supplied by the caller from reconcile().
         When set, OPEN intents this cycle are recorded SKIPPED with block_reason
         and never placed; CLOSE intents are evaluated and placed as usual."""
-        if self._max_position_size_usd is None or self._cycles % CONFIG_REFRESH_EVERY_CYCLES == 0:
-            self._refresh_config()
-        self._cycles += 1
+        # ensure_config() owns both the refresh schedule and the cycle counter,
+        # so _cycles increments exactly once per cycle even when main.py has
+        # already called it earlier in the same cycle.
+        self.ensure_config()
+        try:
+            self._poll_signals(position_amt, opens_blocked, block_reason)
+        finally:
+            # poll_once is the last step of a cycle: close it so the next
+            # ensure_config() counts again, whether or not this one raised.
+            self._cycle_counted = False
 
+    def _poll_signals(
+        self,
+        position_amt,
+        opens_blocked: bool,
+        block_reason: str | None,
+    ) -> None:
+        """Fetch pending signals and record/place an intent for each."""
         params = {"user_id": self._user_id}
         if self._cursor:
             params["after"] = self._cursor
