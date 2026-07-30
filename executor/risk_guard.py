@@ -9,10 +9,24 @@ import time
 
 class RiskGuard:
     ALLOWED_SYMBOLS = {"ETHUSDT"}
-    MAX_NOTIONAL_USD = 100
     MIN_NOTIONAL_USD = 20
-    MAX_LEVERAGE = 1  # recorded for reference; enforced at startup via account config
     MIN_ORDER_INTERVAL_SECONDS = 60
+    # Absolute backstop: no config value may raise the effective cap above this.
+    ABSOLUTE_MAX_NOTIONAL_USD = 500
+
+    def __init__(self, max_notional_usd=100, max_leverage=1):
+        # Conservative defaults so the guard is safe before the bracket probe
+        # and the first config refresh have supplied real limits.
+        self._max_notional_usd = max_notional_usd
+        self._max_leverage = max_leverage
+
+    def update_limits(self, *, max_notional_usd=None, max_leverage=None) -> None:
+        """Update only the limits supplied. main.py sets max_leverage after the
+        bracket probe; the consumer sets max_notional_usd on every refresh."""
+        if max_notional_usd is not None:
+            self._max_notional_usd = max_notional_usd
+        if max_leverage is not None:
+            self._max_leverage = max_leverage
 
     def evaluate(
         self, intended_order: dict, current_position_amt, last_order_time
@@ -55,10 +69,24 @@ class RiskGuard:
             notional = float(intended_order.get("notional_usd") or 0)
         except (TypeError, ValueError):
             notional = 0.0
-        if notional > self.MAX_NOTIONAL_USD:
-            return False, f"notional {notional} exceeds max {self.MAX_NOTIONAL_USD}"
+        effective_max = min(
+            float(self._max_notional_usd), float(self.ABSOLUTE_MAX_NOTIONAL_USD)
+        )
+        if notional > effective_max:
+            return False, f"notional {notional} exceeds max {effective_max}"
         if notional < self.MIN_NOTIONAL_USD:
             return False, "below min notional"
+
+        try:
+            order_leverage = float(intended_order.get("leverage") or 0)
+        except (TypeError, ValueError):
+            order_leverage = 0.0
+        if order_leverage > float(self._max_leverage):
+            return (
+                False,
+                f"leverage {intended_order.get('leverage')} exceeds exchange max "
+                f"{self._max_leverage}",
+            )
 
         try:
             position_amt = float(current_position_amt or 0)

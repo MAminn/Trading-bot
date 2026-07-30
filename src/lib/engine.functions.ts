@@ -32,11 +32,18 @@ export const setEngineRunning = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
+// Allocation is the single source of truth; leverage is derived from it.
+// These are the only ten pairs the UI can produce and the only ten accepted.
+const LEVERAGE_BY_ALLOC: Record<number, number> = {
+  10: 1, 9: 10, 8: 20, 7: 30, 6: 40, 5: 50, 4: 60, 3: 70, 2: 80, 1: 90,
+};
+
 const ConfigPatch = z.object({
   capital_usd: z.number().positive().max(1e9).optional(),
   // allocation is capped at 10% to keep position size small relative to account
   capital_allocation_pct: z.number().min(1).max(10).optional(),
-  leverage: z.number().min(1).max(70).optional(),
+  leverage: z.number().min(1).max(90).optional(),
+  max_notional_usd: z.number().positive().max(100000).optional(),
   // these two fields are reused as Take-Profit % and Stop-Loss % in the UI.
   // Numeric ranges remain wide so older values continue to validate.
   max_daily_loss_usd: z.number().min(0).max(1e9).optional(),
@@ -44,6 +51,29 @@ const ConfigPatch = z.object({
   demo_mode: z.boolean().optional(),
   // mode is locked to signal_only for now
   mode: z.enum(["signal_only"]).optional(),
+}).superRefine((val, ctx) => {
+  const hasLev = val.leverage !== undefined;
+  const hasAlloc = val.capital_allocation_pct !== undefined;
+  // Neither present: unrelated patches (e.g. demo_mode toggle) pass untouched.
+  if (!hasLev && !hasAlloc) return;
+  if (hasLev !== hasAlloc) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: [hasLev ? "capital_allocation_pct" : "leverage"],
+      message: "leverage and capital_allocation_pct must be updated together",
+    });
+    return;
+  }
+  const expected = LEVERAGE_BY_ALLOC[val.capital_allocation_pct as number];
+  if (expected === undefined || expected !== val.leverage) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["leverage"],
+      message:
+        `leverage ${val.leverage} does not match allocation ` +
+        `${val.capital_allocation_pct}% (expected ${expected ?? "a whole 1-10% allocation"})`,
+    });
+  }
 });
 
 export const updateEngineConfig = createServerFn({ method: "POST" })
@@ -53,7 +83,9 @@ export const updateEngineConfig = createServerFn({ method: "POST" })
     if (Object.keys(data).length === 0) return { ok: true };
     const { error } = await context.supabase
       .from("engine_config")
-      .update({ ...data, updated_at: new Date().toISOString() })
+      // max_notional_usd is newer than the generated types; same `as never`
+      // escape hatch the other engine writes already use.
+      .update({ ...data, updated_at: new Date().toISOString() } as never)
       .eq("user_id", context.userId);
     if (error) throw new Error(error.message);
     return { ok: true };

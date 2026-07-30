@@ -10,12 +10,16 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 
 ALLOWED_MODES = ("OFF", "TESTNET_READ", "TESTNET_TRADE", "LIVE_READ", "LIVE_DRYRUN", "LIVE")
 IMPLEMENTED_MODES = ("OFF", "TESTNET_READ", "TESTNET_TRADE")
 
 HEARTBEAT_INTERVAL_SECONDS = 60
 MAX_CONSECUTIVE_FAILURES = 10
+
+# Strategy stop distance assumed purely for the liquidation-vs-stop warning.
+SL_PCT_ASSUMED = 0.015
 
 # The mode determines the base URL — never read from env, so a config mistake
 # can never point testnet mode at live.
@@ -116,7 +120,7 @@ def run_testnet(mode: str) -> int:
     if mode == "TESTNET_TRADE":
         from risk_guard import RiskGuard
 
-        risk_guard = RiskGuard()
+        risk_guard = RiskGuard(max_notional_usd=100, max_leverage=1)
 
     consumer = SignalConsumer(
         app_api_base,
@@ -130,58 +134,138 @@ def run_testnet(mode: str) -> int:
         binance_trader=client if mode == "TESTNET_TRADE" else None,
     )
 
-    def enforce_account_config() -> None:
-        """One-time TESTNET_TRADE prerequisite: isolated margin, leverage 1.
+    # Exchange-authoritative ceiling, filled by the one-time bracket probe.
+    exchange_max_leverage: int | None = None
 
-        Verify-first: if the account is already correct, make zero write calls
-        (works even with an open position). Only reconfigure when the account is
-        wrong and no position is open; refuse to trade otherwise.
+    def probe_leverage_brackets() -> None:
+        """One-time TESTNET_TRADE probe of the symbol's leverage brackets.
+
+        The exchange is authoritative: no order may be sized or placed before
+        the ceiling and notional cap are known, so a failure here is retryable
+        rather than ignorable."""
+        nonlocal exchange_max_leverage
+        try:
+            brackets = client.get_leverage_brackets(SYMBOL)
+        except (BinanceAPIError, OSError) as exc:
+            raise EnforcementError(f"leverage bracket probe failed: {exc}") from exc
+        first = brackets[0]
+        try:
+            max_leverage = int(first["initialLeverage"])
+            notional_cap = Decimal(str(first["notionalCap"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+            raise EnforcementError(f"unreadable leverage bracket: {first!r}") from exc
+        log.info(
+            "BRACKET | %s | max_leverage=%dx | notional_cap=%s",
+            SYMBOL,
+            max_leverage,
+            notional_cap,
+        )
+        exchange_max_leverage = max_leverage
+        consumer.set_leverage_limits(max_leverage, notional_cap)
+        if risk_guard is not None:
+            risk_guard.update_limits(max_leverage=max_leverage)
+
+    def enforce_account_config(desired_leverage: int) -> bool:
+        """Bring the account in line with the configured leverage on isolated
+        margin. Returns True when the account matches, False when it does not
+        and could not be fixed (the caller then blocks OPENs).
+
+        A leverage mismatch NEVER raises: an already-open position must stay
+        closable. FatalConfigError is reserved for isolated margin, which is
+        non-negotiable.
         """
+        desired = int(desired_leverage)
+        if exchange_max_leverage is not None and desired > exchange_max_leverage:
+            log.warning(
+                "CLAMPED | configured leverage %dx exceeds %s exchange max %dx "
+                "— using %dx",
+                desired,
+                SYMBOL,
+                exchange_max_leverage,
+                exchange_max_leverage,
+            )
+            desired = exchange_max_leverage
+
         positions = client.get_positions(SYMBOL)
         pos = positions[0] if positions else {}
         amt = float(pos.get("positionAmt", 0) or 0)
         leverage = str(pos.get("leverage", ""))
         margin_type = str(pos.get("marginType", "")).lower()
 
-        if leverage == "1" and margin_type == "isolated":
+        if leverage == str(desired) and margin_type == "isolated":
             log.info(
-                "ENFORCED | %s | leverage=1 | margin=ISOLATED | verified, no change needed",
+                "ENFORCED | %s | leverage=%dx | margin=ISOLATED | verified, "
+                "no change needed",
                 SYMBOL,
+                desired,
             )
-            return
+            return True
 
         if amt != 0:
-            log.error(
-                "HALT | %s position open with wrong account config "
-                "(leverage=%s, margin=%s) — refusing to trade",
+            log.warning(
+                "config change deferred: position open | %s | account leverage=%s "
+                "margin=%s | desired=%dx — OPENs blocked, CLOSE still allowed",
                 SYMBOL,
                 leverage,
                 margin_type,
+                desired,
             )
-            raise FatalConfigError("position open with wrong account config")
+            return False
 
-        client.set_margin_type(SYMBOL, "ISOLATED")
-        client.set_leverage(SYMBOL, 1)
+        # Flat: margin type first, then leverage.
+        try:
+            client.set_margin_type(SYMBOL, "ISOLATED")
+        except BinanceAPIError as exc:
+            log.error(
+                "HALT | %s isolated margin could not be set while flat: %s",
+                SYMBOL,
+                exc,
+            )
+            raise FatalConfigError("isolated margin could not be set") from exc
+
+        try:
+            client.set_leverage(SYMBOL, desired)
+        except BinanceAPIError as exc:
+            if exc.code == -4028:
+                log.error(
+                    "leverage %dx rejected by exchange (-4028) | %s max=%s "
+                    "— OPENs blocked",
+                    desired,
+                    SYMBOL,
+                    exchange_max_leverage if exchange_max_leverage is not None else "unknown",
+                )
+                return False
+            raise
 
         positions = client.get_positions(SYMBOL)
         pos = positions[0] if positions else {}
         leverage = str(pos.get("leverage", ""))
         margin_type = str(pos.get("marginType", "")).lower()
-        if leverage != "1" or margin_type != "isolated":
+        if margin_type != "isolated":
             log.error(
-                "account config verification failed | leverage=%s (want 1) | "
-                "margin=%s (want isolated)",
-                leverage,
-                margin_type,
+                "HALT | %s margin=%s (want isolated) after write", SYMBOL, margin_type
             )
-            raise FatalConfigError("account configuration verification failed")
-        log.info("ENFORCED | %s | leverage=1 | margin=ISOLATED | applied", SYMBOL)
+            raise FatalConfigError("isolated margin could not be set")
+        if leverage != str(desired):
+            log.warning(
+                "leverage verification failed | %s leverage=%s (want %dx) "
+                "— OPENs blocked",
+                SYMBOL,
+                leverage,
+                desired,
+            )
+            return False
+        log.info(
+            "ENFORCED | %s | leverage=%dx | margin=ISOLATED | applied", SYMBOL, desired
+        )
+        return True
 
-    enforced = False
+    probed = False
+    liquidation_warning_logged = False
 
     def cycle(first_success: bool) -> None:
         """One unified fetch cycle. Startup-only work runs until the first success."""
-        nonlocal enforced
+        nonlocal probed, liquidation_warning_logged
         if not first_success:
             offset = client.sync_clock()
             log.info("clock synced | offset=%dms", offset)
@@ -199,14 +283,15 @@ def run_testnet(mode: str) -> int:
                 symbol_info.get("quantityPrecision"),
             )
 
-        # TESTNET_TRADE only: one-time account enforcement, before anything
-        # else in the cycle. Must succeed before the mode does any other work.
-        if mode == "TESTNET_TRADE" and not enforced:
-            enforce_account_config()
-            enforced = True
+        # TESTNET_TRADE only: learn the exchange's authoritative leverage
+        # ceiling and notional cap before any enforcement or sizing happens.
+        if mode == "TESTNET_TRADE" and not probed:
+            probe_leverage_brackets()
+            probed = True
 
         positions = client.get_positions(SYMBOL)
         account = client.get_account()
+        consumer.set_available_balance(Decimal(str(account["availableBalance"])))
 
         if not first_success:
             log.info(
@@ -239,10 +324,37 @@ def run_testnet(mode: str) -> int:
             position_amt = float(pos_amt or 0)
         except (TypeError, ValueError):
             position_amt = 0.0
+
+        # Refresh the engine config first: the desired leverage drives both
+        # account enforcement and order sizing this cycle.
+        consumer.ensure_config()
+        leverage_blocked = False
+        desired = consumer.desired_leverage
+        if mode == "TESTNET_TRADE" and desired is not None:
+            if not liquidation_warning_logged:
+                liquidation_warning_logged = True
+                if desired > 0 and 1 / desired < SL_PCT_ASSUMED:
+                    log.warning(
+                        "WARNING | leverage %dx puts liquidation at ~%.2f%% which is "
+                        "inside the assumed %.2f%% stop — the exchange will liquidate "
+                        "before the strategy stop can fire",
+                        desired,
+                        100.0 / desired,
+                        SL_PCT_ASSUMED * 100.0,
+                    )
+            if not enforce_account_config(desired):
+                leverage_blocked = True
+
         # Reconcile at cycle start, before signal processing. In TESTNET_TRADE a
         # fetch failure raises SignalConsumerError here (failed cycle) so no OPEN
         # is placed this cycle; in TESTNET_READ it is log-only.
         opens_blocked, block_reason = consumer.reconcile(position_amt)
+        if leverage_blocked:
+            # OPENs are blocked, CLOSEs stay allowed — the same asymmetric
+            # kill-switch behaviour reconcile() already relies on.
+            opens_blocked = True
+            if block_reason is None:
+                block_reason = "leverage_config_mismatch"
         consumer.poll_once(
             position_amt=position_amt,
             opens_blocked=opens_blocked,
