@@ -477,6 +477,18 @@ def safe_div(a, b):
     return a / np.where(b == 0, np.nan, b)
 
 
+def dedupe_columns_keep_last(df: pd.DataFrame) -> pd.DataFrame:
+    """Keep the last occurrence of duplicate column names.
+
+    This is only a safety guard for live feature assembly after merge steps.
+    It does not change trading rules, thresholds, models, order logic, or paths.
+    A frame without duplicate labels is returned unchanged.
+    """
+    if df.columns.has_duplicates:
+        return df.loc[:, ~df.columns.duplicated(keep="last")].copy()
+    return df
+
+
 def zscore(s, window):
     mean = s.rolling(window, min_periods=window).mean()
     std = s.rolling(window, min_periods=window).std()
@@ -923,10 +935,29 @@ def calculate_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    df = dedupe_columns_keep_last(df)
+
+    # Keep the exact locked-training rule inputs when historical/local replay files
+    # already contain them. Network-built live frames normally do not, so the same
+    # columns are rebuilt causally below from the fetched raw inputs.
+    _v22_passthrough_names = [
+        "range_pct", "ret4", "ret12", "ret24", "prev_high_20",
+        "atr14_pct", "atrp_14", "dist_ema20_atr", "ema20_slope_10",
+        "price_ema50", "price_ema200",
+        "binance_funding_rate", "binance_funding_rate_abs",
+        "realagg_buy_ratio_quote", "realagg_cvd_quote_delta",
+    ]
+    _v22_raw = {
+        name: pd.to_numeric(df[name], errors="coerce").copy()
+        for name in _v22_passthrough_names
+        if name in df.columns
+    }
+
     missing = [c for c in RAW_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"{tf} missing raw columns: {missing}")
     df = df[RAW_COLUMNS].copy()
+    df = dedupe_columns_keep_last(df)
     for col in RAW_COLUMNS:
         if col != "date":
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -991,6 +1022,85 @@ def calculate_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     f["prev_high_20"] = h.rolling(20, min_periods=20).max().shift(1)
     f["session_active_07_21"] = ((f["hour"] >= 7) & (f["hour"] <= 21)).astype("int8")
     f["binance_funding_rate_abs"] = pd.to_numeric(df["funding_rate"], errors="coerce").abs()
+
+    # -------------------------------------------------------------------------
+    # V22 LONG exact locked-training rule namespace.
+    #
+    # These `v22_exact_*` columns are additive only. Every generic column above
+    # stays byte-identical so SHORT rules, shortlist specs and both ML feature
+    # frames are unaffected. Only the V22 LONG archetype/gate reads them.
+    # -------------------------------------------------------------------------
+    _v22_scope = df.index
+    if tf == "15m" and len(df):
+        _start_utc = pd.Timestamp(START_DATE)
+        _start_utc = _start_utc.tz_localize("UTC") if _start_utc.tzinfo is None else _start_utc.tz_convert("UTC")
+        _end_utc = pd.Timestamp(END_DATE)
+        _end_utc = _end_utc.tz_localize("UTC") if _end_utc.tzinfo is None else _end_utc.tz_convert("UTC")
+        _study_mask = (df["date"] >= _start_utc) & (df["date"] <= _end_utc)
+        # The locked engine cuts the historical 15m base before rolling/returns.
+        # Normal future live windows have no pre-study rows and use all warm-up.
+        if bool(_study_mask.any()) and bool((df["date"] < _start_utc).any()):
+            _v22_scope = df.index[_study_mask]
+
+    def _v22_scoped_pct_change(source: pd.Series, periods: int) -> pd.Series:
+        result = pd.Series(np.nan, index=df.index, dtype="float64")
+        result.loc[_v22_scope] = source.loc[_v22_scope].pct_change(periods)
+        return result
+
+    def _v22_scoped_prev_high(source: pd.Series, window: int) -> pd.Series:
+        result = pd.Series(np.nan, index=df.index, dtype="float64")
+        result.loc[_v22_scope] = source.loc[_v22_scope].shift(1).rolling(window, min_periods=window).max()
+        return result
+
+    f["v22_exact_range_pct"] = _v22_raw.get("range_pct", safe_div(rng, c))
+    f["v22_exact_ret4"] = _v22_raw.get("ret4", _v22_scoped_pct_change(c, 4))
+    f["v22_exact_ret12"] = _v22_raw.get("ret12", _v22_scoped_pct_change(c, 12))
+    f["v22_exact_ret24"] = _v22_raw.get("ret24", _v22_scoped_pct_change(c, 24))
+    f["v22_exact_prev_high_20"] = _v22_raw.get("prev_high_20", _v22_scoped_prev_high(h, 20))
+    f["v22_exact_session_active_07_21"] = ((f["hour"] >= 7) & (f["hour"] < 21)).astype("int8")
+    f["v22_exact_atr14_pct"] = _v22_raw.get("atr14_pct", _v22_raw.get("atrp_14", safe_div(atr_14, c)))
+    f["v22_exact_dist_ema20_atr"] = _v22_raw.get("dist_ema20_atr", safe_div(c - ema20, atr_14))
+    # The historical training CSV already carries ema20_slope_10 in the generic
+    # ATR-normalised convention. Preserve that exact convention for future bars
+    # instead of the locked source's missing-column fallback.
+    f["v22_exact_ema20_slope_10"] = _v22_raw.get("ema20_slope_10", safe_div(ema20 - ema20.shift(10), atr_14))
+
+    # Important: the locked engine sees existing price_ema50/price_ema200 columns
+    # and applies sign(price_ema50 - price_ema200). In these project files those
+    # columns are price/EMA - 1 distances, not raw EMA levels. Reproduce the
+    # actual trained-data behavior exactly.
+    _v22_price_ema50 = _v22_raw.get("price_ema50", safe_div(c, ema50) - 1)
+    _v22_price_ema200 = _v22_raw.get("price_ema200", safe_div(c, ema200) - 1)
+    f["v22_exact_trend_regime_ema50_200"] = np.sign(_v22_price_ema50 - _v22_price_ema200)
+
+    _v22_funding_rate = _v22_raw.get("binance_funding_rate", pd.to_numeric(df["funding_rate"], errors="coerce"))
+    f["v22_exact_binance_funding_rate_abs"] = _v22_raw.get(
+        "binance_funding_rate_abs", _v22_funding_rate.abs()
+    ).abs()
+
+    # Live realagg parity namespace rebuilt from the fetched raw taker/aggregate
+    # volumes. Written only under v22_exact_* so ML/SHORT inputs stay unchanged.
+    _v22_realagg_buy_quote = pd.to_numeric(df["buy_quote_volume"], errors="coerce")
+    _v22_realagg_sell_quote = pd.to_numeric(df["sell_quote_volume"], errors="coerce")
+    _v22_realagg_total_quote = _v22_realagg_buy_quote + _v22_realagg_sell_quote
+    _v22_realagg_delta = _v22_raw.get(
+        "realagg_cvd_quote_delta", _v22_realagg_buy_quote - _v22_realagg_sell_quote
+    )
+    f["v22_exact_realagg_buy_ratio_quote"] = _v22_raw.get(
+        "realagg_buy_ratio_quote", safe_div(_v22_realagg_buy_quote, _v22_realagg_total_quote)
+    )
+    f["v22_exact_realagg_cvd_quote_delta"] = _v22_realagg_delta
+
+    _v22_realagg_z50 = pd.Series(np.nan, index=df.index, dtype="float64")
+    _v22_realagg_sum4 = pd.Series(np.nan, index=df.index, dtype="float64")
+    _v22_realagg_scope = _v22_realagg_delta.loc[_v22_scope]
+    _v22_mean50 = _v22_realagg_scope.rolling(50, min_periods=50).mean()
+    _v22_std50 = _v22_realagg_scope.rolling(50, min_periods=50).std().replace(0, np.nan)
+    _v22_realagg_z50.loc[_v22_scope] = (_v22_realagg_scope - _v22_mean50) / _v22_std50
+    _v22_realagg_sum4.loc[_v22_scope] = _v22_realagg_scope.rolling(4, min_periods=4).sum()
+    f["v22_exact_realagg_cvd_quote_delta_z_50"] = _v22_realagg_z50
+    f["v22_exact_realagg_cvd_quote_delta_sum_4"] = _v22_realagg_sum4
+
     f["atr_14"] = atr_14
     f["atr14"] = atr_14
     f["atrp_14"] = safe_div(atr_14, c)
@@ -1046,6 +1156,7 @@ def calculate_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     f["trend_state"] = f["ms_trend_state"]
     out = pd.concat([df, f], axis=1)
     out = pd.concat([out, add_support_resistance(out, tf)], axis=1)
+    out = dedupe_columns_keep_last(out)
     return out.replace([np.inf, -np.inf], np.nan)
 
 
@@ -1373,15 +1484,102 @@ def rebuild_execution_columns(panel: pd.DataFrame) -> pd.DataFrame:
     return panel
 
 
-def load_training_panel_for_thresholds() -> pd.DataFrame:
+def add_v22_locked_threshold_features(panel: pd.DataFrame) -> pd.DataFrame:
+    """Rebuild the exact locked-engine columns used for V22 train thresholds.
+
+    Called only after the panel is cut to START_DATE..END_DATE, matching the
+    locked source's operation order. Existing unrelated ML/SHORT columns stay
+    untouched. This runs on the historical threshold panel only; it never
+    touches the live panel used for trading decisions.
+    """
+    out = panel.copy()
+    h = pd.to_numeric(out["high"], errors="coerce")
+    l = pd.to_numeric(out["low"], errors="coerce")
+    c = pd.to_numeric(out["close"], errors="coerce")
+
+    if "range_pct" not in out.columns:
+        out["range_pct"] = (h - l) / c.replace(0, np.nan)
+    for n in (4, 12, 24):
+        name = f"ret{n}"
+        if name not in out.columns:
+            raw_name = f"ret_{n}"
+            out[name] = (
+                pd.to_numeric(out[raw_name], errors="coerce")
+                if raw_name in out.columns else c.pct_change(n)
+            )
+    if "prev_high_20" not in out.columns:
+        out["prev_high_20"] = h.shift(1).rolling(20, min_periods=20).max()
+
+    out["session_active_07_21"] = (
+        (out["ts_open"].dt.hour >= 7) & (out["ts_open"].dt.hour < 21)
+    ).astype(float)
+
+    # The locked source explicitly recreates these from the raw delta after the
+    # study-window cut, even when similarly named columns already exist.
+    if "realagg_cvd_quote_delta" in out.columns:
+        x = pd.to_numeric(out["realagg_cvd_quote_delta"], errors="coerce")
+        out["realagg_cvd_quote_delta_z_50"] = (
+            x - x.rolling(50, min_periods=50).mean()
+        ) / x.rolling(50, min_periods=50).std().replace(0, np.nan)
+        out["realagg_cvd_quote_delta_sum_4"] = x.rolling(4, min_periods=4).sum()
+
+    if "binance_funding_rate_abs" in out.columns:
+        out["binance_funding_rate_abs"] = pd.to_numeric(
+            out["binance_funding_rate_abs"], errors="coerce"
+        ).abs()
+    elif "binance_funding_rate" in out.columns:
+        out["binance_funding_rate_abs"] = pd.to_numeric(
+            out["binance_funding_rate"], errors="coerce"
+        ).abs()
+    elif "funding_rate" in out.columns:
+        out["binance_funding_rate_abs"] = pd.to_numeric(
+            out["funding_rate"], errors="coerce"
+        ).abs()
+
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def _load_base_training_panel() -> pd.DataFrame:
+    """Historical 15m base + 1h/4h/1d training-style HTF context, cut and sorted.
+
+    Shared starting point for both derived panels below. Loading it once keeps
+    startup cost unchanged versus a single-panel build.
+    """
     panel = load_historical_tf("15m")
     for tf in HTF_TFS:
         panel = attach_htf_training_style(panel, load_historical_tf(tf), tf)
     panel = panel[(panel["ts_open"] >= START_DATE) & (panel["ts_open"] <= END_DATE)].copy()
-    panel = panel.sort_values("ts_open").reset_index(drop=True)
+    return panel.sort_values("ts_open").reset_index(drop=True)
+
+
+def _finalize_specs_panel(base: pd.DataFrame) -> pd.DataFrame:
+    """specs_panel: preserves production shortlist resolution unchanged.
+
+    This is the exact pre-enrichment panel shape production used before
+    add_v22_locked_threshold_features() existed, so build_specs() resolves
+    LONG/SHORT shortlist columns against the same column set as before. The
+    V22-only threshold helper columns are deliberately NOT present here, which
+    is what keeps SHORT behavior byte-identical.
+    """
+    panel = ensure_basic_ohlc_helpers(base)
+    return rebuild_execution_columns(panel)
+
+
+def _finalize_v22_threshold_panel(base: pd.DataFrame) -> pd.DataFrame:
+    """v22_threshold_panel: enriched only for V22 LONG threshold finiteness/parity.
+
+    Adds/rebuilds the locked-engine threshold inputs (range_pct, ret4/12/24,
+    prev_high_20, session_active_07_21, binance_funding_rate_abs,
+    realagg_cvd_quote_delta_z_50/_sum_4). Used exclusively for V22 quantile
+    computation and historical replay; never for shortlist spec resolution.
+    """
+    panel = add_v22_locked_threshold_features(base)
     panel = ensure_basic_ohlc_helpers(panel)
-    panel = rebuild_execution_columns(panel)
-    return panel
+    return rebuild_execution_columns(panel)
+
+
+def load_training_panel_for_thresholds() -> pd.DataFrame:
+    return _finalize_v22_threshold_panel(_load_base_training_panel())
 
 
 def make_splits(panel: pd.DataFrame) -> Dict[str, SplitDef]:
@@ -1524,60 +1722,116 @@ def family_setup_pass(row: pd.Series, specs: List[FeatureSpec], side: str, famil
 
 def load_thresholds_and_specs() -> Tuple[RuleThresholds, V22LiveThresholds, List[FeatureSpec], List[FeatureSpec]]:
     logging.info("[THRESHOLDS] loading historical training panel")
-    panel = load_training_panel_for_thresholds()
-    splits = make_splits(panel)
+    base_panel = _load_base_training_panel()
+
+    # Two derived panels, deliberately kept separate:
+    #   specs_panel        -> preserves production shortlist resolution, so SHORT
+    #                         (and LONG) spec source columns cannot change as a
+    #                         side effect of the V22 threshold repair.
+    #   v22_threshold_panel-> enriched only for V22 LONG threshold finiteness /
+    #                         locked-engine parity. Never used by build_specs().
+    specs_panel = _finalize_specs_panel(base_panel)
+    v22_threshold_panel = _finalize_v22_threshold_panel(base_panel)
+    specs_splits = make_splits(specs_panel)
+    v22_splits = make_splits(v22_threshold_panel)
+
     shortlist = pd.read_csv(SHORTLIST_FILE, encoding="latin1", low_memory=False)
     shortlist.columns = [str(c).strip() for c in shortlist.columns]
-    long_specs = build_specs(panel, shortlist, "LONG", feature_first=False)
-    short_specs = build_specs(panel, shortlist, "SHORT", feature_first=SHORT_USE_SHORTLIST_FEATURE_FIELD_FIRST)
+    long_specs = build_specs(specs_panel, shortlist, "LONG", feature_first=False)
+    short_specs = build_specs(specs_panel, shortlist, "SHORT", feature_first=SHORT_USE_SHORTLIST_FEATURE_FIELD_FIRST)
 
-    close_pos_col = first_col(panel, ["close_pos", "close_position"])
-    mom_col = first_col(panel, ["mom", "momentum"], required=True, label="mom")
-    adx_col = first_col(panel, ["adx_14"], required=True, label="adx_14")
-    di_col = first_col(panel, ["di_diff_14"], required=True, label="di_diff_14")
-    adx_1h_col = first_col(panel, ["adx_14_1h", "1h__adx_14"], required=True, label="1h adx")
-    di_1h_col = first_col(panel, ["di_diff_14_1h", "1h__di_diff_14"], required=True, label="1h di")
-    rsi_1h_col = first_col(panel, ["rsi_14_1h", "1h__rsi_14"], required=True, label="1h rsi")
-    v22_vol_col = first_col(panel, ["rv_50", "atrp_14", "rv_20"], required=False, label="v22 volatility regime source")
+    # RuleThresholds (LONG rule gates + all SHORT thresholds) stay on the
+    # production-shape panel so they remain bit-identical to current production.
+    close_pos_col = first_col(specs_panel, ["close_pos", "close_position"])
+    mom_col = first_col(specs_panel, ["mom", "momentum"], required=True, label="mom")
+    adx_col = first_col(specs_panel, ["adx_14"], required=True, label="adx_14")
+    di_col = first_col(specs_panel, ["di_diff_14"], required=True, label="di_diff_14")
+    adx_1h_col = first_col(specs_panel, ["adx_14_1h", "1h__adx_14"], required=True, label="1h adx")
+    di_1h_col = first_col(specs_panel, ["di_diff_14_1h", "1h__di_diff_14"], required=True, label="1h di")
+    rsi_1h_col = first_col(specs_panel, ["rsi_14_1h", "1h__rsi_14"], required=True, label="1h rsi")
+    v22_vol_col = first_col(v22_threshold_panel, ["rv_50", "atrp_14", "rv_20"], required=False, label="v22 volatility regime source")
 
     th = RuleThresholds(
-        long_adx_q60=qtrain(panel, splits, adx_col, 0.60, True),
-        long_di_q60=qtrain(panel, splits, di_col, 0.60, True),
-        long_close_pos_q60=qtrain(panel, splits, close_pos_col, 0.60, True),
-        long_mom_q70=qtrain(panel, splits, mom_col, 0.70, True),
-        long_di_q70_final=qtrain(panel, splits, di_col, 0.70, True),
-        long_1h_adx_q70=qtrain(panel, splits, adx_1h_col, 0.70, True),
-        long_1h_di_q25=qtrain(panel, splits, di_1h_col, 0.25, True),
-        long_1h_rsi_q25=qtrain(panel, splits, rsi_1h_col, 0.25, True),
-        short_range_q50=qtrain(panel, splits, "range", 0.50, True),
-        short_body_q50=qtrain(panel, splits, "body_pct", 0.50, True),
-        short_mom_q30=qtrain(panel, splits, "mom", 0.30, True),
-        short_s1_mom_q30=qtrain(panel, splits, "s1_mom", 0.30, False),
-        short_vol_q60=qtrain(panel, splits, "vol_z_20", 0.60, True),
-        short_1h_adx_q80=qtrain(panel, splits, adx_1h_col, 0.80, True),
-        short_1h_di_q80=qtrain(panel, splits, di_1h_col, 0.80, True),
-        short_1h_rsi_q80=qtrain(panel, splits, rsi_1h_col, 0.80, True),
+        long_adx_q60=qtrain(specs_panel, specs_splits, adx_col, 0.60, True),
+        long_di_q60=qtrain(specs_panel, specs_splits, di_col, 0.60, True),
+        long_close_pos_q60=qtrain(specs_panel, specs_splits, close_pos_col, 0.60, True),
+        long_mom_q70=qtrain(specs_panel, specs_splits, mom_col, 0.70, True),
+        long_di_q70_final=qtrain(specs_panel, specs_splits, di_col, 0.70, True),
+        long_1h_adx_q70=qtrain(specs_panel, specs_splits, adx_1h_col, 0.70, True),
+        long_1h_di_q25=qtrain(specs_panel, specs_splits, di_1h_col, 0.25, True),
+        long_1h_rsi_q25=qtrain(specs_panel, specs_splits, rsi_1h_col, 0.25, True),
+        short_range_q50=qtrain(specs_panel, specs_splits, "range", 0.50, True),
+        short_body_q50=qtrain(specs_panel, specs_splits, "body_pct", 0.50, True),
+        short_mom_q30=qtrain(specs_panel, specs_splits, "mom", 0.30, True),
+        short_s1_mom_q30=qtrain(specs_panel, specs_splits, "s1_mom", 0.30, False),
+        short_vol_q60=qtrain(specs_panel, specs_splits, "vol_z_20", 0.60, True),
+        short_1h_adx_q80=qtrain(specs_panel, specs_splits, adx_1h_col, 0.80, True),
+        short_1h_di_q80=qtrain(specs_panel, specs_splits, di_1h_col, 0.80, True),
+        short_1h_rsi_q80=qtrain(specs_panel, specs_splits, rsi_1h_col, 0.80, True),
     )
+    # V22LiveThresholds are the only ones that read the enriched panel.
     v22th = V22LiveThresholds(
-        atr_low=qtrain(panel, splits, "atrp_14", 0.25, False),
-        atr_high=qtrain(panel, splits, "atrp_14", 0.92, False),
-        range_high=qtrain(panel, splits, "range_pct", 0.55, False),
-        funding_abs_hi=qtrain(panel, splits, "binance_funding_rate_abs", 0.95, False),
-        q_range70=qtrain(panel, splits, "range_pct", 0.70, False),
-        q_range40=qtrain(panel, splits, "range_pct", 0.40, False),
-        q_ret4_65=qtrain(panel, splits, "ret4", 0.65, False),
-        q_ret12_40=qtrain(panel, splits, "ret12", 0.40, False),
-        q_ret24_25=qtrain(panel, splits, "ret24", 0.25, False),
-        q_closepos60=qtrain(panel, splits, "close_pos", 0.60, False),
-        q_closepos75=qtrain(panel, splits, "close_pos", 0.75, False),
-        q_lwick60=qtrain(panel, splits, "lower_wick_pct", 0.60, False),
-        q_bbw30=qtrain(panel, splits, "bb_bw", 0.30, False),
-        q_realagg70=qtrain(panel, splits, "realagg_buy_ratio_quote", 0.70, False),
-        q_realagg_delta65=qtrain(panel, splits, "realagg_cvd_quote_delta_z_50", 0.65, False),
-        vol_q33=qtrain(panel, splits, v22_vol_col, 0.33, False),
-        vol_q66=qtrain(panel, splits, v22_vol_col, 0.66, False),
+        atr_low=qtrain(v22_threshold_panel, v22_splits, "atrp_14", 0.25, False),
+        atr_high=qtrain(v22_threshold_panel, v22_splits, "atrp_14", 0.92, False),
+        range_high=qtrain(v22_threshold_panel, v22_splits, "range_pct", 0.55, False),
+        funding_abs_hi=qtrain(v22_threshold_panel, v22_splits, "binance_funding_rate_abs", 0.95, False),
+        q_range70=qtrain(v22_threshold_panel, v22_splits, "range_pct", 0.70, False),
+        q_range40=qtrain(v22_threshold_panel, v22_splits, "range_pct", 0.40, False),
+        q_ret4_65=qtrain(v22_threshold_panel, v22_splits, "ret4", 0.65, False),
+        q_ret12_40=qtrain(v22_threshold_panel, v22_splits, "ret12", 0.40, False),
+        q_ret24_25=qtrain(v22_threshold_panel, v22_splits, "ret24", 0.25, False),
+        q_closepos60=qtrain(v22_threshold_panel, v22_splits, "close_pos", 0.60, False),
+        q_closepos75=qtrain(v22_threshold_panel, v22_splits, "close_pos", 0.75, False),
+        q_lwick60=qtrain(v22_threshold_panel, v22_splits, "lower_wick_pct", 0.60, False),
+        q_bbw30=qtrain(v22_threshold_panel, v22_splits, "bb_bw", 0.30, False),
+        q_realagg70=qtrain(v22_threshold_panel, v22_splits, "realagg_buy_ratio_quote", 0.70, False),
+        q_realagg_delta65=qtrain(v22_threshold_panel, v22_splits, "realagg_cvd_quote_delta_z_50", 0.65, False),
+        vol_q33=qtrain(v22_threshold_panel, v22_splits, v22_vol_col, 0.33, False),
+        vol_q66=qtrain(v22_threshold_panel, v22_splits, v22_vol_col, 0.66, False),
     )
-    logging.info("[THRESHOLDS] loaded | long_specs=%d short_specs=%d", len(long_specs), len(short_specs))
+    # A non-finite V22 quantile silently makes every comparison against it
+    # False, which zeroes out the breakout/compression/reversal archetypes
+    # without any error. Fail fast instead of trading a crippled LONG side.
+    _required_v22_thresholds = [
+        "atr_low", "atr_high", "range_high", "funding_abs_hi",
+        "q_range70", "q_range40", "q_ret4_65", "q_ret12_40",
+        "q_ret24_25", "q_closepos60", "q_closepos75", "q_lwick60",
+        "q_bbw30", "q_realagg70", "q_realagg_delta65",
+    ]
+    _bad_v22_thresholds = [
+        name for name in _required_v22_thresholds
+        if not np.isfinite(float(getattr(v22th, name)))
+    ]
+    if _bad_v22_thresholds:
+        raise RuntimeError(
+            "V22 LONG threshold initialization failed; non-finite values: "
+            + ", ".join(_bad_v22_thresholds)
+        )
+    logging.info(
+        "[THRESHOLDS] loaded | long_specs=%d short_specs=%d | v22_long_thresholds=FINITE",
+        len(long_specs), len(short_specs),
+    )
+    # SHORT specs are resolved against specs_panel (production pre-enrichment
+    # shape), so the V22 threshold repair cannot alter them. Log the resolved
+    # source columns so this can be confirmed against the previous deployment's
+    # startup log. Logging only.
+    logging.info(
+        "[SHORT SPECS] n=%d panel=specs_panel source_columns=%s",
+        len(short_specs),
+        sorted({s.source_column for s in short_specs}),
+    )
+    logging.info(
+        "[V22 THRESHOLDS] PASS | q_range70=%.12g q_ret4_65=%.12g q_closepos75=%.12g",
+        v22th.q_range70, v22th.q_ret4_65, v22th.q_closepos75,
+    )
+    logging.info(
+        "[V22 THRESHOLDS] q_range40=%.12g q_ret12_40=%.12g q_ret24_25=%.12g q_closepos60=%.12g "
+        "q_lwick60=%.12g q_bbw30=%.12g atr_low=%.12g atr_high=%.12g range_high=%.12g "
+        "funding_abs_hi=%.12g q_realagg70=%.12g q_realagg_delta65=%.12g",
+        v22th.q_range40, v22th.q_ret12_40, v22th.q_ret24_25, v22th.q_closepos60,
+        v22th.q_lwick60, v22th.q_bbw30, v22th.atr_low, v22th.atr_high,
+        v22th.range_high, v22th.funding_abs_hi, v22th.q_realagg70, v22th.q_realagg_delta65,
+    )
     return th, v22th, long_specs, short_specs
 
 
@@ -1977,11 +2231,14 @@ def log_bar_mode(panel: pd.DataFrame, decision_source: pd.DataFrame, now_utc: da
 def attach_htf_live(base: pd.DataFrame, htf: pd.DataFrame, tf: str) -> pd.DataFrame:
     base = base.sort_values("ts_close").reset_index(drop=True).copy()
     htf = htf.sort_values("ts_close").reset_index(drop=True).copy()
+    htf = dedupe_columns_keep_last(htf)
     reserved = {"ts_open", "ts_close", "entry_time_next", "entry_ts_next", "entry_open_next", "next_index", "valid_next_entry", "entry_gap_minutes"}
     rename = {c: f"{tf}__{c}" for c in htf.columns if c not in reserved and c != "date"}
     h = htf.rename(columns=rename)
-    keep = ["ts_close"] + list(rename.values())
+    h = dedupe_columns_keep_last(h)
+    keep = ["ts_close"] + list(dict.fromkeys(rename.values()))
     h = h[keep].rename(columns={"ts_close": f"{tf}__ts_close"})
+    h = dedupe_columns_keep_last(h)
     out = pd.merge_asof(
         base,
         h.sort_values(f"{tf}__ts_close"),
@@ -1996,8 +2253,55 @@ def attach_htf_live(base: pd.DataFrame, htf: pd.DataFrame, tf: str) -> pd.DataFr
             raw = c[len(pref):]
             alias = f"{raw}_{tf}"
             if alias not in out.columns:
-                out[alias] = out[c]
-    return out
+                src = out[c]
+                if isinstance(src, pd.DataFrame):
+                    src = src.iloc[:, -1]
+                out[alias] = src
+    return dedupe_columns_keep_last(out)
+
+
+def attach_v22_locked_htf_context(base: pd.DataFrame, htf: pd.DataFrame, tf: str) -> pd.DataFrame:
+    """Attach V22-only HTF features with the locked source's exact timing.
+
+    Locked behavior: shift every HTF feature by one completed HTF row, then
+    backward merge_asof on HTF open timestamp. This is causal and was proven
+    equivalent to selecting the latest closed HTF candle. It writes only
+    `v22_exact_eth{1h,4h,1d}_*` columns, so the generic `*_1h` / `1h__*`
+    aliases used by SHORT and ML are untouched.
+    """
+    prefix = {"1h": "eth1h", "4h": "eth4h", "1d": "eth1d"}.get(tf)
+    if prefix is None:
+        raise ValueError(f"Unsupported V22 HTF: {tf}")
+
+    source_cols = [
+        "v22_exact_ema20_slope_10",
+        "v22_exact_trend_regime_ema50_200",
+    ]
+    missing = [c for c in source_cols if c not in htf.columns]
+    if missing:
+        raise RuntimeError(f"V22 exact HTF source missing tf={tf}: {missing}")
+
+    right_key = f"v22_exact_{prefix}_source_ts_open"
+    rename = {
+        "v22_exact_ema20_slope_10": f"v22_exact_{prefix}_ema20_slope_10",
+        "v22_exact_trend_regime_ema50_200": f"v22_exact_{prefix}_trend_regime_ema50_200",
+    }
+    right = htf[["ts_open"] + source_cols].copy().sort_values("ts_open")
+    right[source_cols] = right[source_cols].shift(1)
+    right = right.rename(columns={"ts_open": right_key, **rename})
+    right = right.drop_duplicates(right_key, keep="last")
+
+    out = base.sort_values("ts_open").reset_index(drop=True).copy()
+    out = out.drop(columns=[right_key] + list(rename.values()), errors="ignore")
+    out = pd.merge_asof(
+        out,
+        right,
+        left_on="ts_open",
+        right_on=right_key,
+        direction="backward",
+        allow_exact_matches=True,
+    )
+    return dedupe_columns_keep_last(out)
 
 
 def prepare_feature_frame(raw: pd.DataFrame, tf: str, add_context_features: bool = True) -> pd.DataFrame:
@@ -2007,6 +2311,7 @@ def prepare_feature_frame(raw: pd.DataFrame, tf: str, add_context_features: bool
         df = add_final_extra_features(df, tf)
     df["ts_open"] = to_utc(df["date"])
     df["ts_close"] = df["ts_open"] + pd.to_timedelta(tf_minutes(tf), unit="m")
+    df = dedupe_columns_keep_last(df)
     return df.sort_values("ts_open").drop_duplicates("ts_open").reset_index(drop=True)
 
 
@@ -2034,6 +2339,8 @@ def build_live_panel(raw1m: pd.DataFrame, raw5m: pd.DataFrame, raw15: pd.DataFra
     panel = f15.copy()
     for tf, htf in [("1h", f1h), ("4h", f4h), ("1d", f1d)]:
         panel = attach_htf_live(panel, htf, tf)
+    for tf, htf in [("1h", f1h), ("4h", f4h), ("1d", f1d)]:
+        panel = attach_v22_locked_htf_context(panel, htf, tf)
 
     panel = rebuild_execution_columns(panel)
     panel["bar_closed_now"] = panel["ts_close"] <= pd.Timestamp(now_utc)
@@ -2110,6 +2417,20 @@ def row_num_any(row: pd.Series, names: List[str], default: float = np.nan) -> fl
     return default
 
 
+def row_num_v22_exact_first(row: pd.Series, names: List[str], default: float = np.nan) -> float:
+    """Match the locked engine's existing-column NaN semantics exactly.
+
+    When the authoritative ``v22_exact_*`` column exists, its NaN must remain
+    NaN. The locked dataframe classifier applies ``default`` only when the
+    column is absent; it never replaces NaN values inside an existing column.
+    Fallback aliases are therefore consulted only when the exact column itself
+    is absent.
+    """
+    if names and str(names[0]).startswith("v22_exact_") and names[0] in row.index:
+        return row_num(row, names[0], np.nan)
+    return row_num_any(row, names, default)
+
+
 def row_bool_any(row: pd.Series, names: List[str]) -> bool:
     for name in names:
         if name in row.index:
@@ -2174,27 +2495,28 @@ def v22_long_source_meta(row: pd.Series) -> Optional[Dict[str, Any]]:
 # classify() + orchestration_regime_gate() from the V22 training source.
 # This is not a new heuristic layer; it rebuilds the same pre-entry archetype/gate logic on the live row.
 def v22_training_pre_entry_archetype(row: pd.Series) -> str:
+    """Exact causal row port of locked classify() archetype priority."""
     th = V22_THRESHOLDS
     close_pos = row_num_any(row, ["close_pos", "close_position"], 0.0)
-    range_pct = row_num_any(row, ["range_pct"], 0.0)
-    ret4 = row_num_any(row, ["ret4"], 0.0)
-    ret12 = row_num_any(row, ["ret12"], 0.0)
-    ret24 = row_num_any(row, ["ret24"], 0.0)
+    range_pct = row_num_v22_exact_first(row, ["v22_exact_range_pct", "range_pct"], 0.0)
+    ret4 = row_num_v22_exact_first(row, ["v22_exact_ret4", "ret4"], 0.0)
+    ret12 = row_num_v22_exact_first(row, ["v22_exact_ret12", "ret12"], 0.0)
+    ret24 = row_num_v22_exact_first(row, ["v22_exact_ret24", "ret24"], 0.0)
     lower_wick_pct = row_num_any(row, ["lower_wick_pct"], 0.0)
     bb_bw = row_num_any(row, ["bb_bw"], np.inf)
     bb_z = row_num_any(row, ["bb_z"], 0.0)
-    dist_ema20_atr = row_num_any(row, ["dist_ema20_atr"], 0.0)
-    ema20_slope_10 = row_num_any(row, ["ema20_slope_10"], 0.0)
+    dist_ema20_atr = row_num_v22_exact_first(row, ["v22_exact_dist_ema20_atr", "dist_ema20_atr"], 0.0)
+    ema20_slope_10 = row_num_v22_exact_first(row, ["v22_exact_ema20_slope_10", "ema20_slope_10"], 0.0)
     close = row_num_any(row, ["close"], 0.0)
-    prev_high_20 = row_num_any(row, ["prev_high_20"], np.inf)
+    prev_high_20 = row_num_v22_exact_first(row, ["v22_exact_prev_high_20", "prev_high_20"], np.inf)
 
     h1_up = (
-        row_num_any(row, ["ema20_slope_10_1h", "1h__ema20_slope_10"], 0.0) > 0
-        or row_num_any(row, ["trend_regime_ema50_200_1h", "1h__trend_regime_ema50_200"], 0.0) > 0
+        row_num_v22_exact_first(row, ["v22_exact_eth1h_ema20_slope_10", "ema20_slope_10_1h", "1h__ema20_slope_10"], 0.0) > 0
+        or row_num_v22_exact_first(row, ["v22_exact_eth1h_trend_regime_ema50_200", "trend_regime_ema50_200_1h", "1h__trend_regime_ema50_200"], 0.0) > 0
     )
     h4_up = (
-        row_num_any(row, ["ema20_slope_10_4h", "4h__ema20_slope_10"], 0.0) > 0
-        or row_num_any(row, ["trend_regime_ema50_200_4h", "4h__trend_regime_ema50_200"], 0.0) > 0
+        row_num_v22_exact_first(row, ["v22_exact_eth4h_ema20_slope_10", "ema20_slope_10_4h", "4h__ema20_slope_10"], 0.0) > 0
+        or row_num_v22_exact_first(row, ["v22_exact_eth4h_trend_regime_ema50_200", "trend_regime_ema50_200_4h", "4h__trend_regime_ema50_200"], 0.0) > 0
     )
     btc_ok = (
         row_num_any(row, ["btc_trend_score"], 0.0) > 0
@@ -2207,9 +2529,9 @@ def v22_training_pre_entry_archetype(row: pd.Series) -> str:
         or row_num_any(row, ["eth_vs_btc_strength_6"], 0.0) > 0
     )
     realagg_flow = (
-        row_num_any(row, ["realagg_buy_ratio_quote"], 0.5) >= th.q_realagg70
-        or row_num_any(row, ["realagg_cvd_quote_delta_z_50"], 0.0) >= th.q_realagg_delta65
-        or row_num_any(row, ["realagg_cvd_quote_delta_sum_4"], 0.0) > 0
+        row_num_v22_exact_first(row, ["v22_exact_realagg_buy_ratio_quote", "realagg_buy_ratio_quote"], 0.5) >= th.q_realagg70
+        or row_num_v22_exact_first(row, ["v22_exact_realagg_cvd_quote_delta_z_50", "realagg_cvd_quote_delta_z_50"], 0.0) >= th.q_realagg_delta65
+        or row_num_v22_exact_first(row, ["v22_exact_realagg_cvd_quote_delta_sum_4", "realagg_cvd_quote_delta_sum_4"], 0.0) > 0
     )
     old_flow = (
         row_num_any(row, ["taker_quote_imbalance"], 0.0) > 0
@@ -2239,6 +2561,48 @@ def v22_training_pre_entry_archetype(row: pd.Series) -> str:
 
 def v22_live_archetype(row: pd.Series) -> str:
     return v22_training_pre_entry_archetype(row)
+
+
+def v22_long_breakout_diagnostics(row: pd.Series) -> Dict[str, Any]:
+    """Read-only decomposition of the V22 LONG breakout term.
+
+    Mirrors the exact reads used by v22_training_pre_entry_archetype so the
+    audit can show which of the three breakout conditions failed, alongside
+    both the generic and the v22_exact_* input values and the live thresholds.
+    Purely diagnostic: it never feeds any trading decision.
+    """
+    th = V22_THRESHOLDS
+    close = row_num_any(row, ["close"], 0.0)
+    close_pos = row_num_any(row, ["close_pos", "close_position"], 0.0)
+    range_pct = row_num_v22_exact_first(row, ["v22_exact_range_pct", "range_pct"], 0.0)
+    ret4 = row_num_v22_exact_first(row, ["v22_exact_ret4", "ret4"], 0.0)
+    prev_high_20 = row_num_v22_exact_first(row, ["v22_exact_prev_high_20", "prev_high_20"], np.inf)
+
+    break_flag = row_bool_any(row, ["sr_break_up", "ms_break_up", "break_up"])
+    flag_or_prevhigh = bool(break_flag or (close > prev_high_20))
+    closepos_ok = bool(close_pos >= th.q_closepos75)
+    size_ok = bool((range_pct >= th.q_range70) or (ret4 >= th.q_ret4_65))
+
+    return {
+        "range_pct": row_num(row, "range_pct"),
+        "ret4": row_num(row, "ret4"),
+        "ret12": row_num(row, "ret12"),
+        "ret24": row_num(row, "ret24"),
+        "prev_high_20": row_num(row, "prev_high_20"),
+        "close": close,
+        "v22_exact_range_pct": row_num(row, "v22_exact_range_pct"),
+        "v22_exact_ret4": row_num(row, "v22_exact_ret4"),
+        "v22_exact_ret12": row_num(row, "v22_exact_ret12"),
+        "v22_exact_ret24": row_num(row, "v22_exact_ret24"),
+        "v22_exact_prev_high_20": row_num(row, "v22_exact_prev_high_20"),
+        "breakout_flag_or_prevhigh": flag_or_prevhigh,
+        "breakout_closepos_ok": closepos_ok,
+        "breakout_size_ok": size_ok,
+        "breakout_calc": bool(flag_or_prevhigh and closepos_ok and size_ok),
+        "q_range70": float(th.q_range70),
+        "q_ret4_65": float(th.q_ret4_65),
+        "q_closepos75": float(th.q_closepos75),
+    }
 
 
 def v22_live_long_candidate(row: pd.Series) -> bool:
@@ -2403,6 +2767,7 @@ def build_rule_funnel(row: pd.Series) -> Dict[str, Dict[str, Any]]:
             "ms_break_up": bool_value(row.get(first_col(row, ["ms_break_up", "break_up", "sr_break_up"]))),
             "hour": int(pd.Timestamp(row["ts_open"]).hour),
             "v22_archetype": v22_training_pre_entry_archetype(row) if valid else "invalid",
+            **v22_long_breakout_diagnostics(row),
         },
         "short": {
             "side": "SHORT",
