@@ -29,6 +29,7 @@ Live audit outputs are written/appended cumulatively under:
 from __future__ import annotations
 
 import os
+import gc
 import json
 import time
 import smtplib
@@ -1721,20 +1722,26 @@ def family_setup_pass(row: pd.Series, specs: List[FeatureSpec], side: str, famil
 
 
 def load_thresholds_and_specs() -> Tuple[RuleThresholds, V22LiveThresholds, List[FeatureSpec], List[FeatureSpec]]:
-    logging.info("[THRESHOLDS] loading historical training panel")
+    # Memory note: the historical panel is large (multi-year 15m base with 1h/4h/1d
+    # HTF columns plus aliases). The two derived panels are therefore built in two
+    # sequential phases, with only ONE panel resident at a time. Holding
+    # base_panel + specs_panel + v22_threshold_panel together previously OOM-killed
+    # startup (exit 137). The base panel is reloaded for phase 2 rather than kept
+    # alive across phase 1; that costs one extra CSV read but keeps peak RSS at
+    # roughly the pre-split single-panel level.
+
+    # ------------------------------------------------------------------
+    # Phase 1 - specs_panel: preserves production shortlist resolution, so
+    # SHORT (and LONG) spec source columns cannot change as a side effect of
+    # the V22 threshold repair. Also carries all RuleThresholds.
+    # ------------------------------------------------------------------
+    logging.info("[THRESHOLDS] phase 1/2 | loading historical panel for specs + rule thresholds")
     base_panel = _load_base_training_panel()
-
-    # Two derived panels, deliberately kept separate:
-    #   specs_panel        -> preserves production shortlist resolution, so SHORT
-    #                         (and LONG) spec source columns cannot change as a
-    #                         side effect of the V22 threshold repair.
-    #   v22_threshold_panel-> enriched only for V22 LONG threshold finiteness /
-    #                         locked-engine parity. Never used by build_specs().
     specs_panel = _finalize_specs_panel(base_panel)
-    v22_threshold_panel = _finalize_v22_threshold_panel(base_panel)
-    specs_splits = make_splits(specs_panel)
-    v22_splits = make_splits(v22_threshold_panel)
+    del base_panel
+    gc.collect()
 
+    specs_splits = make_splits(specs_panel)
     shortlist = pd.read_csv(SHORTLIST_FILE, encoding="latin1", low_memory=False)
     shortlist.columns = [str(c).strip() for c in shortlist.columns]
     long_specs = build_specs(specs_panel, shortlist, "LONG", feature_first=False)
@@ -1749,7 +1756,6 @@ def load_thresholds_and_specs() -> Tuple[RuleThresholds, V22LiveThresholds, List
     adx_1h_col = first_col(specs_panel, ["adx_14_1h", "1h__adx_14"], required=True, label="1h adx")
     di_1h_col = first_col(specs_panel, ["di_diff_14_1h", "1h__di_diff_14"], required=True, label="1h di")
     rsi_1h_col = first_col(specs_panel, ["rsi_14_1h", "1h__rsi_14"], required=True, label="1h rsi")
-    v22_vol_col = first_col(v22_threshold_panel, ["rv_50", "atrp_14", "rv_20"], required=False, label="v22 volatility regime source")
 
     th = RuleThresholds(
         long_adx_q60=qtrain(specs_panel, specs_splits, adx_col, 0.60, True),
@@ -1769,6 +1775,26 @@ def load_thresholds_and_specs() -> Tuple[RuleThresholds, V22LiveThresholds, List
         short_1h_di_q80=qtrain(specs_panel, specs_splits, di_1h_col, 0.80, True),
         short_1h_rsi_q80=qtrain(specs_panel, specs_splits, rsi_1h_col, 0.80, True),
     )
+
+    # specs_panel and its splits are fully consumed above (specs are resolved,
+    # RuleThresholds are computed). Release before building the enriched panel so
+    # the two never coexist.
+    del specs_panel, specs_splits
+    gc.collect()
+
+    # ------------------------------------------------------------------
+    # Phase 2 - v22_threshold_panel: enriched only for V22 LONG threshold
+    # finiteness / locked-engine parity. Never used by build_specs().
+    # ------------------------------------------------------------------
+    logging.info("[THRESHOLDS] phase 2/2 | rebuilding enriched panel for V22 long thresholds")
+    base_panel = _load_base_training_panel()
+    v22_threshold_panel = _finalize_v22_threshold_panel(base_panel)
+    del base_panel
+    gc.collect()
+
+    v22_splits = make_splits(v22_threshold_panel)
+    v22_vol_col = first_col(v22_threshold_panel, ["rv_50", "atrp_14", "rv_20"], required=False, label="v22 volatility regime source")
+
     # V22LiveThresholds are the only ones that read the enriched panel.
     v22th = V22LiveThresholds(
         atr_low=qtrain(v22_threshold_panel, v22_splits, "atrp_14", 0.25, False),
@@ -1789,6 +1815,12 @@ def load_thresholds_and_specs() -> Tuple[RuleThresholds, V22LiveThresholds, List
         vol_q33=qtrain(v22_threshold_panel, v22_splits, v22_vol_col, 0.33, False),
         vol_q66=qtrain(v22_threshold_panel, v22_splits, v22_vol_col, 0.66, False),
     )
+
+    # All quantiles are materialized as plain floats on v22th; release the
+    # enriched panel before the guard/logging so no large frame outlives this call.
+    del v22_threshold_panel, v22_splits
+    gc.collect()
+
     # A non-finite V22 quantile silently makes every comparison against it
     # False, which zeroes out the breakout/compression/reversal archetypes
     # without any error. Fail fast instead of trading a crippled LONG side.
