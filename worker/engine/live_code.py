@@ -35,9 +35,13 @@ import time
 import smtplib
 import warnings
 import logging
+import uuid
+import io
+import zipfile
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from bisect import bisect_left, bisect_right, insort
@@ -249,8 +253,46 @@ SHADOW_PARITY_FILE = LIVE_AUDIT_DIR / "ethusdt_15m_version_b_shadow_parity.csv"
 AUDIT_STATUS_FILE = LIVE_AUDIT_DIR / "ethusdt_15m_version_b_live_audit_status.csv"
 TRAINING_FINGERPRINT = None
 
-EMAIL_ADDRESS = os.getenv("LIVE_EMAIL_ADDRESS", "omarameen291@gmail.com")
-EMAIL_APP_PASSWORD = os.getenv("LIVE_EMAIL_APP_PASSWORD", "vykm ihku iugw hhbf")
+EMAIL_ADDRESS = os.getenv("LIVE_EMAIL_ADDRESS", "")
+EMAIL_APP_PASSWORD = os.getenv("LIVE_EMAIL_APP_PASSWORD", "")
+
+# =============================================================================
+# CLEAN 4-FILE ADMIN AUDIT — REAL LIVE ENGINE, NOT UI
+# =============================================================================
+CLEAN_AUDIT_SCHEMA_VERSION = 2
+
+# Put the exact uploaded 4-file audit folder under the already-mounted live
+# audit Docker volume. This keeps it private to the backend/admin path and avoids
+# touching any dashboard/report/UI files.
+CLEAN_AUDIT_DIR = LIVE_AUDIT_DIR / "shadow_live_v22_clean_audit"
+CLEAN_MASTER_AUDIT_FILE = CLEAN_AUDIT_DIR / "shadow_live_master_audit.jsonl"
+CLEAN_TRADES_FILE = CLEAN_AUDIT_DIR / "shadow_live_trades.csv"
+CLEAN_RUNTIME_STATE_FILE = CLEAN_AUDIT_DIR / "shadow_live_state.json"
+CLEAN_ERRORS_FILE = CLEAN_AUDIT_DIR / "shadow_live_errors.jsonl"
+
+CLEAN_AUDIT_FILES = [
+    CLEAN_MASTER_AUDIT_FILE,
+    CLEAN_TRADES_FILE,
+    CLEAN_RUNTIME_STATE_FILE,
+    CLEAN_ERRORS_FILE,
+]
+
+CLEAN_AUDIT_FILENAMES = {p.name for p in CLEAN_AUDIT_FILES}
+
+CLEAN_SHADOW_TRADE_COLUMNS = [
+    "logged_at_utc", "trade_id", "status", "side", "setup_name",
+    "signal_t", "entry_t", "exit_t", "entry", "exit", "tp",
+    "initial_sl", "final_stop", "atr", "bars_held", "prob",
+    "threshold", "exit_reason", "gross_pnl_rate",
+    "net_pnl_rate_after_round_trip_cost", "round_trip_cost",
+    "best_high", "best_low", "mfe_atr", "mae_atr",
+    "trail_active_at_exit", "path_bar_count", "trade_path_json",
+    "leverage_scenarios_json",
+]
+
+ADMIN_AUDIT_EMAIL = os.getenv("ADMIN_AUDIT_EMAIL", EMAIL_ADDRESS)
+ADMIN_AUDIT_EMAIL_ENABLED = os.getenv("ADMIN_AUDIT_EMAIL_ENABLED", "0").strip().lower() not in {"0", "false", "no", "off"}
+ADMIN_AUDIT_EMAIL_ON_SIDED_SIGNAL = os.getenv("ADMIN_AUDIT_EMAIL_ON_SIDED_SIGNAL", "0").strip().lower() not in {"0", "false", "no", "off"}
 
 
 # =============================================================================
@@ -694,6 +736,338 @@ def append_jsonl_row(path: Path, row: Dict[str, Any]):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(to_jsonable(row), ensure_ascii=False) + "\n")
 
+
+
+# =============================================================================
+# CLEAN 4-FILE ADMIN AUDIT HELPERS
+# =============================================================================
+def _clean_csv_safe_cell(v: Any) -> Any:
+    v = to_jsonable(v)
+    if isinstance(v, (dict, list, tuple)):
+        return json.dumps(v, ensure_ascii=False, default=str)
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    return v
+
+
+def _clean_schema_row(row: Dict[str, Any], columns: List[str]) -> Dict[str, Any]:
+    fixed = {c: None for c in columns}
+    for k, v in row.items():
+        if k in fixed:
+            fixed[k] = _clean_csv_safe_cell(v)
+    return fixed
+
+
+def _clean_atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(to_jsonable(payload), handle, ensure_ascii=False, indent=2, default=str)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _clean_jsonl_key_exists(path: Path, key_field: str, key_value: str) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if str(rec.get(key_field, "")) == str(key_value):
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _clean_append_jsonl_unique(path: Path, row: Dict[str, Any], key_field: str) -> bool:
+    key = str(row.get(key_field, ""))
+    if key and _clean_jsonl_key_exists(path, key_field, key):
+        return False
+    append_jsonl_row(path, row)
+    return True
+
+
+def _clean_csv_key_exists(path: Path, key_field: str, key_value: str) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        df = pd.read_csv(path, usecols=[key_field], low_memory=False)
+        return str(key_value) in set(df[key_field].astype(str))
+    except Exception:
+        return False
+
+
+def _clean_append_trade_unique(row: Dict[str, Any]) -> bool:
+    CLEAN_TRADES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not CLEAN_TRADES_FILE.exists() or CLEAN_TRADES_FILE.stat().st_size == 0:
+        pd.DataFrame(columns=CLEAN_SHADOW_TRADE_COLUMNS).to_csv(CLEAN_TRADES_FILE, index=False)
+
+    key_value = str(row.get("trade_id", ""))
+    if key_value and _clean_csv_key_exists(CLEAN_TRADES_FILE, "trade_id", key_value):
+        return False
+
+    fixed = _clean_schema_row(row, CLEAN_SHADOW_TRADE_COLUMNS)
+    pd.DataFrame([fixed], columns=CLEAN_SHADOW_TRADE_COLUMNS).to_csv(
+        CLEAN_TRADES_FILE,
+        mode="a",
+        index=False,
+        header=False,
+    )
+    return True
+
+
+def _clean_runtime_state_payload(state: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "schema_version": CLEAN_AUDIT_SCHEMA_VERSION,
+        "initialized": bool(state.get("initialized", False)),
+        "last_processed_bar": state.get("last_processed_bar"),
+        "position": state.get("position"),
+        "last_saved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "real_live_engine",
+    }
+
+
+def _clean_source_bar_snapshot(row: Optional[pd.Series]) -> Dict[str, Any]:
+    if row is None:
+        return {}
+    out: Dict[str, Any] = {}
+    for key in [
+        "ts_open", "ts_close", "open", "high", "low", "close",
+        "entry_ts_next", "entry_open_next", "valid_next_entry",
+        "bar_closed_now", "atr_14", "atrp_14",
+    ]:
+        if key in row.index:
+            out[key] = row.get(key)
+    return out
+
+
+def initialize_clean_audit_files() -> None:
+    CLEAN_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
+    CLEAN_MASTER_AUDIT_FILE.touch(exist_ok=True)
+    CLEAN_ERRORS_FILE.touch(exist_ok=True)
+
+    if not CLEAN_TRADES_FILE.exists() or CLEAN_TRADES_FILE.stat().st_size == 0:
+        pd.DataFrame(columns=CLEAN_SHADOW_TRADE_COLUMNS).to_csv(CLEAN_TRADES_FILE, index=False)
+
+    if not CLEAN_RUNTIME_STATE_FILE.exists():
+        _clean_atomic_write_json(
+            CLEAN_RUNTIME_STATE_FILE,
+            {
+                "schema_version": CLEAN_AUDIT_SCHEMA_VERSION,
+                "initialized": False,
+                "last_processed_bar": None,
+                "position": None,
+                "last_saved_at_utc": datetime.now(timezone.utc).isoformat(),
+                "source": "real_live_engine",
+            },
+        )
+
+    unexpected = sorted(
+        p.name for p in CLEAN_AUDIT_DIR.iterdir()
+        if p.is_file() and not p.name.startswith(".") and p.name not in CLEAN_AUDIT_FILENAMES
+    )
+    if unexpected:
+        logging.warning("[CLEAN AUDIT WARNING] unexpected files in clean audit dir: %s", unexpected)
+
+
+def append_clean_runtime_error(stage: str, exc: BaseException, context: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        append_jsonl_row(
+            CLEAN_ERRORS_FILE,
+            {
+                "schema_version": CLEAN_AUDIT_SCHEMA_VERSION,
+                "record_type": "ERROR",
+                "event_key": f"ERROR|{stage}|{datetime.now(timezone.utc).isoformat()}|{uuid.uuid4().hex}",
+                "time_utc": datetime.now(timezone.utc).isoformat(),
+                "stage": stage,
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "context": context or {},
+            },
+        )
+    except Exception as inner:
+        logging.error("[CLEAN AUDIT ERROR LOGGING FAILED] stage=%s error=%s", stage, inner)
+
+
+def append_clean_closed_trade(pos: "OpenPosition", exit_t: pd.Timestamp, exit_px: float, reason: str) -> None:
+    try:
+        gross = (
+            float(exit_px) / float(pos.entry) - 1.0
+            if int(pos.side) == +1
+            else (float(pos.entry) - float(exit_px)) / float(pos.entry)
+        )
+        atr = max(float(pos.atr), 1e-12)
+        if int(pos.side) == +1:
+            mfe_atr = (float(pos.best_high) - float(pos.entry)) / atr
+            mae_atr = (float(pos.entry) - float(pos.best_low)) / atr
+        else:
+            mfe_atr = (float(pos.entry) - float(pos.best_low)) / atr
+            mae_atr = (float(pos.best_high) - float(pos.entry)) / atr
+
+        row = {
+            "logged_at_utc": datetime.now(timezone.utc).isoformat(),
+            "trade_id": pos.trade_id,
+            "status": "CLOSED",
+            "side": position_txt(pos.side),
+            "setup_name": pos.setup_name,
+            "signal_t": pos.signal_t,
+            "entry_t": pos.entry_t,
+            "exit_t": pd.Timestamp(exit_t).isoformat(),
+            "entry": float(pos.entry),
+            "exit": float(exit_px),
+            "tp": float(pos.tp),
+            "initial_sl": float(pos.initial_sl if np.isfinite(pos.initial_sl) else pos.sl),
+            "final_stop": float(pos.stop),
+            "atr": float(pos.atr),
+            "bars_held": int(pos.bars_held),
+            "prob": float(pos.prob),
+            "threshold": float(pos.threshold),
+            "exit_reason": reason,
+            "gross_pnl_rate": float(gross),
+            "net_pnl_rate_after_round_trip_cost": trade_pnl(pos, exit_px),
+            "round_trip_cost": ROUND_TRIP_COST,
+            "best_high": float(pos.best_high),
+            "best_low": float(pos.best_low),
+            "mfe_atr": float(mfe_atr),
+            "mae_atr": float(mae_atr),
+            "trail_active_at_exit": bool(pos.trail_active),
+            "path_bar_count": None,
+            "trade_path_json": None,
+            "leverage_scenarios_json": _safe_json(build_close_leverage_scenarios(pos, exit_px)),
+        }
+        _clean_append_trade_unique(row)
+    except Exception as exc:
+        append_clean_runtime_error("append_clean_closed_trade", exc, {"trade_id": getattr(pos, "trade_id", None)})
+
+
+def append_clean_master_audit(event: Dict[str, Any], state: Dict[str, Any], source_row: Optional[pd.Series] = None) -> None:
+    event_time = str(event.get("t") or datetime.now(timezone.utc).isoformat())
+    record = {
+        "schema_version": CLEAN_AUDIT_SCHEMA_VERSION,
+        "record_type": "MASTER_CANDLE_AUDIT",
+        "event_key": f"CANDLE|{event_time}",
+        "time_utc": datetime.now(timezone.utc).isoformat(),
+        "source": "real_live_engine",
+        "bar": _clean_source_bar_snapshot(source_row),
+        "decision": event,
+        "state_after": _clean_runtime_state_payload(state),
+    }
+    _clean_append_jsonl_unique(CLEAN_MASTER_AUDIT_FILE, record, "event_key")
+
+
+def save_clean_runtime_state(state: Dict[str, Any]) -> None:
+    _clean_atomic_write_json(CLEAN_RUNTIME_STATE_FILE, _clean_runtime_state_payload(state))
+
+
+def _clean_build_audit_zip_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file_path in CLEAN_AUDIT_FILES:
+            if file_path.exists():
+                zf.write(file_path, arcname=file_path.name)
+    return buffer.getvalue()
+
+
+def send_admin_audit_zip(subject: str, body: str) -> None:
+    if not ADMIN_AUDIT_EMAIL_ENABLED:
+        logging.info("[ADMIN AUDIT EMAIL SKIPPED] disabled")
+        return
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD or not ADMIN_AUDIT_EMAIL:
+        logging.info("[ADMIN AUDIT EMAIL SKIPPED] missing email env")
+        return
+
+    zip_bytes = _clean_build_audit_zip_bytes()
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_ADDRESS
+    msg["To"] = ADMIN_AUDIT_EMAIL
+    msg.set_content(body)
+    msg.add_attachment(
+        zip_bytes,
+        maintype="application",
+        subtype="zip",
+        filename="ethusdt_real_live_4file_audit.zip",
+    )
+
+    try:
+        with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
+            smtp.starttls()
+            smtp.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD.replace(" ", ""))
+            smtp.send_message(msg)
+        logging.info("[ADMIN AUDIT EMAIL SENT] %s", subject)
+    except Exception as exc:
+        append_clean_runtime_error("send_admin_audit_zip", exc, {"subject": subject})
+        logging.error("[ADMIN AUDIT EMAIL ERROR] %s", exc)
+
+
+def maybe_send_admin_audit_zip_for_event(event: Dict[str, Any]) -> None:
+    try:
+        sided_signal = event.get("rule_side") in (1, -1)
+        opened = event.get("opened") in {"LONG", "SHORT"}
+        closed = event.get("closed_reason") not in {None, "", "nan"}
+        if not (opened or closed or (ADMIN_AUDIT_EMAIL_ON_SIDED_SIGNAL and sided_signal)):
+            return
+
+        trigger = "OPEN" if opened else "CLOSE" if closed else "SIDED_SIGNAL"
+        subject = f"ETHUSDT real live 4-file audit | {trigger} | {event.get('t')}"
+        body = (
+            "Attached ZIP contains exactly the four real-live admin audit files:\n"
+            "- shadow_live_master_audit.jsonl\n"
+            "- shadow_live_trades.csv\n"
+            "- shadow_live_state.json\n"
+            "- shadow_live_errors.jsonl\n\n"
+            f"Trigger: {trigger}\n"
+            f"Bar: {event.get('t')}\n"
+            f"Rule: {event.get('rule_reason')}\n"
+            f"Side: {event.get('rule_side')}\n"
+            f"ML probability: {event.get('ml_prob')}\n"
+            f"ML threshold: {event.get('ml_threshold')}\n"
+            f"ML accept: {event.get('ml_accept')}\n"
+            f"Opened: {event.get('opened')}\n"
+            f"Closed reason: {event.get('closed_reason')}\n"
+            f"Position before: {event.get('position_before')}\n"
+            f"Position after: {event.get('position_after')}\n"
+            f"Clean audit dir: {CLEAN_AUDIT_DIR}\n"
+        )
+        send_admin_audit_zip(subject, body)
+    except Exception as exc:
+        append_clean_runtime_error("maybe_send_admin_audit_zip_for_event", exc, {"event_t": event.get("t")})
+
+
+def append_clean_audit_files(
+    event: Dict[str, Any],
+    state: Dict[str, Any],
+    source_row: Optional[pd.Series] = None,
+    send_admin_email: bool = False,
+) -> None:
+    try:
+        initialize_clean_audit_files()
+        append_clean_master_audit(event, state, source_row=source_row)
+        save_clean_runtime_state(state)
+        if send_admin_email:
+            maybe_send_admin_audit_zip_for_event(event)
+    except Exception as exc:
+        append_clean_runtime_error("append_clean_audit_files", exc, {"event_t": event.get("t")})
+        logging.error("[CLEAN AUDIT ERROR] %s", exc)
 
 def make_trade_id(signal_t: str, side: int, setup_name: str) -> str:
     side_txt = "LONG" if side == +1 else "SHORT"
@@ -3123,6 +3497,7 @@ def append_closed_trade(pos: OpenPosition, exit_t: pd.Timestamp, exit_px: float,
         "leverage_scenarios_json": _safe_json(build_close_leverage_scenarios(pos, exit_px)),
     }
     append_csv_row(TRADE_LOG_FILE, row, TRADE_LOG_COLUMNS)
+    append_clean_closed_trade(pos, exit_t, float(exit_px), reason)
 
 def send_open_email(pos: OpenPosition):
     body = (
@@ -3830,6 +4205,7 @@ def run_once(state: Dict[str, Any]) -> Dict[str, Any]:
                 append_rule_funnel_file(event)
                 append_sample_audit_file(event)
                 append_root_debug_file(event)
+                append_clean_audit_files(event, state, source_row=row, send_admin_email=False)
         logging.info("[CATCHUP MODE] processed %d 15m bars with alerts disabled", len(new_rows))
         return state
 
@@ -3842,6 +4218,7 @@ def run_once(state: Dict[str, Any]) -> Dict[str, Any]:
             append_rule_funnel_file(last_event)
             append_sample_audit_file(last_event)
             append_root_debug_file(last_event)
+            append_clean_audit_files(last_event, state, source_row=row, send_admin_email=True)
 
     pos = load_position(state)
     pos_side = pos.side if pos else 0
@@ -3942,6 +4319,12 @@ def main():
     logging.info("[audit_status_file] %s", AUDIT_STATUS_FILE)
     logging.info("[signal_monitor_file] %s", SIGNAL_MONITOR_FILE)
     logging.info("[trade_log_file] %s", TRADE_LOG_FILE)
+    logging.info("[clean_audit_dir] %s", CLEAN_AUDIT_DIR)
+    logging.info("[clean_master_audit_file] %s", CLEAN_MASTER_AUDIT_FILE)
+    logging.info("[clean_trades_file] %s", CLEAN_TRADES_FILE)
+    logging.info("[clean_runtime_state_file] %s", CLEAN_RUNTIME_STATE_FILE)
+    logging.info("[clean_errors_file] %s", CLEAN_ERRORS_FILE)
+    initialize_clean_audit_files()
 
     run_startup_export_engine_check()
 
