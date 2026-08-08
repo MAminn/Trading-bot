@@ -1321,6 +1321,7 @@ def calculate_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
         "price_ema50", "price_ema200",
         "binance_funding_rate", "binance_funding_rate_abs",
         "realagg_buy_ratio_quote", "realagg_cvd_quote_delta",
+        "oi_open_interest_pct_chg_4", "oi_price_oi_divergence_4",
     ]
     _v22_raw = {
         name: pd.to_numeric(df[name], errors="coerce").copy()
@@ -1331,11 +1332,14 @@ def calculate_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     missing = [c for c in RAW_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"{tf} missing raw columns: {missing}")
-    df = df[RAW_COLUMNS].copy()
+    # Open-interest columns are not part of RAW_COLUMNS but must survive the
+    # projection when an upstream frame supplies them, so the V22 LONG
+    # open-interest divergence input can be rebuilt below.
+    extra_live_external_cols = [c for c in ["oi_open_interest", "oi_open_interest_value"] if c in df.columns]
+    df = df[RAW_COLUMNS + extra_live_external_cols].copy()
     df = dedupe_columns_keep_last(df)
-    for col in RAW_COLUMNS:
-        if col != "date":
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in [c for c in df.columns if c != "date"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     o = df["open"]
     h = df["high"]
     l = df["low"]
@@ -1475,6 +1479,24 @@ def calculate_features(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     _v22_realagg_sum4.loc[_v22_scope] = _v22_realagg_scope.rolling(4, min_periods=4).sum()
     f["v22_exact_realagg_cvd_quote_delta_z_50"] = _v22_realagg_z50
     f["v22_exact_realagg_cvd_quote_delta_sum_4"] = _v22_realagg_sum4
+
+    # V22 LONG open-interest divergence input. Only the single column consumed
+    # by the seven-gate flow_or_oi_ok check is rebuilt here; the wider OI feature
+    # family is intentionally not ported. Open interest stays a NaN Series when
+    # the upstream frame carries no OI columns, so .pct_change()/.notna() remain
+    # valid and the resulting column is NaN rather than absent.
+    if "oi_open_interest" in df.columns:
+        _v22_oi_open_interest = pd.to_numeric(df["oi_open_interest"], errors="coerce")
+    else:
+        _v22_oi_open_interest = pd.Series(np.nan, index=df.index, dtype="float64")
+    _v22_oi_pct4 = _v22_raw.get("oi_open_interest_pct_chg_4", _v22_oi_open_interest.pct_change(4))
+    _v22_price_ret4 = _v22_scoped_pct_change(c, 4)
+    _v22_oi_valid4 = _v22_price_ret4.notna() & _v22_oi_pct4.notna()
+    _v22_oi_signed4 = np.sign(_v22_price_ret4) * np.sign(_v22_oi_pct4)
+    f["v22_exact_oi_price_oi_divergence_4"] = _v22_raw.get(
+        "oi_price_oi_divergence_4",
+        pd.Series(np.where(_v22_oi_valid4, _v22_oi_signed4, np.nan), index=df.index),
+    )
 
     f["atr_14"] = atr_14
     f["atr14"] = atr_14
@@ -3025,8 +3047,19 @@ def v22_live_long_candidate(row: pd.Series) -> bool:
     return False
 
 
-def v22_long_causal_gate_state(row: pd.Series) -> Dict[str, Any]:
-    """Return exact future V22 LONG archetype, seven gates and candidate."""
+def v22_long_causal_gate_state(
+    row: pd.Series,
+    setup_archetypes: Optional[Tuple[str, ...]] = None,
+) -> Dict[str, Any]:
+    """Return exact future V22 LONG archetype, seven gates and candidate.
+
+    setup_archetypes defaults to ("breakout",), which is the pre-existing
+    behaviour. The pre-ML strict-reaction selector passes both breakout and
+    reversal_after_drop so the virtual LONG slot is occupied by the same
+    candidate stream the training pipeline used.
+    """
+    if setup_archetypes is None:
+        setup_archetypes = ("breakout",)
     empty_gates = {
         "setup_ok": False,
         "vol_ok": False,
@@ -3046,7 +3079,7 @@ def v22_long_causal_gate_state(row: pd.Series) -> Dict[str, Any]:
 
     th = V22_THRESHOLDS
     arch = v22_training_pre_entry_archetype(row)
-    setup_ok = arch == "breakout"
+    setup_ok = arch in set(setup_archetypes)
     atrp = row_num_any(row, ["v22_exact_atr14_pct", "atrp_14", "pre_atr14_pct"], np.nan)
     range_pct = row_num_any(row, ["v22_exact_range_pct", "range_pct", "pre_range_pct"], 0.0)
     funding_abs = row_num_any(
@@ -3136,10 +3169,18 @@ def valid_signal_row(row: pd.Series) -> bool:
     return bool_value(row.get("valid_next_entry")) and bool_value(row.get("bar_closed_now"))
 
 
-def build_rule_funnel(row: pd.Series) -> Dict[str, Dict[str, Any]]:
+def build_rule_funnel(
+    row: pd.Series,
+    long_selected: Optional[bool] = None,
+    short_selected: Optional[bool] = None,
+    long_selector_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
     valid = valid_signal_row(row)
 
-    long_family_pass = bool(v22_live_long_candidate(row)) if valid else False
+    long_raw_candidate = bool(v22_live_long_candidate(row)) if valid else False
+    long_family_pass = (
+        bool(long_selected) if long_selected is not None else long_raw_candidate
+    )
     long_trigger_pass = long_family_pass
     long_1h_soft_veto = True if valid else False
     long_final_filter = True if valid else False
@@ -3149,7 +3190,10 @@ def build_rule_funnel(row: pd.Series) -> Dict[str, Dict[str, Any]]:
     short_trigger_pass = bool(short_momentum_break_trigger(row)) if valid else False
     short_1h_soft_veto = bool(short_1h_soft_veto_pass(row)) if valid else False
     short_final_filter = True if valid else False
-    short_ml_reached = bool(valid and short_family_pass and short_trigger_pass and short_1h_soft_veto and short_final_filter)
+    short_raw_candidate = bool(valid and short_family_pass and short_trigger_pass and short_1h_soft_veto and short_final_filter)
+    short_ml_reached = bool(
+        short_selected if short_selected is not None else short_raw_candidate
+    )
 
     return {
         "long": {
@@ -3157,6 +3201,9 @@ def build_rule_funnel(row: pd.Series) -> Dict[str, Dict[str, Any]]:
             "setup": LONG_SETUP_NAME,
             "trigger": LONG_TRIGGER,
             "valid_signal_row": bool(valid),
+            "raw_long_candidate": long_raw_candidate,
+            "strict_reaction_selected": bool(long_selected) if long_selected is not None else None,
+            "strict_selector_meta": long_selector_meta,
             "family_pass": long_family_pass,
             "trigger_pass": long_trigger_pass,
             "one_h_soft_veto_pass": long_1h_soft_veto,
@@ -3180,6 +3227,8 @@ def build_rule_funnel(row: pd.Series) -> Dict[str, Dict[str, Any]]:
             "setup": SHORT_SETUP_NAME,
             "trigger": SHORT_TRIGGER,
             "valid_signal_row": bool(valid),
+            "raw_rule_candidate": short_raw_candidate,
+            "side_no_overlap_selected": bool(short_selected) if short_selected is not None else None,
             "family_pass": short_family_pass,
             "trigger_pass": short_trigger_pass,
             "one_h_soft_veto_pass": short_1h_soft_veto,
@@ -3202,15 +3251,37 @@ def build_rule_funnel(row: pd.Series) -> Dict[str, Dict[str, Any]]:
     }
 
 
-def evaluate_rule_candidates(row: pd.Series) -> List[Dict[str, Any]]:
+def evaluate_rule_candidates(
+    row: pd.Series,
+    long_selected: Optional[bool] = None,
+    short_selected: Optional[bool] = None,
+    long_selector_meta: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     if not valid_signal_row(row):
         return out
-    v22_meta = v22_long_source_meta(row)
-    if v22_live_long_candidate(row):
-        out.append({"side": +1, "setup": LONG_SETUP_NAME, "trigger": LONG_TRIGGER, "exit": LONG_EXIT_NAME, "v22_source_meta": v22_meta})
-    if family_setup_pass(row, SHORT_SPECS, "SHORT", SHORT_SETUP_FAMILY) and short_momentum_break_trigger(row) and short_1h_soft_veto_pass(row):
-        out.append({"side": -1, "setup": SHORT_SETUP_NAME, "trigger": SHORT_TRIGGER, "exit": SHORT_EXIT_NAME})
+
+    if long_selected is None:
+        long_selected = bool(v22_live_long_candidate(row))
+    if short_selected is None:
+        short_selected = _short_rule_candidate(row)
+
+    if bool(long_selected):
+        out.append({
+            "side": +1,
+            "setup": LONG_SETUP_NAME,
+            "trigger": LONG_TRIGGER,
+            "exit": LONG_EXIT_NAME,
+            "v22_source_meta": v22_long_source_meta(row),
+            "strict_selector_meta": long_selector_meta,
+        })
+    if bool(short_selected):
+        out.append({
+            "side": -1,
+            "setup": SHORT_SETUP_NAME,
+            "trigger": SHORT_TRIGGER,
+            "exit": SHORT_EXIT_NAME,
+        })
     return out
 
 
@@ -3534,11 +3605,262 @@ def send_close_email(pos: OpenPosition, exit_t: pd.Timestamp, exit_px: float, re
     send_email(f"CLOSE {position_txt(pos.side)} | {reason} | ETHUSDT 15M version B baseline", body)
 
 
+
+# =============================================================================
+# EXACT PRE-ML SIDE SELECTORS
+# -----------------------------------------------------------------------------
+# ORCH_V1_STRICT_REACTION side-selection management. This selector runs on all
+# breakout + reversal_after_drop orchestration candidates and occupies a virtual
+# LONG slot; only breakout-initiated occupancies are exposed to LONG ML. The
+# SHORT raw selector tracks its own virtual no-overlap position. Both advance on
+# every signal bar, independently of the real portfolio position.
+#
+# Neither selector places, sizes, or influences any order. They only decide
+# which rows reach the ML models.
+# =============================================================================
+STRICT_REACTION_INITIAL_SL_ATR = 1.05
+STRICT_REACTION_TP_ATR = 1.55
+STRICT_REACTION_HOLD_BARS = 20
+STRICT_REACTION_TRAIL_START_ATR = 0.70
+STRICT_REACTION_TRAIL_DIST_ATR = 0.35
+STRICT_REACTION_EARLY_BARS = 4
+STRICT_REACTION_EARLY_MIN_MFE_ATR = 0.55
+STRICT_REACTION_EARLY_BAD_CLOSE_ATR = -0.15
+STRICT_REACTION_WEAK_HOLD_BARS = 8
+STRICT_REACTION_RUNNER_MFE_ATR = 1.20
+STRICT_REACTION_SETUP_ARCHETYPES = ("breakout", "reversal_after_drop")
+
+
+@dataclass
+class StrictReactionPosition:
+    signal_t: str
+    entry_t: str
+    entry: float
+    atr: float
+    archetype: str
+    sl: float
+    tp: float
+    trail_stop: float
+    bars_held: int = 0
+    best_high: float = float("nan")
+    worst_low: float = float("nan")
+    trail_active: bool = False
+
+
+def _short_rule_candidate(row: pd.Series) -> bool:
+    """Raw SHORT rule candidate, identical to the inline test in
+    evaluate_rule_candidates. Extracted so the SHORT selector can reuse it."""
+    return bool(
+        valid_signal_row(row)
+        and family_setup_pass(row, SHORT_SPECS, "SHORT", SHORT_SETUP_FAMILY)
+        and short_momentum_break_trigger(row)
+        and short_1h_soft_veto_pass(row)
+    )
+
+
+def _create_strict_reaction_position(
+    row: pd.Series,
+    archetype: str,
+) -> StrictReactionPosition:
+    entry = float(row["entry_open_next"])
+    atr = get_atr_abs(row, entry)
+    signal_t = pd.Timestamp(row["ts_open"])
+    entry_t = pd.Timestamp(row["entry_ts_next"])
+    sl = entry - STRICT_REACTION_INITIAL_SL_ATR * atr
+    tp = entry + STRICT_REACTION_TP_ATR * atr
+    return StrictReactionPosition(
+        signal_t=signal_t.isoformat(),
+        entry_t=entry_t.isoformat(),
+        entry=entry,
+        atr=atr,
+        archetype=str(archetype),
+        sl=sl,
+        tp=tp,
+        trail_stop=sl,
+        bars_held=0,
+        best_high=entry,
+        worst_low=entry,
+        trail_active=False,
+    )
+
+
+def _resolve_strict_reaction_on_bar(
+    pos: StrictReactionPosition,
+    row: pd.Series,
+) -> Tuple[Optional[float], Optional[str], StrictReactionPosition]:
+    if pd.Timestamp(row["ts_open"]) < pd.Timestamp(pos.entry_t):
+        return None, None, pos
+
+    high = float(row["high"])
+    low = float(row["low"])
+    close = float(row["close"])
+    bars = int(pos.bars_held) + 1
+    pos.best_high = max(float(pos.best_high), high)
+    pos.worst_low = min(float(pos.worst_low), low)
+    mfe_atr = (float(pos.best_high) - float(pos.entry)) / max(float(pos.atr), 1e-12)
+
+    if mfe_atr >= STRICT_REACTION_TRAIL_START_ATR:
+        pos.trail_active = True
+        pos.trail_stop = max(
+            float(pos.trail_stop),
+            float(pos.best_high) - STRICT_REACTION_TRAIL_DIST_ATR * float(pos.atr),
+        )
+    active_stop = float(pos.trail_stop) if pos.trail_active else float(pos.sl)
+
+    if low <= active_stop:
+        return active_stop, "TR" if pos.trail_active else "SL", pos
+    if high >= float(pos.tp):
+        return float(pos.tp), "TP", pos
+
+    if 2 <= bars <= STRICT_REACTION_EARLY_BARS:
+        close_atr = (close - float(pos.entry)) / max(float(pos.atr), 1e-12)
+        if (
+            mfe_atr < STRICT_REACTION_EARLY_MIN_MFE_ATR
+            and close_atr <= STRICT_REACTION_EARLY_BAD_CLOSE_ATR
+        ):
+            return close, "EARLY_BAD_REACTION", pos
+
+    if bars == STRICT_REACTION_WEAK_HOLD_BARS:
+        close_atr = (close - float(pos.entry)) / max(float(pos.atr), 1e-12)
+        if mfe_atr < STRICT_REACTION_RUNNER_MFE_ATR and close_atr <= 0.15:
+            return close, "WEAK_FOLLOWTHROUGH_EXIT", pos
+
+    pos.bars_held = bars
+    if bars >= STRICT_REACTION_HOLD_BARS:
+        return close, "TIME_EXIT", pos
+    return None, None, pos
+
+
+def _load_strict_reaction_position(
+    state: Dict[str, Any],
+) -> Optional[StrictReactionPosition]:
+    payload = state.get("strict_long_position")
+    return StrictReactionPosition(**payload) if isinstance(payload, dict) else None
+
+
+def _save_strict_reaction_position(
+    state: Dict[str, Any],
+    pos: Optional[StrictReactionPosition],
+) -> None:
+    state["strict_long_position"] = asdict(pos) if pos is not None else None
+
+
+def _load_short_raw_position(state: Dict[str, Any]) -> Optional[OpenPosition]:
+    payload = state.get("short_raw_position")
+    return OpenPosition(**payload) if isinstance(payload, dict) else None
+
+
+def _save_short_raw_position(
+    state: Dict[str, Any],
+    pos: Optional[OpenPosition],
+) -> None:
+    state["short_raw_position"] = asdict(pos) if pos is not None else None
+
+
+def advance_pre_ml_side_selectors(
+    row: pd.Series,
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Advance LONG strict reaction and SHORT raw no-overlap independently."""
+    strict_pos = _load_strict_reaction_position(state)
+    strict_exit_reason: Optional[str] = None
+    if strict_pos is not None:
+        _, strict_exit_reason, strict_pos = _resolve_strict_reaction_on_bar(
+            strict_pos, row
+        )
+        if strict_exit_reason is not None:
+            strict_pos = None
+
+    gate_state = v22_long_causal_gate_state(row, STRICT_REACTION_SETUP_ARCHETYPES)
+    long_selected = False
+    selected_archetype: Optional[str] = None
+    if strict_pos is None and bool(gate_state.get("candidate")):
+        selected_archetype = str(gate_state.get("archetype"))
+        strict_pos = _create_strict_reaction_position(row, selected_archetype)
+        long_selected = selected_archetype == "breakout"
+    _save_strict_reaction_position(state, strict_pos)
+
+    short_pos = _load_short_raw_position(state)
+    short_exit_reason: Optional[str] = None
+    short_exited_this_bar = False
+    if short_pos is not None:
+        entry_t = pd.Timestamp(short_pos.entry_t)
+        if pd.Timestamp(row["ts_open"]) >= entry_t:
+            _, short_exit_reason, short_pos = resolve_position_on_bar(short_pos, row)
+            if short_exit_reason is not None:
+                short_pos = None
+                short_exited_this_bar = True
+
+    short_selected = False
+    if (
+        short_pos is None
+        and not short_exited_this_bar
+        and _short_rule_candidate(row)
+    ):
+        short_candidate = {
+            "side": -1,
+            "setup": SHORT_SETUP_NAME,
+            "trigger": SHORT_TRIGGER,
+            "exit": SHORT_EXIT_NAME,
+        }
+        short_pos = create_open_position(
+            row, short_candidate, float("nan"), SHORT_THRESHOLD
+        )
+        short_selected = True
+    _save_short_raw_position(state, short_pos)
+
+    state["selector_state_initialized"] = True
+    return {
+        "long_selected": bool(long_selected),
+        "long_selected_archetype": selected_archetype,
+        "long_gate_state": gate_state,
+        "long_strict_exit_reason": strict_exit_reason,
+        "short_selected": bool(short_selected),
+        "short_raw_exit_reason": short_exit_reason,
+        "strict_long_position_after": (
+            asdict(strict_pos) if strict_pos is not None else None
+        ),
+        "short_raw_position_after": (
+            asdict(short_pos) if short_pos is not None else None
+        ),
+    }
+
+
+def rebuild_selector_state_from_history(
+    state: Dict[str, Any],
+    decision_source: pd.DataFrame,
+    through: Optional[pd.Timestamp] = None,
+) -> Dict[str, Any]:
+    """Warm up both selectors by replaying the clean panel."""
+    state["strict_long_position"] = None
+    state["short_raw_position"] = None
+    rows = decision_source.copy().sort_values("ts_open")
+    if through is not None:
+        rows = rows[rows["ts_open"] <= through]
+    for _, row in rows.iterrows():
+        advance_pre_ml_side_selectors(row, state)
+    state["selector_state_initialized"] = True
+    logging.info(
+        "[SELECTOR WARMUP] replayed %d bars | strict_long_open=%s short_raw_open=%s",
+        len(rows),
+        state.get("strict_long_position") is not None,
+        state.get("short_raw_position") is not None,
+    )
+    return state
+
+
 # =============================================================================
 # STATE / BAR PROCESSING
 # =============================================================================
 def default_runtime_state() -> Dict[str, Any]:
-    return {"initialized": False, "last_processed_bar": None, "position": None}
+    return {
+        "initialized": False,
+        "selector_state_initialized": False,
+        "last_processed_bar": None,
+        "position": None,
+        "strict_long_position": None,
+        "short_raw_position": None,
+    }
 
 
 def load_position(state: Dict[str, Any]) -> Optional[OpenPosition]:
@@ -3552,6 +3874,7 @@ def save_position(state: Dict[str, Any], pos: Optional[OpenPosition]) -> None:
 
 
 def process_one_signal_bar(row: pd.Series, state: Dict[str, Any], send_alerts: bool = True) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    selector = advance_pre_ml_side_selectors(row, state)
     pos = load_position(state)
     event: Dict[str, Any] = {
         "t": pd.Timestamp(row["ts_open"]).isoformat(),
@@ -3568,7 +3891,13 @@ def process_one_signal_bar(row: pd.Series, state: Dict[str, Any], send_alerts: b
         "position_after": None,
         "leverage_scenarios_json": None,
         "sample_features": None,
-        "rule_funnel": build_rule_funnel(row),
+        "pre_ml_selector": selector,
+        "rule_funnel": build_rule_funnel(
+            row,
+            long_selected=selector["long_selected"],
+            short_selected=selector["short_selected"],
+            long_selector_meta=selector,
+        ),
     }
     if pos is not None:
         entry_t = pd.Timestamp(pos.entry_t)
@@ -3584,7 +3913,12 @@ def process_one_signal_bar(row: pd.Series, state: Dict[str, Any], send_alerts: b
                 event = add_close_leverage_columns(event, pos, float(exit_px))
                 pos = None
     if pos is None:
-        candidates = evaluate_rule_candidates(row)
+        candidates = evaluate_rule_candidates(
+            row,
+            long_selected=selector["long_selected"],
+            short_selected=selector["short_selected"],
+            long_selector_meta=selector,
+        )
         scored = []
         for cand in candidates:
             side = int(cand["side"])
@@ -4090,7 +4424,7 @@ def append_signal_monitor(event: Dict[str, Any]):
         "closed_reason": event.get("closed_reason"),
         "position_before": event.get("position_before"),
         "position_after": event.get("position_after"),
-        "event_json": _safe_json({k: v for k, v in event.items() if k not in {"sample_features", "rule_funnel"}}),
+        "event_json": _safe_json({k: v for k, v in event.items() if k not in {"sample_features", "rule_funnel", "pre_ml_selector"}}),
     }
     append_csv_row(SIGNAL_MONITOR_FILE, row, SIGNAL_MONITOR_COLUMNS)
 
@@ -4110,9 +4444,11 @@ def append_diagnostic_status(panel: pd.DataFrame):
 def bootstrap_state_from_history(state: Dict[str, Any], decision_source: pd.DataFrame) -> Dict[str, Any]:
     if decision_source.empty:
         state["initialized"] = True
+        state["selector_state_initialized"] = True
         return state
-    state["last_processed_bar"] = pd.Timestamp(decision_source.iloc[-1]["ts_open"]).isoformat()
     state["position"] = None
+    state = rebuild_selector_state_from_history(state, decision_source)
+    state["last_processed_bar"] = pd.Timestamp(decision_source.iloc[-1]["ts_open"]).isoformat()
     state["initialized"] = True
     logging.info("[BOOTSTRAP DONE] started FLAT | last_processed_bar=%s", state["last_processed_bar"])
     return state
@@ -4175,6 +4511,18 @@ def run_once(state: Dict[str, Any]) -> Dict[str, Any]:
 
     if not state.get("initialized", False):
         return bootstrap_state_from_history(state, decision_source)
+
+    if not state.get("selector_state_initialized", False):
+        cutoff = (
+            pd.Timestamp(state["last_processed_bar"])
+            if state.get("last_processed_bar") else None
+        )
+        state = rebuild_selector_state_from_history(
+            state, decision_source, through=cutoff
+        )
+        logging.info(
+            "[STATE MIGRATION] pre-ML selector state rebuilt through=%s", cutoff
+        )
 
     last_processed = pd.Timestamp(state["last_processed_bar"]) if state.get("last_processed_bar") else None
     new_rows = decision_source if last_processed is None else decision_source[decision_source["ts_open"] > last_processed].copy()
