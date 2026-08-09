@@ -37,6 +37,18 @@ MARGIN_SAFETY_FRACTION = Decimal("0.90")
 # stripped before POSTing so they never reach the app's Zod schema.
 NON_PERSISTED_KEYS = {"leverage"}
 
+OPENED_TO_RULE_SIDE = {"LONG": 1, "SHORT": -1}
+
+
+def is_accepted_open_signal(signal: dict) -> bool:
+    """True only when ml_accept is True, opened is LONG/SHORT, and rule_side agrees."""
+    if signal.get("ml_accept") is not True:
+        return False
+    expected = OPENED_TO_RULE_SIDE.get(signal.get("opened"))
+    if expected is None:
+        return False
+    return signal.get("rule_side") == expected
+
 # After placing an order, poll the position until Binance reflects the fill so a
 # same-cycle follow-up (e.g. a CLOSE after an OPEN) sizes against the real state.
 SETTLE_MAX_POLLS = 10
@@ -582,12 +594,21 @@ class SignalConsumer:
                         close_order, current_amt, opens_blocked, block_reason
                     )
 
-            if signal.get("rule_side") in (1, -1):
+            if is_accepted_open_signal(signal):
                 current_amt = self._process_intent(
                     self._build_intent(signal, ref_price),
                     current_amt,
                     opens_blocked,
                     block_reason,
+                )
+            elif signal.get("rule_side") in (1, -1):
+                log.info(
+                    "NO OPEN | rule_side=%r not an accepted open "
+                    "(ml_accept=%r opened=%r) | bar_time=%s",
+                    signal.get("rule_side"),
+                    signal.get("ml_accept"),
+                    signal.get("opened"),
+                    signal.get("bar_time"),
                 )
 
             # Advance cursor only after the intent(s) are persisted (or confirmed
