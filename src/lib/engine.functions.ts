@@ -1,6 +1,13 @@
 // Server functions for the authenticated user to control their engine.
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import {
+  LEVERAGE_BY_ALLOC,
+  LEVERAGE_MAX,
+  LEVERAGE_MIN,
+  SIZING_MODES,
+  capitalFromAllocation,
+} from "@/lib/sizing";
 import { z } from "zod";
 
 export const setEngineRunning = createServerFn({ method: "POST" })
@@ -32,48 +39,99 @@ export const setEngineRunning = createServerFn({ method: "POST" })
     return { ok: true };
   });
 
-// Allocation is the single source of truth; leverage is derived from it.
-// These are the only ten pairs the UI can produce and the only ten accepted.
-const LEVERAGE_BY_ALLOC: Record<number, number> = {
-  10: 1, 9: 10, 8: 20, 7: 30, 6: 40, 5: 50, 4: 60, 3: 70, 2: 80, 1: 90,
-};
+// Every field that participates in sizing. If a patch touches any of them it
+// must declare the mode it is sizing under, so no patch can mutate sizing into
+// a state this validator never evaluated.
+const SIZING_FIELDS = [
+  "sizing_mode",
+  "account_size_usd",
+  "capital_usd",
+  "capital_allocation_pct",
+  "leverage",
+] as const;
 
-const ConfigPatch = z.object({
+export const ConfigPatch = z.object({
+  sizing_mode: z.enum(SIZING_MODES).optional(),
+  account_size_usd: z.number().positive().max(1e9).optional(),
   capital_usd: z.number().positive().max(1e9).optional(),
   // allocation is capped at 10% to keep position size small relative to account
   capital_allocation_pct: z.number().min(1).max(10).optional(),
-  leverage: z.number().min(1).max(90).optional(),
+  leverage: z.number().min(LEVERAGE_MIN).max(LEVERAGE_MAX).optional(),
   max_notional_usd: z.number().positive().max(100000).optional(),
-  // these two fields are reused as Take-Profit % and Stop-Loss % in the UI.
-  // Numeric ranges remain wide so older values continue to validate.
+  // Legacy columns, no longer written by the UI. Ranges stay wide so older
+  // values continue to validate.
   max_daily_loss_usd: z.number().min(0).max(1e9).optional(),
   max_position_size_usd: z.number().min(0).max(1e9).optional(),
   demo_mode: z.boolean().optional(),
   // mode is locked to signal_only for now
   mode: z.enum(["signal_only"]).optional(),
 }).superRefine((val, ctx) => {
-  const hasLev = val.leverage !== undefined;
-  const hasAlloc = val.capital_allocation_pct !== undefined;
-  // Neither present: unrelated patches (e.g. demo_mode toggle) pass untouched.
-  if (!hasLev && !hasAlloc) return;
-  if (hasLev !== hasAlloc) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: [hasLev ? "capital_allocation_pct" : "leverage"],
-      message: "leverage and capital_allocation_pct must be updated together",
-    });
+  const touched = SIZING_FIELDS.filter((f) => val[f] !== undefined);
+  // Unrelated patches (e.g. a demo_mode toggle) pass through untouched.
+  if (touched.length === 0) return;
+
+  const reject = (path: string, message: string) =>
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: [path], message });
+
+  if (val.sizing_mode === undefined) {
+    reject(
+      "sizing_mode",
+      `sizing_mode is required when updating ${touched.join(", ")} — a sizing ` +
+        `patch must declare the mode it applies to`,
+    );
     return;
   }
-  const expected = LEVERAGE_BY_ALLOC[val.capital_allocation_pct as number];
-  if (expected === undefined || expected !== val.leverage) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ["leverage"],
-      message:
-        `leverage ${val.leverage} does not match allocation ` +
-        `${val.capital_allocation_pct}% (expected ${expected ?? "a whole 1-10% allocation"})`,
-    });
+
+  if (val.sizing_mode === "allocation") {
+    const missing = (
+      ["capital_allocation_pct", "leverage", "capital_usd", "account_size_usd"] as const
+    ).filter((f) => val[f] === undefined);
+    if (missing.length > 0) {
+      for (const f of missing) {
+        reject(f, `${f} is required when sizing_mode is allocation`);
+      }
+      return;
+    }
+    const pct = val.capital_allocation_pct as number;
+    const expected = LEVERAGE_BY_ALLOC[pct];
+    if (expected === undefined || expected !== val.leverage) {
+      reject(
+        "leverage",
+        `leverage ${val.leverage} does not match allocation ${pct}% ` +
+          `(expected ${expected ?? "a whole 1-10% allocation"})`,
+      );
+    }
+    const expectedCapital = capitalFromAllocation(val.account_size_usd as number, pct);
+    if (val.capital_usd !== expectedCapital) {
+      reject(
+        "capital_usd",
+        `capital_usd ${val.capital_usd} does not match ${pct}% of account size ` +
+          `${val.account_size_usd} (expected ${expectedCapital})`,
+      );
+    }
+    return;
   }
+
+  // full_capital: sized off account_size_usd directly.
+  if (val.capital_allocation_pct !== undefined) {
+    // Meaningless here; writing it would leave a misleading row behind.
+    reject(
+      "capital_allocation_pct",
+      "capital_allocation_pct must not be sent when sizing_mode is full_capital",
+    );
+  }
+  if (val.account_size_usd === undefined) {
+    reject("account_size_usd", "account_size_usd is required when sizing_mode is full_capital");
+    return;
+  }
+  if (val.capital_usd === undefined || val.capital_usd !== val.account_size_usd) {
+    reject(
+      "capital_usd",
+      `capital_usd must equal account_size_usd ${val.account_size_usd} in ` +
+        `full_capital mode (got ${val.capital_usd})`,
+    );
+  }
+  // leverage stays free within 1-90 here: it is NOT derived from allocation.
 });
 
 export const updateEngineConfig = createServerFn({ method: "POST" })
@@ -83,9 +141,9 @@ export const updateEngineConfig = createServerFn({ method: "POST" })
     if (Object.keys(data).length === 0) return { ok: true };
     const { error } = await context.supabase
       .from("engine_config")
-      // max_notional_usd is newer than the generated types; same `as never`
-      // escape hatch the other engine writes already use.
-      .update({ ...data, updated_at: new Date().toISOString() } as never)
+      // The generated types now carry every engine_config column this patch can
+      // write, so the previous `as never` escape hatch is no longer needed.
+      .update({ ...data, updated_at: new Date().toISOString() })
       .eq("user_id", context.userId);
     if (error) throw new Error(error.message);
     return { ok: true };

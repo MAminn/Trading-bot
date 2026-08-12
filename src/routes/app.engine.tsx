@@ -34,6 +34,17 @@ function EnginePage() {
   const state = liveState(status.data, !!config.data?.is_running);
   const isRunning = !!config.data?.is_running;
   const demoMode = !!config.data?.demo_mode;
+  const isFullCapital = config.data?.sizing_mode === "full_capital";
+  // account_size_usd is nullable on rows written before the sizing migration.
+  const rawAccountSize = Number(config.data?.account_size_usd);
+  const accountSize = Number.isFinite(rawAccountSize) ? rawAccountSize : null;
+  // What the engine aims for before caps: full capital sizes off the account,
+  // allocation off the allocated slice of it.
+  const sizingBase = isFullCapital ? accountSize : Number(config.data?.capital_usd);
+  const targetNotional =
+    config.data && sizingBase !== null && Number.isFinite(sizingBase)
+      ? sizingBase * Number(config.data.leverage)
+      : null;
 
   async function toggle() {
     try {
@@ -131,10 +142,14 @@ function EnginePage() {
           <div className="mt-5 grid gap-4 md:grid-cols-3">
             <KV k="Mode" v={config.data.mode} />
             <KV k="Strategy capital" v={fmtUSD(Number(config.data.capital_usd))} />
-            <KV k="Allocation" v={`${config.data.capital_allocation_pct ?? 100}%`} />
+            <KV
+              k="Allocation"
+              v={isFullCapital ? "n/a" : `${config.data.capital_allocation_pct ?? 100}%`}
+            />
             <KV k="Leverage" v={`${config.data.leverage}×`} />
-            <KV k="Max daily loss" v={fmtUSD(Number(config.data.max_daily_loss_usd))} />
-            <KV k="Max position size" v={fmtUSD(Number(config.data.max_position_size_usd))} />
+            <KV k="Sizing mode" v={isFullCapital ? "FULL CAPITAL" : "ALLOCATION"} tone={isFullCapital ? "warn" : undefined} />
+            <KV k="Account size" v={accountSize === null ? "—" : fmtUSD(accountSize)} />
+            <KV k="Target notional" v={targetNotional === null ? "—" : fmtUSD(targetNotional)} />
             <KV k="Updated" v={fmtAgo(config.data.updated_at)} />
           </div>
         ) : (

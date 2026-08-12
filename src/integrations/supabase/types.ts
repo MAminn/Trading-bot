@@ -109,6 +109,7 @@ export type Database = {
       }
       engine_config: {
         Row: {
+          account_size_usd: number | null
           capital_allocation_pct: number
           capital_usd: number
           created_at: string
@@ -117,12 +118,15 @@ export type Database = {
           is_running: boolean
           leverage: number
           max_daily_loss_usd: number
+          max_notional_usd: number
           max_position_size_usd: number
           mode: string
+          sizing_mode: string
           updated_at: string
           user_id: string
         }
         Insert: {
+          account_size_usd?: number | null
           capital_allocation_pct?: number
           capital_usd?: number
           created_at?: string
@@ -131,12 +135,15 @@ export type Database = {
           is_running?: boolean
           leverage?: number
           max_daily_loss_usd?: number
+          max_notional_usd?: number
           max_position_size_usd?: number
           mode?: string
+          sizing_mode?: string
           updated_at?: string
           user_id: string
         }
         Update: {
+          account_size_usd?: number | null
           capital_allocation_pct?: number
           capital_usd?: number
           created_at?: string
@@ -145,8 +152,10 @@ export type Database = {
           is_running?: boolean
           leverage?: number
           max_daily_loss_usd?: number
+          max_notional_usd?: number
           max_position_size_usd?: number
           mode?: string
+          sizing_mode?: string
           updated_at?: string
           user_id?: string
         }

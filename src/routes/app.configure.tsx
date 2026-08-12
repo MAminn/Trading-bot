@@ -4,23 +4,31 @@ import { Sliders, ExternalLink, Loader2, Check, AlertTriangle } from "lucide-rea
 import { toast } from "sonner";
 import { Slider } from "@/components/ui/slider";
 import { useEngineConfig, useUpdateConfig, fmtUSD } from "@/lib/engine";
+import {
+  ALLOC_MAX,
+  ALLOC_MIN,
+  DEFAULT_SIZING_MODE,
+  LEVERAGE_BY_ALLOC,
+  LEVERAGE_MAX,
+  LEVERAGE_MIN,
+  capitalFromAllocation,
+  isSizingMode,
+  liquidationPct,
+  type SizingMode,
+} from "@/lib/sizing";
 
 export const Route = createFileRoute("/app/configure")({
   head: () => ({ meta: [{ title: "Configure — Helix" }] }),
   component: Configure,
 });
 
-// Allocation is the single source of truth. Leverage is derived, never free.
-// 10 discrete states. Nothing exists between adjacent steps.
-const ALLOC_MIN = 1;
-const ALLOC_MAX = 10;
-const LEVERAGE_BY_ALLOC: Record<number, number> = {
-  10: 1, 9: 10, 8: 20, 7: 30, 6: 40, 5: 50, 4: 60, 3: 70, 2: 80, 1: 90,
-};
+// Allocation mode: 10 discrete states, nothing between adjacent steps.
 const allocToIndex = (a: number) => ALLOC_MAX - a;
 const indexToAlloc = (i: number) => ALLOC_MAX - i;
 const clampAlloc = (a: number) =>
   Math.min(ALLOC_MAX, Math.max(ALLOC_MIN, Math.round(a)));
+const clampLeverage = (l: number) =>
+  Math.min(LEVERAGE_MAX, Math.max(LEVERAGE_MIN, Math.round(l)));
 const allocFromLeverage = (lv: number) => {
   let best = ALLOC_MAX, bestDiff = Infinity;
   for (const [a, l] of Object.entries(LEVERAGE_BY_ALLOC)) {
@@ -33,17 +41,29 @@ const allocFromLeverage = (lv: number) => {
 function Configure() {
   const { data: config, isLoading } = useEngineConfig();
   const update = useUpdateConfig();
+  const [sizingMode, setSizingMode] = useState<SizingMode>(DEFAULT_SIZING_MODE);
   const [accountSize, setAccountSize] = useState("");
   const [allocPct, setAllocPct] = useState<number>(ALLOC_MAX);
-  const [maxLoss, setMaxLoss] = useState("");
-  const [maxPos, setMaxPos] = useState("");
+  // Free leverage, used in full_capital only — kept separate so switching
+  // modes never writes an allocation-derived value into a free field.
+  const [freeLeverage, setFreeLeverage] = useState<number>(LEVERAGE_MIN);
 
   useEffect(() => {
     if (!config) return;
-    const pct = Number(config.capital_allocation_pct ?? 100);
-    const cap = Number(config.capital_usd ?? 0);
-    const acct = pct > 0 ? cap / (pct / 100) : cap;
-    setAccountSize(String(Math.round(acct)));
+    // An unknown stored mode shows as Allocation — the narrower of the two.
+    setSizingMode(isSizingMode(config.sizing_mode) ? config.sizing_mode : DEFAULT_SIZING_MODE);
+
+    // account_size_usd is now first-class. Fall back to the old lossy
+    // reconstruction only for rows written before the migration.
+    const stored = Number(config.account_size_usd);
+    if (Number.isFinite(stored) && stored > 0) {
+      setAccountSize(String(Math.round(stored)));
+    } else {
+      const pct = Number(config.capital_allocation_pct ?? 100);
+      const cap = Number(config.capital_usd ?? 0);
+      setAccountSize(String(Math.round(pct > 0 ? cap / (pct / 100) : cap)));
+    }
+
     const rawAlloc = Number(config.capital_allocation_pct);
     if (Number.isFinite(rawAlloc) && rawAlloc >= ALLOC_MIN && rawAlloc <= ALLOC_MAX) {
       setAllocPct(clampAlloc(rawAlloc));
@@ -51,26 +71,48 @@ function Configure() {
       const rawLev = Number(config.leverage);
       setAllocPct(Number.isFinite(rawLev) ? allocFromLeverage(rawLev) : ALLOC_MAX);
     }
-    setMaxLoss(String(config.max_daily_loss_usd));
-    setMaxPos(String(config.max_position_size_usd));
+
+    const rawLev = Number(config.leverage);
+    setFreeLeverage(Number.isFinite(rawLev) ? clampLeverage(rawLev) : LEVERAGE_MIN);
   }, [config]);
 
-  const leverage = LEVERAGE_BY_ALLOC[allocPct] ?? 1;
+  const isFullCapital = sizingMode === "full_capital";
+  const accountSizeNum = Number(accountSize) || 0;
+  const leverage = isFullCapital ? freeLeverage : (LEVERAGE_BY_ALLOC[allocPct] ?? 1);
   const capitalUsd = useMemo(
-    () => Math.round((Number(accountSize) || 0) * (allocPct / 100)),
-    [accountSize, allocPct],
+    () => (isFullCapital ? accountSizeNum : capitalFromAllocation(accountSizeNum, allocPct)),
+    [isFullCapital, accountSizeNum, allocPct],
   );
 
   async function onSave(e: React.FormEvent) {
     e.preventDefault();
+    if (!(accountSizeNum > 0)) {
+      toast.error("Account size must be greater than 0");
+      return;
+    }
+    if (capitalUsd < 1) {
+      toast.error("Account size is too small for the selected allocation");
+      return;
+    }
     try {
-      await update.mutateAsync({
-        capital_usd: capitalUsd,
-        capital_allocation_pct: allocPct,
-        leverage,
-        max_daily_loss_usd: Number(maxLoss),
-        max_position_size_usd: Number(maxPos),
-      });
+      // Every sizing patch declares its mode. full_capital deliberately omits
+      // capital_allocation_pct — it is meaningless there and the server rejects it.
+      await update.mutateAsync(
+        isFullCapital
+          ? {
+              sizing_mode: "full_capital",
+              account_size_usd: accountSizeNum,
+              capital_usd: accountSizeNum,
+              leverage,
+            }
+          : {
+              sizing_mode: "allocation",
+              account_size_usd: accountSizeNum,
+              capital_usd: capitalUsd,
+              capital_allocation_pct: allocPct,
+              leverage,
+            },
+      );
       toast.success("Configuration saved");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Save failed");
@@ -103,6 +145,29 @@ function Configure() {
           <div className="text-sm text-muted-foreground">Loading…</div>
         ) : (
           <>
+            <div>
+              <span className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                Sizing mode
+              </span>
+              <div className="inline-flex rounded-lg border border-border p-1">
+                <ModeButton
+                  active={!isFullCapital}
+                  label="Allocation"
+                  onClick={() => setSizingMode("allocation")}
+                />
+                <ModeButton
+                  active={isFullCapital}
+                  label="Full capital"
+                  onClick={() => setSizingMode("full_capital")}
+                />
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {isFullCapital
+                  ? "Positions are sized off your full account size, bounded only by available margin and exchange limits."
+                  : "Positions are sized off a fixed percentage of your account, with internal notional caps applied."}
+              </p>
+            </div>
+
             <Field label="Account size (USD)" value={accountSize} onChange={setAccountSize} type="number" />
 
             <div className="grid gap-6 md:grid-cols-2">
@@ -111,67 +176,101 @@ function Configure() {
                   <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Leverage</span>
                   <span className="font-mono text-lg font-semibold text-primary">{leverage}×</span>
                 </div>
-                <Slider
-                  className="mt-3"
-                  min={0} max={9} step={1}
-                  value={[allocToIndex(allocPct)]}
-                  onValueChange={(v) => setAllocPct(indexToAlloc(v[0]))}
-                />
-                <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
-                  <span>1×</span><span>90×</span>
-                </div>
+                {isFullCapital ? (
+                  <>
+                    <Slider
+                      className="mt-3"
+                      min={LEVERAGE_MIN} max={LEVERAGE_MAX} step={1}
+                      value={[freeLeverage]}
+                      onValueChange={(v) => setFreeLeverage(clampLeverage(v[0]))}
+                    />
+                    <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
+                      <span>{LEVERAGE_MIN}×</span><span>{LEVERAGE_MAX}×</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <Slider
+                      className="mt-3"
+                      min={0} max={9} step={1}
+                      value={[allocToIndex(allocPct)]}
+                      onValueChange={(v) => setAllocPct(indexToAlloc(v[0]))}
+                    />
+                    <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
+                      <span>1×</span><span>90×</span>
+                    </div>
+                  </>
+                )}
               </div>
 
-              <div>
-                <div className="flex items-baseline justify-between">
-                  <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Capital allocation</span>
-                  <span className="font-mono text-lg font-semibold text-primary">{allocPct}%</span>
+              {/* Allocation is meaningless in full_capital — hidden, not disabled. */}
+              {!isFullCapital && (
+                <div>
+                  <div className="flex items-baseline justify-between">
+                    <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Capital allocation</span>
+                    <span className="font-mono text-lg font-semibold text-primary">{allocPct}%</span>
+                  </div>
+                  <Slider
+                    className="mt-3"
+                    min={ALLOC_MIN} max={ALLOC_MAX} step={1}
+                    value={[allocPct]}
+                    onValueChange={(v) => setAllocPct(clampAlloc(v[0]))}
+                  />
+                  <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
+                    <span>1%</span><span>10%</span>
+                  </div>
                 </div>
-                <Slider
-                  className="mt-3"
-                  min={ALLOC_MIN} max={ALLOC_MAX} step={1}
-                  value={[allocPct]}
-                  onValueChange={(v) => setAllocPct(clampAlloc(v[0]))}
-                />
-                <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
-                  <span>1%</span><span>10%</span>
+              )}
+            </div>
+
+            {isFullCapital ? (
+              <>
+                <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span className="space-y-1">
+                    <strong className="block">Full capital mode — internal notional caps do not apply.</strong>
+                    <span className="block text-destructive/90">
+                      Order size is bounded only by your available margin and the
+                      exchange's leverage bracket limits. At {leverage}× a roughly{" "}
+                      <span className="font-mono font-semibold">
+                        {liquidationPct(leverage).toFixed(2)}%
+                      </span>{" "}
+                      adverse move liquidates the position.
+                    </span>
+                  </span>
                 </div>
-              </div>
-            </div>
 
-            <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-xs text-warning">
-              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span className="text-warning/90">
-                Higher leverage massively increases both gains and losses. 70× means a ~1.4% adverse move can liquidate the position.
-              </span>
-            </div>
+                <div className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 text-xs md:grid-cols-3">
+                  <KV k="Account size" v={fmtUSD(accountSizeNum)} />
+                  <KV k="Leverage" v={`${leverage}×`} />
+                  <KV k="Target notional" v={fmtUSD(accountSizeNum * leverage)} />
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-xs text-warning">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span className="text-warning/90">
+                    Higher leverage massively increases both gains and losses. 70× means a ~1.4% adverse move can liquidate the position.
+                  </span>
+                </div>
 
-            <p className="text-xs text-muted-foreground">
-              Allocation moves in whole percent only; leverage is derived from it.
-              Margin committed always equals your allocation — leverage multiplies
-              exposure, not capital at risk. The executor clamps leverage to the ETHUSDT
-              exchange maximum and caps order notional independently, so live order size
-              may be smaller than shown.
-            </p>
+                <p className="text-xs text-muted-foreground">
+                  Allocation moves in whole percent only; leverage is derived from it.
+                  Margin committed always equals your allocation — leverage multiplies
+                  exposure, not capital at risk. The executor clamps leverage to the ETHUSDT
+                  exchange maximum and caps order notional independently, so live order size
+                  may be smaller than shown.
+                </p>
 
-            <div className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 text-xs md:grid-cols-4">
-              <KV k="Strategy capital" v={fmtUSD(capitalUsd)} />
-              <KV k="Leverage" v={`${leverage}×`} />
-              <KV k="Allocation" v={`${allocPct}%`} />
-              <KV k="Notional" v={fmtUSD(capitalUsd * leverage)} />
-            </div>
-
-            <div className="space-y-3">
-              <div className="grid gap-5 md:grid-cols-2">
-                <Field label="Take profit (%)" value={maxLoss} onChange={setMaxLoss} type="number" />
-                <Field label="Stop loss (%)" value={maxPos} onChange={setMaxPos} type="number" />
-              </div>
-              <p className="text-xs text-muted-foreground">
-                For these to work effectively use a positive risk/reward ratio — TP should be at least 2× SL.
-                Suggested defaults: <span className="font-mono text-foreground">TP 3%</span>, <span className="font-mono text-foreground">SL 1.5%</span>.
-                Keep SL below 2% to survive normal volatility; never exceed your account's daily loss tolerance.
-              </p>
-            </div>
+                <div className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 text-xs md:grid-cols-4">
+                  <KV k="Strategy capital" v={fmtUSD(capitalUsd)} />
+                  <KV k="Leverage" v={`${leverage}×`} />
+                  <KV k="Allocation" v={`${allocPct}%`} />
+                  <KV k="Notional" v={fmtUSD(capitalUsd * leverage)} />
+                </div>
+              </>
+            )}
 
             <div>
               <span className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">Mode</span>
@@ -194,7 +293,7 @@ function Configure() {
 
         <div className="flex items-center justify-end gap-3">
           <span className="text-xs text-muted-foreground">
-            Current: {config ? `${fmtUSD(Number(config.capital_usd))} · ${config.leverage}× · ${config.capital_allocation_pct ?? 100}% alloc` : "—"}
+            Current: {config ? `${fmtUSD(Number(config.capital_usd))} · ${config.leverage}× · ${config.sizing_mode === "full_capital" ? "full capital" : `${config.capital_allocation_pct ?? 100}% alloc`}` : "—"}
           </span>
           <button type="submit" disabled={update.isPending || isLoading}
             className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary to-accent px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-60">
@@ -203,6 +302,23 @@ function Configure() {
         </div>
       </form>
     </div>
+  );
+}
+
+function ModeButton({ active, label, onClick }: { active: boolean; label: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={`rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+        active
+          ? "bg-primary/15 text-primary ring-1 ring-primary/60"
+          : "text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      {label}
+    </button>
   );
 }
 

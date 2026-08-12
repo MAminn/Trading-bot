@@ -16,6 +16,7 @@ import {
   closePosition as closePositionFn,
   closeAllPositions as closeAllPositionsFn,
 } from "./engine.functions";
+import type { SizingMode } from "./sizing";
 
 const POLL = 10_000;
 
@@ -37,9 +38,12 @@ export interface EngineStatusRow {
 export interface EngineConfigRow {
   user_id: string;
   mode: EngineMode;
+  sizing_mode: SizingMode;
   capital_usd: number;
+  account_size_usd: number | null;
   capital_allocation_pct: number;
   leverage: number;
+  max_notional_usd: number;
   max_daily_loss_usd: number;
   max_position_size_usd: number;
   is_running: boolean;
@@ -283,9 +287,12 @@ export function useUpdateConfig() {
       patch: Partial<
         Pick<
           EngineConfigRow,
+          | "sizing_mode"
           | "capital_usd"
+          | "account_size_usd"
           | "capital_allocation_pct"
           | "leverage"
+          | "max_notional_usd"
           | "max_daily_loss_usd"
           | "max_position_size_usd"
           | "mode"
