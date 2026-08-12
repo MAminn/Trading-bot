@@ -4,14 +4,21 @@ Pure logic: no network calls, stdlib only. Every intended order must pass
 `evaluate()` before it may be persisted as an allowed intent.
 """
 
+import logging
 import time
+
+log = logging.getLogger("executor.risk_guard")
+
+SIZING_MODES = frozenset({"allocation", "full_capital"})
 
 
 class RiskGuard:
     ALLOWED_SYMBOLS = {"ETHUSDT"}
     MIN_NOTIONAL_USD = 20
     MIN_ORDER_INTERVAL_SECONDS = 60
-    # Absolute backstop: no config value may raise the effective cap above this.
+    # Absolute backstop in allocation mode: no config value may raise the
+    # effective cap above this. Inapplicable in full_capital, where available
+    # margin and the exchange bracket cap are the bounds instead.
     ABSOLUTE_MAX_NOTIONAL_USD = 500
 
     def __init__(self, max_notional_usd=100, max_leverage=1):
@@ -19,6 +26,8 @@ class RiskGuard:
         # and the first config refresh have supplied real limits.
         self._max_notional_usd = max_notional_usd
         self._max_leverage = max_leverage
+        # Fail closed to the capped mode until a refresh says otherwise.
+        self._sizing_mode = "allocation"
 
     def update_limits(self, *, max_notional_usd=None, max_leverage=None) -> None:
         """Update only the limits supplied. main.py sets max_leverage after the
@@ -27,6 +36,19 @@ class RiskGuard:
             self._max_notional_usd = max_notional_usd
         if max_leverage is not None:
             self._max_leverage = max_leverage
+
+    def set_sizing_mode(self, mode: str) -> None:
+        """Select which notional-ceiling rule applies to OPENs.
+
+        An unrecognised value is treated as 'allocation' — the narrower of the
+        two. The guard never widens on input it does not understand."""
+        if mode in SIZING_MODES:
+            self._sizing_mode = mode
+            return
+        self._sizing_mode = "allocation"
+        log.error(
+            "invalid sizing_mode=%r — falling back to allocation (capped)", mode
+        )
 
     def evaluate(
         self, intended_order: dict, current_position_amt, last_order_time
@@ -69,11 +91,15 @@ class RiskGuard:
             notional = float(intended_order.get("notional_usd") or 0)
         except (TypeError, ValueError):
             notional = 0.0
-        effective_max = min(
-            float(self._max_notional_usd), float(self.ABSOLUTE_MAX_NOTIONAL_USD)
-        )
-        if notional > effective_max:
-            return False, f"notional {notional} exceeds max {effective_max}"
+        # full_capital deliberately has no internal notional ceiling: it is
+        # bounded by available margin and the exchange bracket cap instead.
+        # Every other check below applies identically in both modes.
+        if self._sizing_mode != "full_capital":
+            effective_max = min(
+                float(self._max_notional_usd), float(self.ABSOLUTE_MAX_NOTIONAL_USD)
+            )
+            if notional > effective_max:
+                return False, f"notional {notional} exceeds max {effective_max}"
         if notional < self.MIN_NOTIONAL_USD:
             return False, "below min notional"
 
