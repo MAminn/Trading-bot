@@ -29,9 +29,14 @@ CONFIG_REFRESH_EVERY_CYCLES = 10
 STEP_SIZE = Decimal("0.001")
 MIN_NOTIONAL_USD = Decimal("20")
 # Code ceiling for the first soak. Not reachable from the UI.
+# Applies in allocation mode only; full_capital is bounded by available margin
+# and the exchange bracket cap instead.
 HARD_CAP_USD = Decimal("500")
 # Never commit more than this fraction of available balance as margin.
 MARGIN_SAFETY_FRACTION = Decimal("0.90")
+
+# The only two recognised sizing modes. Anything else blocks OPENs.
+SIZING_MODES = frozenset({"allocation", "full_capital"})
 
 # Transient keys carried on the intent dict for the risk guard only. They are
 # stripped before POSTing so they never reach the app's Zod schema.
@@ -111,13 +116,20 @@ class SignalConsumer:
         # True between the first ensure_config() of a cycle and the end of
         # poll_once, so repeated calls in one cycle cannot double-count.
         self._cycle_counted = False
-        self._max_position_size_usd: Decimal | None = None
         self._leverage: Decimal | None = None
         self._capital_usd: Decimal | None = None
         self._alloc_pct: Decimal | None = None
         self._max_notional_usd: Decimal | None = None
+        self._sizing_mode: str = "allocation"
+        self._account_size_usd: Decimal | None = None
+        # Set by any refresh that cannot be trusted to size an order. Blocks
+        # OPENs only — CLOSEs are never gated on it.
+        self._config_invalid: bool = False
         self._available_balance: Decimal | None = None
         self._exchange_max_leverage: int | None = None
+        # Full exchange bracket ladder; the applicable cap is selected from it
+        # per configured leverage on every refresh.
+        self._bracket_ladder: list[dict] | None = None
         self._bracket_notional_cap: Decimal | None = None
         self._session = requests.Session()
         self._session.headers.update({"Authorization": f"Bearer {engine_service_token}"})
@@ -150,11 +162,9 @@ class SignalConsumer:
         # Response includes decrypted secrets — never log it. Extract sizing only.
         config = body.get("config") or {}
 
-        raw = config.get("max_position_size_usd")
-        if raw is None:
-            raise SignalConsumerError("config missing max_position_size_usd")
-        # Read but NEVER used for sizing: this field is the UI's stop-loss %.
-        self._max_position_size_usd = Decimal(str(raw))
+        # A refresh re-derives validity from scratch, so a corrected config
+        # recovers on the next cycle without a restart.
+        self._config_invalid = False
 
         for field, attr in (
             ("leverage", "_leverage"),
@@ -177,6 +187,55 @@ class SignalConsumer:
         else:
             self._max_notional_usd = Decimal(str(raw_max_notional))
 
+        # --- sizing mode -------------------------------------------------- #
+        if "sizing_mode" not in config:
+            # Pre-migration rows have no column. Same precedent as the
+            # max_notional_usd fallback: default to the narrower mode.
+            self._sizing_mode = "allocation"
+            log.info("config missing sizing_mode, defaulting to allocation")
+        else:
+            raw_mode = config.get("sizing_mode")
+            if raw_mode in SIZING_MODES:
+                self._sizing_mode = raw_mode
+            else:
+                # Never guess: an unrecognised mode blocks OPENs outright.
+                self._sizing_mode = "allocation"
+                self._config_invalid = True
+                log.error(
+                    "invalid sizing_mode=%r (allowed: %s) — OPENs blocked",
+                    raw_mode,
+                    "/".join(sorted(SIZING_MODES)),
+                )
+
+        # --- account size -------------------------------------------------- #
+        raw_account_size = config.get("account_size_usd")
+        if raw_account_size is None:
+            self._account_size_usd = None
+        else:
+            try:
+                self._account_size_usd = Decimal(str(raw_account_size))
+            except (ArithmeticError, TypeError, ValueError):
+                self._account_size_usd = None
+                self._config_invalid = True
+                log.error(
+                    "unreadable account_size_usd=%r — OPENs blocked", raw_account_size
+                )
+
+        # full_capital sizes directly off account_size_usd, so a missing or
+        # non-positive value leaves the sizing base undefined. Fail closed.
+        if self._sizing_mode == "full_capital" and (
+            self._account_size_usd is None or self._account_size_usd <= 0
+        ):
+            self._config_invalid = True
+            log.error(
+                "sizing_mode=full_capital requires account_size_usd > 0 "
+                "(got %r) — OPENs blocked",
+                self._account_size_usd,
+            )
+
+        # Leverage may have moved, so the applicable bracket tier may have too.
+        self._apply_bracket_selection()
+
         log.info(
             "config refreshed | leverage=%s | alloc_pct=%s | capital_usd=%s | "
             "max_notional_usd=%s",
@@ -185,8 +244,19 @@ class SignalConsumer:
             self._capital_usd,
             self._max_notional_usd,
         )
+        # The line that determines exposure. Never log the response body.
+        log.info(
+            "sizing | mode=%s | account_size_usd=%s | capital_usd=%s | "
+            "leverage=%s | max_notional_usd=%s",
+            self._sizing_mode,
+            self._account_size_usd,
+            self._capital_usd,
+            self._leverage,
+            self._max_notional_usd,
+        )
         if self._risk_guard is not None:
             self._risk_guard.update_limits(max_notional_usd=self._max_notional_usd)
+            self._risk_guard.set_sizing_mode(self._sizing_mode)
 
     def ensure_config(self) -> None:
         """Refresh config if due. Safe to call every cycle.
@@ -206,10 +276,69 @@ class SignalConsumer:
         """Configured leverage as an int, or None before the first refresh."""
         return int(self._leverage) if self._leverage is not None else None
 
-    def set_leverage_limits(self, max_leverage: int, notional_cap: Decimal) -> None:
-        """Record the exchange's authoritative bracket limits for this symbol."""
+    def set_leverage_limits(self, max_leverage: int, brackets: list[dict]) -> None:
+        """Record the exchange's leverage ceiling and the FULL bracket ladder.
+
+        The applicable notional cap depends on configured leverage, which can
+        change on any config refresh, so it is selected from the ladder rather
+        than fixed here."""
         self._exchange_max_leverage = int(max_leverage)
-        self._bracket_notional_cap = Decimal(str(notional_cap))
+        self._bracket_ladder = [
+            {
+                "initialLeverage": int(b["initialLeverage"]),
+                "notionalCap": Decimal(str(b["notionalCap"])),
+            }
+            for b in brackets
+        ]
+        self._apply_bracket_selection()
+
+    @staticmethod
+    def select_bracket(brackets: list[dict], configured_leverage: int) -> dict | None:
+        """Return the bracket that applies at configured_leverage, or None.
+
+        A tier qualifies when it permits at least the configured leverage;
+        among those the LARGEST notionalCap is the true bound. None means no
+        tier permits this leverage — a config error, never licence to size
+        without a cap."""
+        qualifying = [
+            b
+            for b in brackets
+            if int(b["initialLeverage"]) >= int(configured_leverage)
+        ]
+        if not qualifying:
+            return None
+        return max(qualifying, key=lambda b: Decimal(str(b["notionalCap"])))
+
+    def _apply_bracket_selection(self) -> None:
+        """Re-select the bracket cap for the configured leverage. Called from
+        the probe and from every config refresh, since either input can move."""
+        if self._bracket_ladder is None or self._leverage is None:
+            # Ladder not probed (read-only modes) or config not yet loaded.
+            # Leaving the cap unset matches pre-existing behaviour; not an error.
+            self._bracket_notional_cap = None
+            return
+        configured = int(self._leverage)
+        selected = self.select_bracket(self._bracket_ladder, configured)
+        if selected is None:
+            # Unreachable while RiskGuard rejects leverage > max_leverage, but
+            # never rely on that: fail closed rather than size uncapped.
+            self._bracket_notional_cap = None
+            self._config_invalid = True
+            log.error(
+                "BRACKET SELECTED | configured_leverage=%dx | no bracket permits "
+                "this leverage (exchange max=%sx) — OPENs blocked",
+                configured,
+                self._exchange_max_leverage,
+            )
+            return
+        self._bracket_notional_cap = Decimal(str(selected["notionalCap"]))
+        log.info(
+            "BRACKET SELECTED | configured_leverage=%dx | "
+            "selected_bracket_leverage=%dx | selected_bracket_notional_cap=%s",
+            configured,
+            int(selected["initialLeverage"]),
+            self._bracket_notional_cap,
+        )
 
     def set_available_balance(self, bal: Decimal) -> None:
         """Record the account's available balance for the margin sanity check."""
@@ -271,31 +400,82 @@ class SignalConsumer:
         bar_time = to_z_iso(signal["bar_time"])
         idempotency_key = f"{self._user_id}:{bar_time}:{side}:OPEN"
 
-        target = self._capital_usd * self._leverage
-        caps = [target, self._max_notional_usd, HARD_CAP_USD]
-        if self._bracket_notional_cap is not None:
-            caps.append(self._bracket_notional_cap)
-        notional_target = min(caps)
-        if notional_target < target:
-            log.info("SIZE CLAMPED | target=%s -> %s", target, notional_target)
-        qty = (notional_target / ref_price).quantize(STEP_SIZE, rounding=ROUND_DOWN)
-        notional = qty * ref_price
-
         order = {
             "user_id": self._user_id,
             "signal_bar_time": bar_time,
             "symbol": self._symbol,
             "side": side,
             "intent": "OPEN",
-            "qty": float(qty),
+            "qty": 0.0,
             "ref_price": float(ref_price),
-            "notional_usd": float(notional),
+            "notional_usd": 0.0,
             "execution_mode": self._execution_mode,
             "status": "INTENT_LOGGED",
             "idempotency_key": idempotency_key,
             # Transient: read by the risk guard, stripped before the POST.
             "leverage": int(self._leverage),
         }
+
+        mode = self._sizing_mode
+
+        # Uncertainty never widens: an unusable sizing config sizes nothing.
+        if self._config_invalid:
+            order["status"] = "SKIPPED"
+            order["error"] = "invalid sizing config"
+            log.error("SIZE BLOCKED | invalid sizing config | key=%s", idempotency_key)
+            return order
+
+        if mode == "full_capital":
+            # Load-bearing. Allocation mode tolerates an unknown balance because
+            # HARD_CAP_USD still binds; here nothing would bound the base at all.
+            if self._available_balance is None:
+                order["status"] = "SKIPPED"
+                order["error"] = "available balance unknown"
+                log.error(
+                    "SIZE BLOCKED | available balance unknown | key=%s",
+                    idempotency_key,
+                )
+                return order
+            # base = min(account_size, available_balance * MARGIN_SAFETY_FRACTION),
+            # expressed as a cap on the target so the binding constraint is named.
+            target = self._account_size_usd * self._leverage
+            caps = [
+                (
+                    "available_margin",
+                    self._available_balance
+                    * MARGIN_SAFETY_FRACTION
+                    * self._leverage,
+                )
+            ]
+        else:
+            target = self._capital_usd * self._leverage
+            caps = [
+                ("max_notional_usd", self._max_notional_usd),
+                ("hard_cap", HARD_CAP_USD),
+            ]
+        if self._bracket_notional_cap is not None:
+            caps.append(("bracket_cap", self._bracket_notional_cap))
+
+        notional_target = target
+        bound_by = None
+        for name, cap in caps:
+            if cap < notional_target:
+                notional_target = cap
+                bound_by = name
+        if bound_by is not None:
+            log.info(
+                "SIZE CLAMPED | mode=%s | target=%s -> %s | bound_by=%s",
+                mode,
+                target,
+                notional_target,
+                bound_by,
+            )
+
+        qty = (notional_target / ref_price).quantize(STEP_SIZE, rounding=ROUND_DOWN)
+        notional = qty * ref_price
+        order["qty"] = float(qty)
+        order["notional_usd"] = float(notional)
+
         if notional < MIN_NOTIONAL_USD:
             order["status"] = "SKIPPED"
             order["error"] = "below min notional"
@@ -303,6 +483,8 @@ class SignalConsumer:
             notional / self._leverage
             > self._available_balance * MARGIN_SAFETY_FRACTION
         ):
+            # Redundant by construction in full_capital; kept in both modes as a
+            # second line of defence.
             order["status"] = "SKIPPED"
             order["error"] = "insufficient margin for configured size"
         return order

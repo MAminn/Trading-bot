@@ -141,27 +141,50 @@ def run_testnet(mode: str) -> int:
         """One-time TESTNET_TRADE probe of the symbol's leverage brackets.
 
         The exchange is authoritative: no order may be sized or placed before
-        the ceiling and notional cap are known, so a failure here is retryable
-        rather than ignorable."""
+        the ceiling and the bracket ladder are known, so a failure here is
+        retryable rather than ignorable.
+
+        The FULL ladder is retained. brackets[0] is the highest-leverage tier
+        and therefore carries the SMALLEST notionalCap — correct as the leverage
+        ceiling, but wrong as the notional cap for any lower configured
+        leverage. The applicable tier depends on configured leverage, which
+        changes on config refresh, so the consumer re-selects it there."""
         nonlocal exchange_max_leverage
         try:
             brackets = client.get_leverage_brackets(SYMBOL)
         except (BinanceAPIError, OSError) as exc:
             raise EnforcementError(f"leverage bracket probe failed: {exc}") from exc
-        first = brackets[0]
-        try:
-            max_leverage = int(first["initialLeverage"])
-            notional_cap = Decimal(str(first["notionalCap"]))
-        except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
-            raise EnforcementError(f"unreadable leverage bracket: {first!r}") from exc
-        log.info(
-            "BRACKET | %s | max_leverage=%dx | notional_cap=%s",
-            SYMBOL,
-            max_leverage,
-            notional_cap,
-        )
+        if not brackets:
+            raise EnforcementError(f"no leverage brackets returned for {SYMBOL}")
+
+        ladder: list[dict] = []
+        for entry in brackets:
+            try:
+                ladder.append(
+                    {
+                        "initialLeverage": int(entry["initialLeverage"]),
+                        "notionalCap": Decimal(str(entry["notionalCap"])),
+                    }
+                )
+            except (KeyError, TypeError, ValueError, ArithmeticError) as exc:
+                raise EnforcementError(
+                    f"unreadable leverage bracket: {entry!r}"
+                ) from exc
+
+        # Unchanged: the highest-leverage tier still supplies the ceiling.
+        max_leverage = ladder[0]["initialLeverage"]
+
+        log.info("BRACKET LADDER | %s | tiers=%d", SYMBOL, len(ladder))
+        for i, tier in enumerate(ladder):
+            log.info(
+                "BRACKET | tier=%d | initialLeverage=%dx | notionalCap=%s",
+                i,
+                tier["initialLeverage"],
+                tier["notionalCap"],
+            )
+
         exchange_max_leverage = max_leverage
-        consumer.set_leverage_limits(max_leverage, notional_cap)
+        consumer.set_leverage_limits(max_leverage, ladder)
         if risk_guard is not None:
             risk_guard.update_limits(max_leverage=max_leverage)
 
