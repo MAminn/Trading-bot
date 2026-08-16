@@ -1,10 +1,11 @@
 """Signal consumer: polls the app for pending signals and records order intents.
 
 Binance access is limited to one unsigned, read-only mark-price fetch
-(/fapi/v1/premiumIndex) used for sizing plus the TESTNET_TRADE placement call.
+(/fapi/v1/premiumIndex) used for sizing plus the trade-capable placement call.
 Everything else goes to the app's API (signals/pending, config, ingest/order,
-ingest/order_update). TESTNET_READ stays pure-read; TESTNET_TRADE records
-intents, places allowed MARKET orders, and persists the outcome.
+ingest/order_update). Read modes (TESTNET_READ / LIVE_READ) stay pure-read and
+are refused a trader outright; trade-capable modes (TESTNET_TRADE / LIVE_TRADE)
+record intents, place allowed MARKET orders, and persist the outcome.
 
 The config endpoint response contains decrypted Binance credentials, so the
 raw response is never logged; only the sizing fields are extracted.
@@ -12,6 +13,7 @@ raw response is never logged; only the sizing fields are extracted.
 
 import hashlib
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
@@ -64,7 +66,19 @@ SETTLE_POLL_INTERVAL_SECONDS = 2
 MODE_BINANCE_BASE_URLS = {
     "TESTNET_READ": "https://testnet.binancefuture.com",
     "TESTNET_TRADE": "https://testnet.binancefuture.com",
+    # Mainnet USD-M Futures for both live modes.
+    "LIVE_READ": "https://fapi.binance.com",
+    "LIVE_TRADE": "https://fapi.binance.com",
 }
+
+# Modes that may place orders, and modes that touch real funds. Kept in sync
+# with main.py; asserted against the constructor arguments below.
+TRADE_CAPABLE_MODES = frozenset({"TESTNET_TRADE", "LIVE_TRADE"})
+LIVE_MODES = frozenset({"LIVE_READ", "LIVE_TRADE"})
+
+# full_capital is not permitted on mainnet unless this env var is explicitly
+# set to "1". The first live runs must size through the capped allocation path.
+LIVE_ALLOW_FULL_CAPITAL_ENV = "LIVE_ALLOW_FULL_CAPITAL"
 
 
 class SignalConsumerError(Exception):
@@ -98,11 +112,32 @@ class SignalConsumer:
         start_after: str | None = None,
         risk_guard=None,
         binance_trader=None,
+        live_order_cap_usd=None,
     ):
+        if execution_mode not in MODE_BINANCE_BASE_URLS:
+            raise SignalConsumerError(
+                f"unsupported execution_mode {execution_mode!r} "
+                f"(known: {', '.join(sorted(MODE_BINANCE_BASE_URLS))})"
+            )
+        # A read mode holding a trader would be a placement path in a mode that
+        # must not have one. Refuse to construct rather than trust the caller.
+        if execution_mode not in TRADE_CAPABLE_MODES and binance_trader is not None:
+            raise SignalConsumerError(
+                f"{execution_mode} is read-only and must not be given a "
+                "binance_trader"
+            )
         self._base = app_api_base.rstrip("/")
         self._user_id = user_id
         self._execution_mode = execution_mode
         self._symbol = symbol
+        self._is_live = execution_mode in LIVE_MODES
+        self._live_order_cap_usd = (
+            None if live_order_cap_usd is None else Decimal(str(live_order_cap_usd))
+        )
+        # Read once at construction: a mid-run env change must not widen sizing.
+        self._live_allow_full_capital = (
+            os.environ.get(LIVE_ALLOW_FULL_CAPITAL_ENV, "").strip() == "1"
+        )
         # Optional RiskGuard (trade-capable modes only); None keeps read modes pure.
         self._risk_guard = risk_guard
         # Authenticated client for order placement; supplied ONLY in TESTNET_TRADE.
@@ -220,6 +255,22 @@ class SignalConsumer:
                 log.error(
                     "unreadable account_size_usd=%r — OPENs blocked", raw_account_size
                 )
+
+        # On mainnet, full_capital is opt-in via env and off by default. The
+        # config alone can never move a live executor onto the uncapped sizing
+        # path — someone with server access has to set the flag as well.
+        if (
+            self._is_live
+            and self._sizing_mode == "full_capital"
+            and not self._live_allow_full_capital
+        ):
+            self._config_invalid = True
+            log.error(
+                "sizing_mode=full_capital is not permitted in %s without %s=1 "
+                "— OPENs blocked",
+                self._execution_mode,
+                LIVE_ALLOW_FULL_CAPITAL_ENV,
+            )
 
         # full_capital sizes directly off account_size_usd, so a missing or
         # non-positive value leaves the sizing base undefined. Fail closed.
@@ -455,6 +506,10 @@ class SignalConsumer:
             ]
         if self._bracket_notional_cap is not None:
             caps.append(("bracket_cap", self._bracket_notional_cap))
+        # Appended last and outside the mode branch: the live cap binds in
+        # allocation and full_capital alike, and no config value can lift it.
+        if self._live_order_cap_usd is not None:
+            caps.append(("live_order_cap", self._live_order_cap_usd))
 
         notional_target = target
         bound_by = None
@@ -519,7 +574,7 @@ class SignalConsumer:
         }
 
     # ------------------------------------------------------------------ #
-    # order placement (TESTNET_TRADE only)
+    # order placement (trade-capable modes only)
     # ------------------------------------------------------------------ #
 
     def _place_order(self, order: dict):
@@ -725,6 +780,124 @@ class SignalConsumer:
             # poll_once is the last step of a cycle: close it so the next
             # ensure_config() counts again, whether or not this one raised.
             self._cycle_counted = False
+
+    # ------------------------------------------------------------------ #
+    # smoke test: one synthetic OPEN + CLOSE, used to prove a live path
+    # ------------------------------------------------------------------ #
+
+    def run_smoke_test(self, side: str, position_amt) -> int:
+        """Place one synthetic OPEN, wait for it to settle, then CLOSE it.
+
+        Returns a process exit code: 0 only if the position finished flat.
+
+        No pending signal is fetched and the cursor is never moved, so this
+        neither consumes nor skips any natural ML signal. The intents are built
+        by the same _build_intent / _build_close_intent and evaluated by the
+        same risk guard as a real signal — the only synthetic part is the
+        trigger. The OPEN is therefore subject to the live cap, the bracket
+        cap, the min-notional floor and the margin check exactly as usual.
+        """
+        if self._binance_trader is None:
+            log.error("SMOKE ABORTED | no trader in %s", self._execution_mode)
+            return 1
+
+        try:
+            starting_amt = float(position_amt or 0)
+        except (TypeError, ValueError):
+            log.error("SMOKE ABORTED | unreadable starting position %r", position_amt)
+            return 1
+        if starting_amt != 0:
+            log.error(
+                "SMOKE ABORTED | position is not flat (amt=%s) — the smoke test "
+                "only ever runs from flat",
+                starting_amt,
+            )
+            return 1
+
+        # Config must be loaded before sizing; main.py has already refreshed it
+        # this cycle, but the smoke path must not depend on that ordering.
+        self.ensure_config()
+        try:
+            ref_price = Decimal(str(self._binance.get_mark_price(self._symbol)))
+        except (BinanceAPIError, OSError) as exc:
+            log.error("SMOKE ABORTED | mark price unavailable: %s", exc)
+            return 1
+
+        bar_time = datetime.now(timezone.utc)
+        signal = {
+            "bar_time": bar_time,
+            "rule_side": 1 if side == "LONG" else -1,
+            "position_before": side,
+        }
+
+        log.warning(
+            "SMOKE OPEN | %s %s | ref_price=%s | placing a real order",
+            self._symbol,
+            side,
+            ref_price,
+        )
+        open_order = self._build_intent(signal, ref_price)
+        try:
+            settled = self._process_intent(open_order, starting_amt)
+        except SignalConsumerError as exc:
+            # _settle_open raises when the OPEN does not show up as a position
+            # within the settle window. The order was already sent, so the true
+            # state is unknown — never guess and never auto-close on a state we
+            # could not read. Stop and hand it to a human.
+            log.error(
+                "SMOKE HALTED | OPEN was sent but did not settle: %s | STATE "
+                "UNKNOWN — check ETHUSDT on Binance now and close it manually "
+                "if a position is open",
+                exc,
+            )
+            return 1
+
+        if open_order["status"] != "INTENT_LOGGED":
+            log.error(
+                "SMOKE HALTED | OPEN was not placed | status=%s | reason=%s | "
+                "nothing to close, no position was taken",
+                open_order["status"],
+                open_order.get("error"),
+            )
+            return 1
+
+        try:
+            settled_amt = float(settled or 0)
+        except (TypeError, ValueError):
+            settled_amt = 0.0
+        if settled_amt == 0:
+            log.error(
+                "SMOKE HALTED | OPEN sent but position still reads flat — "
+                "CHECK BINANCE MANUALLY before rerunning; a fill may be pending"
+            )
+            return 1
+
+        log.warning("SMOKE OPEN FILLED | pos=%s | closing immediately", settled_amt)
+
+        close_order = self._build_close_intent(signal, ref_price, settled_amt)
+        if close_order is None:
+            log.error(
+                "SMOKE HALTED | could not build CLOSE for side=%r | POSITION IS "
+                "OPEN — close it manually on Binance now",
+                side,
+            )
+            return 1
+        final_amt = self._process_intent(close_order, settled_amt)
+
+        try:
+            final = float(final_amt or 0)
+        except (TypeError, ValueError):
+            final = None
+        if final != 0:
+            log.error(
+                "SMOKE FAILED | position did not go flat (amt=%s) — CLOSE IT "
+                "MANUALLY ON BINANCE NOW",
+                final_amt,
+            )
+            return 1
+
+        log.warning("SMOKE PASSED | %s OPEN and CLOSE completed | position flat", side)
+        return 0
 
     def _poll_signals(
         self,

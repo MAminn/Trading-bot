@@ -21,13 +21,18 @@ class RiskGuard:
     # margin and the exchange bracket cap are the bounds instead.
     ABSOLUTE_MAX_NOTIONAL_USD = 500
 
-    def __init__(self, max_notional_usd=100, max_leverage=1):
+    def __init__(self, max_notional_usd=100, max_leverage=1, live_cap_usd=None):
         # Conservative defaults so the guard is safe before the bracket probe
         # and the first config refresh have supplied real limits.
         self._max_notional_usd = max_notional_usd
         self._max_leverage = max_leverage
         # Fail closed to the capped mode until a refresh says otherwise.
         self._sizing_mode = "allocation"
+        # LIVE_TRADE only: an absolute per-order notional ceiling from the
+        # environment. Unlike _max_notional_usd it is NOT config-driven, cannot
+        # be raised by a config refresh, and applies in EVERY sizing mode —
+        # including full_capital, which has no internal ceiling of its own.
+        self._live_cap_usd = None if live_cap_usd is None else float(live_cap_usd)
 
     def update_limits(self, *, max_notional_usd=None, max_leverage=None) -> None:
         """Update only the limits supplied. main.py sets max_leverage after the
@@ -91,6 +96,14 @@ class RiskGuard:
             notional = float(intended_order.get("notional_usd") or 0)
         except (TypeError, ValueError):
             notional = 0.0
+        # The live cap is checked before, and independently of, the sizing-mode
+        # rules — it binds in full_capital too, where no other notional ceiling
+        # applies. Checked first so its rejection reason is the one reported.
+        if self._live_cap_usd is not None and notional > self._live_cap_usd:
+            return (
+                False,
+                f"notional {notional} exceeds live cap {self._live_cap_usd}",
+            )
         # full_capital deliberately has no internal notional ceiling: it is
         # bounded by available margin and the exchange bracket cap instead.
         # Every other check below applies identically in both modes.

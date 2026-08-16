@@ -232,3 +232,46 @@ class BinanceFuturesClient:
         if reduce_only:
             params["reduceOnly"] = "true"
         return self._request("POST", "/fapi/v1/order", params, signed=True)
+
+
+# Every read method a read-only mode legitimately needs. Anything absent from
+# this tuple is unreachable through the facade below.
+READ_ONLY_METHODS = (
+    "sync_clock",
+    "get_server_time",
+    "get_exchange_info",
+    "get_mark_price",
+    "get_account",
+    "get_positions",
+    "get_leverage_brackets",
+)
+
+
+class ReadOnlyFuturesClient:
+    """Read-only facade over BinanceFuturesClient for LIVE_READ / TESTNET_READ.
+
+    Placement is prevented structurally, not by a flag. This class COMPOSES the
+    real client rather than subclassing it and forwards only the methods in
+    READ_ONLY_METHODS. `set_leverage`, `set_margin_type` and `place_market_order`
+    are not defined here and are not forwarded, so touching one raises
+    AttributeError at the call site — there is no branch to misconfigure, and no
+    conditional that a future edit could invert.
+    """
+
+    def __init__(self, base_url: str, api_key: str, api_secret: str):
+        self._inner = BinanceFuturesClient(base_url, api_key, api_secret)
+        for name in READ_ONLY_METHODS:
+            setattr(self, name, getattr(self._inner, name))
+
+    @property
+    def clock_offset_ms(self) -> int:
+        return self._inner.clock_offset_ms
+
+    def __getattr__(self, name: str):
+        # Reached only for attributes not set in __init__ — i.e. every write
+        # method. Fail loudly and specifically rather than with a bare
+        # AttributeError, so the log names the violated invariant.
+        raise AttributeError(
+            f"{name!r} is not available in a read-only execution mode: this "
+            f"client exposes reads only ({', '.join(READ_ONLY_METHODS)})"
+        )
