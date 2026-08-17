@@ -242,6 +242,11 @@ export function useEngineRealtime() {
       .on("postgres_changes", { event: "*", schema: "public", table: "engine_config" }, () =>
         qc.invalidateQueries({ queryKey: ["engine", "config"] }),
       )
+      // Key literal rather than an import from ./executor, which imports this
+      // module — one direction only.
+      .on("postgres_changes", { event: "*", schema: "public", table: "executor_status" }, () =>
+        qc.invalidateQueries({ queryKey: ["executor", "status"] }),
+      )
       .on(
         "postgres_changes",
         { event: "INSERT", schema: "public", table: "user_signals" },

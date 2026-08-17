@@ -37,6 +37,9 @@ import {
   type SignalRow,
   type SignalStatus,
 } from "@/lib/engine";
+import {
+  useExecutorStatus, executionModeLabel, executorFresh, executorTone, canPlaceOrders,
+} from "@/lib/executor";
 import { useLivePrice } from "@/lib/live-price";
 import { toast } from "sonner";
 
@@ -48,6 +51,7 @@ export const Route = createFileRoute("/app/dashboard")({
 function Dashboard() {
   const status = useEngineStatus();
   const config = useEngineConfig();
+  const executor = useExecutorStatus();
   const signals = useSignals(50);
   const actionable = useLatestActionableSignal();
   const trades = useTrades(500);
@@ -60,6 +64,12 @@ function Dashboard() {
   const [timelineId, setTimelineId] = useState<string | null>(null);
 
   const state = liveState(status.data, !!config.data?.is_running);
+  // Executor truth for the header. Falls back to the app-side signal mode only
+  // when no executor has ever reported.
+  const execLabel = executionModeLabel(executor.data, config.data?.mode);
+  const execTone = executorTone(executor.data);
+  const execFresh = executorFresh(executor.data);
+  const execCanTrade = canPlaceOrders(executor.data?.effective_mode);
   const capital = Number(config.data?.capital_usd ?? 10000);
   const metrics = computeMetrics(trades.data ?? [], capital);
   const equity = capital + metrics.netPnl;
@@ -142,17 +152,34 @@ function Dashboard() {
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <div className="text-xs uppercase tracking-[0.2em] text-primary">Live cockpit</div>
+          {/* The mode shown here is the EXECUTOR's, whenever one has reported.
+              config.mode describes app-side signal handling and says nothing
+              about whether real orders are being placed — rendering it as
+              "Signals only" beside a LIVE_TRADE executor is the exact
+              misstatement this replaces. */}
           <h1 className="mt-2 font-display text-3xl font-semibold">
-            ETHUSDT · {config.data?.mode === "auto" ? "Auto" : "Signals only"}
+            ETHUSDT ·{" "}
+            <span className={execTone === "live" ? "text-destructive" : execTone === "warn" ? "text-warning" : ""}>
+              {execLabel}
+            </span>
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
             Engine <span className="font-mono text-foreground">{state.toUpperCase()}</span> ·
             heartbeat{" "}
             <span className="font-mono text-foreground">{fmtAgo(status.data?.last_heartbeat)}</span>{" "}
-            · position{" "}
+            · strategy position{" "}
             <span className="font-mono text-foreground">
               {status.data?.current_position ?? "FLAT"}
             </span>
+            {executor.data && (
+              <>
+                {" "}
+                · Binance position{" "}
+                <span className="font-mono text-foreground">
+                  {executor.data.position_side ?? "—"}
+                </span>
+              </>
+            )}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -177,6 +204,39 @@ function Dashboard() {
         </div>
       </div>
 
+      {execCanTrade && (
+        <div className="flex items-start gap-3 rounded-lg border border-destructive/40 bg-destructive/10 p-4 text-sm">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+          <div>
+            <div className="font-medium text-destructive">
+              {executor.data?.effective_mode === "LIVE_TRADE"
+                ? "Executor is placing REAL orders on Binance mainnet"
+                : "Executor is placing orders on the Binance testnet"}
+            </div>
+            <p className="mt-0.5 text-muted-foreground">
+              Accepted signals are executed by the executor process, not merely
+              recorded.{" "}
+              <Link to="/app/engine" className="text-primary hover:underline">
+                View executor state →
+              </Link>
+            </p>
+          </div>
+        </div>
+      )}
+      {executor.data && !execFresh && (
+        <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/10 p-4 text-sm">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+          <div>
+            <div className="font-medium text-warning">Executor heartbeat is stale</div>
+            <p className="mt-0.5 text-muted-foreground">
+              Last report {fmtAgo(executor.data.last_heartbeat)}, mode{" "}
+              <span className="font-mono">{executor.data.effective_mode}</span>. Its
+              current state is unknown — verify on the executor host before
+              assuming it has stopped.
+            </p>
+          </div>
+        </div>
+      )}
       {state === "stale" && (
         <div className="flex items-start gap-3 rounded-lg border border-warning/30 bg-warning/10 p-4 text-sm">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />

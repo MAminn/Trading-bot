@@ -194,6 +194,78 @@ export type Database = {
         }
         Relationships: []
       }
+      executor_status: {
+        Row: {
+          available_balance_usd: number | null
+          created_at: string
+          effective_mode: string
+          entry_price: number | null
+          env_mode_ceiling: string | null
+          id: string
+          keys_present: boolean | null
+          last_heartbeat: string | null
+          last_reconcile_at: string | null
+          margin_type: string | null
+          message: string | null
+          permission_status: string | null
+          position_amt: number | null
+          position_leverage: number | null
+          position_side: string | null
+          reconcile_actual: number | null
+          reconcile_expected: number | null
+          reconcile_match: boolean | null
+          updated_at: string
+          user_id: string
+          wallet_balance_usd: number | null
+        }
+        Insert: {
+          available_balance_usd?: number | null
+          created_at?: string
+          effective_mode: string
+          entry_price?: number | null
+          env_mode_ceiling?: string | null
+          id?: string
+          keys_present?: boolean | null
+          last_heartbeat?: string | null
+          last_reconcile_at?: string | null
+          margin_type?: string | null
+          message?: string | null
+          permission_status?: string | null
+          position_amt?: number | null
+          position_leverage?: number | null
+          position_side?: string | null
+          reconcile_actual?: number | null
+          reconcile_expected?: number | null
+          reconcile_match?: boolean | null
+          updated_at?: string
+          user_id: string
+          wallet_balance_usd?: number | null
+        }
+        Update: {
+          available_balance_usd?: number | null
+          created_at?: string
+          effective_mode?: string
+          entry_price?: number | null
+          env_mode_ceiling?: string | null
+          id?: string
+          keys_present?: boolean | null
+          last_heartbeat?: string | null
+          last_reconcile_at?: string | null
+          margin_type?: string | null
+          message?: string | null
+          permission_status?: string | null
+          position_amt?: number | null
+          position_leverage?: number | null
+          position_side?: string | null
+          reconcile_actual?: number | null
+          reconcile_expected?: number | null
+          reconcile_match?: boolean | null
+          updated_at?: string
+          user_id?: string
+          wallet_balance_usd?: number | null
+        }
+        Relationships: []
+      }
       model_versions: {
         Row: {
           created_at: string

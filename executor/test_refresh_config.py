@@ -138,6 +138,22 @@ def test_guard_gets_allocation_when_mode_is_invalid():
     assert guard._sizing_mode == "allocation"
 
 
+def test_refreshes_from_the_payload_that_carries_no_key_material():
+    """Phase 0 removed the decrypted `binance` block from the config endpoint;
+    it now returns presence metadata instead. The consumer never read the
+    credentials — lock that in so the endpoint can never be "fixed" back."""
+    c, _ = make_consumer(None)
+    c._get = lambda path, params: {
+        "config": dict(BASE_CONFIG),
+        "keys_present": True,
+        "api_key_last4": "ab12",
+    }
+    c._refresh_config()
+    assert c._config_invalid is False
+    assert c._leverage == Decimal("30")
+    assert c._sizing_mode == "allocation"
+
+
 def test_config_response_body_is_never_logged(caplog):
     """The config payload carries decrypted Binance credentials."""
     cfg = dict(BASE_CONFIG, binance_api_key="SECRETKEY", binance_api_secret="SECRETSEC")

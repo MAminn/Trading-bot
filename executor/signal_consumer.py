@@ -144,6 +144,9 @@ class SignalConsumer:
         # None in TESTNET_READ/OFF keeps those paths free of any write calls.
         self._binance_trader = binance_trader
         self._last_order_time: float | None = None
+        # Last successful reconcile, for telemetry only. Never read by any
+        # decision path; a stale or absent value cannot affect placement.
+        self.last_reconcile: dict | None = None
         # created_at of last processed signal; optionally seeded via CONSUMER_START_AFTER.
         # Always stored in canonical Z-form — the pending route rejects +00:00 offsets.
         self._cursor: str | None = to_z_iso(start_after) if start_after else None
@@ -727,6 +730,15 @@ class SignalConsumer:
             position_amt,
             state["is_running"],
         )
+
+        # Record for telemetry. Set only on a successful reconcile, so the
+        # timestamp always describes the reading it is attached to.
+        self.last_reconcile = {
+            "expected": state["expected"],
+            "match": state["match"],
+            "actual": position_amt,
+            "at": to_z_iso(datetime.now(timezone.utc)),
+        }
 
         if not trade_capable:
             # Read-only reconciliation is purely informational.

@@ -92,15 +92,49 @@ class FatalConfigError(Exception):
     """Account config could not be verified — refuse to run trade-capable."""
 
 
+def build_reporter():
+    """Telemetry reporter, or None when the app API is not configured.
+
+    Telemetry is optional in every mode: an executor with no APP_API_BASE runs
+    exactly as it always has, silently."""
+    app_api_base = os.environ.get("APP_API_BASE", "").strip()
+    engine_service_token = os.environ.get("ENGINE_SERVICE_TOKEN", "").strip()
+    engine_user_id = os.environ.get("ENGINE_USER_ID", "").strip()
+    if not app_api_base or not engine_service_token or not engine_user_id:
+        return None
+    from executor_status import StatusReporter
+
+    return StatusReporter(app_api_base, engine_service_token, engine_user_id)
+
+
 def run_off() -> int:
     log.info("=" * 60)
     log.info("executor starting | mode=OFF")
     log.info("no Binance connectivity, no trading logic")
     log.info("=" * 60)
 
+    # OFF deliberately reports no credential state: which key set would even be
+    # meant is undefined here, and a keys_present of either value would mislead.
+    reporter = build_reporter()
+
     while True:
         now = datetime.now(timezone.utc).isoformat()
         log.info("executor alive | mode=OFF | %s", now)
+        if reporter is not None:
+            from executor_status import build_snapshot
+
+            reporter.report(
+                build_snapshot(
+                    mode="OFF",
+                    env_mode_ceiling="OFF",
+                    account=None,
+                    positions=None,
+                    reconcile=None,
+                    keys_present=None,
+                    permission_status=None,
+                    message="executor idle (mode=OFF)",
+                )
+            )
         time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
@@ -195,6 +229,7 @@ def run_executor(mode: str) -> int:
         RateLimitError,
         ReadOnlyFuturesClient,
     )
+    from executor_status import build_snapshot, permission_status_for_error
     from signal_consumer import SignalConsumer, SignalConsumerError
 
     trade_capable = mode in TRADE_CAPABLE_MODES
@@ -289,6 +324,30 @@ def run_executor(mode: str) -> int:
         binance_trader=client if trade_capable else None,
         live_order_cap_usd=live_order_cap_usd,
     )
+
+    # Telemetry only. The env vars it needs were validated above, so this is
+    # non-None here in every non-OFF mode.
+    reporter = build_reporter()
+
+    def report(account=None, positions=None, message=None, permission=None):
+        """Send one telemetry snapshot. Contains its own failures — a telemetry
+        problem must never disturb a trading cycle."""
+        if reporter is None:
+            return
+        reporter.report(
+            build_snapshot(
+                mode=mode,
+                # Today the env IS the mode; the two diverge only once the DB is
+                # allowed to narrow it, which this phase does not do.
+                env_mode_ceiling=mode,
+                account=account,
+                positions=positions,
+                reconcile=consumer.last_reconcile,
+                keys_present=True,
+                permission_status=permission,
+                message=message,
+            )
+        )
 
     # Exchange-authoritative ceiling, filled by the one-time bracket probe.
     exchange_max_leverage: int | None = None
@@ -541,6 +600,21 @@ def run_executor(mode: str) -> int:
             if block_reason is None:
                 block_reason = "leverage_config_mismatch"
 
+        # Report once per cycle, here: reconcile has just run, and every branch
+        # below (smoke, blocked, normal) is reached through this point, so a
+        # heartbeat is sent whatever happens next. The account/position snapshot
+        # is the cycle-start read — a fill placed later this cycle shows up on
+        # the next one. get_account() above is a signed call, so reaching this
+        # line is itself the proof that the credential works.
+        report(
+            account=account,
+            positions=positions,
+            permission="verified_futures",
+            message=(
+                f"opens blocked: {block_reason}" if opens_blocked else "cycle ok"
+            ),
+        )
+
         if smoke_test:
             # The smoke test replaces signal processing for this run: no pending
             # ML signal is fetched, sized, or placed. It runs only after the
@@ -574,7 +648,8 @@ def run_executor(mode: str) -> int:
                 return exit_code
             first_success = True
             consecutive_failures = 0
-        except FatalConfigError:
+        except FatalConfigError as exc:
+            report(message=f"halted: {exc}", permission=permission_status_for_error(exc))
             return 1
         except RateLimitError as exc:
             if smoke_started:
@@ -586,6 +661,7 @@ def run_executor(mode: str) -> int:
                 return 1
             backoff = max(exc.retry_after, 60)
             log.error("RATE LIMITED | backing off %ds", backoff)
+            report(message=f"rate limited, backing off {backoff}s")
             time.sleep(backoff)
             continue
         except (BinanceAPIError, SignalConsumerError, EnforcementError, OSError) as exc:
@@ -602,6 +678,15 @@ def run_executor(mode: str) -> int:
                 consecutive_failures,
                 MAX_CONSECUTIVE_FAILURES,
                 exc,
+            )
+            # A failed cycle clears balances and positions back to null rather
+            # than leaving the last good reading in place: those numbers are
+            # stale by definition here, and the dashboard must never present a
+            # stale reading as a current one.
+            report(
+                message=f"cycle failed ({consecutive_failures}/"
+                f"{MAX_CONSECUTIVE_FAILURES}): {exc}",
+                permission=permission_status_for_error(exc),
             )
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 log.error("10 consecutive failed cycles — exiting")

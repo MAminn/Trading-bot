@@ -1,11 +1,17 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
-import { Play, Square, Activity, Copy, Check, AlertTriangle, Cpu, FlaskConical } from "lucide-react";
+import {
+  Play, Square, Activity, Copy, Check, AlertTriangle, Cpu, FlaskConical, Radio, ShieldAlert,
+} from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useQuery } from "@tanstack/react-query";
 import {
   useEngineStatus, useEngineConfig, useSetRunning, useUpdateConfig, liveState, fmtAgo, fmtUSD,
 } from "@/lib/engine";
+import {
+  useExecutorStatus, executorFresh, executorTone, canPlaceOrders, isLiveMode,
+  MODE_LABEL, PERMISSION_LABEL, type ExecutorStatusRow,
+} from "@/lib/executor";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "sonner";
 
@@ -28,6 +34,7 @@ function useUserId() {
 function EnginePage() {
   const status = useEngineStatus();
   const config = useEngineConfig();
+  const executor = useExecutorStatus();
   const setRunning = useSetRunning();
   const updateConfig = useUpdateConfig();
   const { data: userId } = useUserId();
@@ -89,16 +96,24 @@ function EnginePage() {
         </button>
       </div>
 
-      {/* Status detail */}
+      {/* Executor: the real Binance-facing process */}
+      <ExecutorCard row={executor.data} loading={executor.isLoading} />
+
+      {/* ML signal worker status — the strategy's own view, NOT the exchange's */}
       <div className="card-elevated p-6">
         <div className="flex items-center gap-2 text-sm font-medium">
-          <Activity className="h-4 w-4 text-primary" /> Engine status
+          <Activity className="h-4 w-4 text-primary" /> ML signal worker
         </div>
+        <p className="mt-2 max-w-2xl text-xs text-muted-foreground">
+          The strategy process that produces signals. Its position is the
+          strategy's own bookkeeping — the exchange's real position is in the
+          executor card above.
+        </p>
         <div className="mt-5 grid gap-4 md:grid-cols-2">
           <KV k="State" v={state.toUpperCase()} tone={state === "running" ? "success" : state === "error" ? "destructive" : state === "stale" ? "warn" : undefined} />
           <KV k="Worker says" v={status.data?.status ?? "—"} />
           <KV k="Last heartbeat" v={fmtAgo(status.data?.last_heartbeat)} />
-          <KV k="Current position" v={status.data?.current_position ?? "FLAT"} />
+          <KV k="Strategy position" v={status.data?.current_position ?? "FLAT"} />
           <KV k="Is running flag" v={isRunning ? "TRUE" : "FALSE"} tone={isRunning ? "success" : undefined} />
           <KV k="Last message" v={status.data?.message ?? "—"} />
         </div>
@@ -138,9 +153,19 @@ function EnginePage() {
         <div className="flex items-center gap-2 text-sm font-medium">
           <Cpu className="h-4 w-4 text-primary" /> Active configuration
         </div>
+        {isLiveMode(executor.data?.effective_mode) && (
+          <p className="mt-2 max-w-2xl text-xs text-muted-foreground">
+            These are sizing inputs only. What the executor is permitted to do
+            is set in its own environment on the VPS and is shown in the
+            executor card above — not by the signal mode below.
+          </p>
+        )}
         {config.data ? (
           <div className="mt-5 grid gap-4 md:grid-cols-3">
-            <KV k="Mode" v={config.data.mode} />
+            {/* Labelled as the app-side signal mode: it does NOT gate live
+                execution, and reading it as "signal only" while the executor
+                runs LIVE_TRADE is exactly the confusion to avoid. */}
+            <KV k="Signal mode (app)" v={config.data.mode} />
             <KV k="Strategy capital" v={fmtUSD(Number(config.data.capital_usd))} />
             <KV
               k="Allocation"
@@ -181,6 +206,148 @@ function EnginePage() {
           environment. The token is never returned to the browser.
         </p>
       </div>
+    </div>
+  );
+}
+
+function ExecutorCard({ row, loading }: { row: ExecutorStatusRow | null | undefined; loading: boolean }) {
+  const fresh = executorFresh(row);
+  const tone = executorTone(row);
+  const ring =
+    tone === "live" ? "ring-1 ring-destructive/50" : tone === "warn" ? "ring-1 ring-warning/40" : "";
+
+  if (loading) {
+    return (
+      <div className="card-elevated p-6">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Radio className="h-4 w-4 text-primary" /> Executor (Binance)
+        </div>
+        <div className="mt-4 text-sm text-muted-foreground">Loading…</div>
+      </div>
+    );
+  }
+
+  // No row at all: either the executor has never reported, or this app is
+  // running ahead of the migration. Say so plainly rather than implying the
+  // executor is idle — an unreported executor may well be trading.
+  if (!row) {
+    return (
+      <div className="card-elevated p-6">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Radio className="h-4 w-4 text-muted-foreground" /> Executor (Binance)
+        </div>
+        <div className="mt-4 flex items-start gap-3 rounded-lg border border-border bg-card/40 p-4 text-sm">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+          <div>
+            <div className="font-medium">No executor telemetry</div>
+            <p className="mt-0.5 text-muted-foreground">
+              The executor has not reported yet. This does <strong>not</strong>{" "}
+              mean it is stopped — check the executor host directly before
+              assuming anything about live execution.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const modeLabel = MODE_LABEL[row.effective_mode] ?? row.effective_mode;
+  const modeColor =
+    tone === "live" ? "text-destructive" : tone === "warn" ? "text-warning" : "text-muted-foreground";
+  const num = (n: number | null, digits = 3) => (n === null ? "—" : n.toFixed(digits));
+
+  return (
+    <div className={`card-elevated p-6 ${ring}`}>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <Radio className={`h-4 w-4 ${modeColor}`} /> Executor (Binance)
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`rounded-full border px-3 py-1 font-mono text-xs font-semibold ${
+            tone === "live"
+              ? "border-destructive/50 bg-destructive/10 text-destructive"
+              : tone === "warn"
+                ? "border-warning/50 bg-warning/10 text-warning"
+                : "border-border bg-card/60 text-muted-foreground"
+          }`}>
+            {modeLabel}
+          </span>
+          {!fresh && (
+            <span className="rounded-full border border-warning/50 bg-warning/10 px-3 py-1 text-xs font-medium text-warning">
+              STALE · {fmtAgo(row.last_heartbeat)}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {canPlaceOrders(row.effective_mode) && (
+        <div className="mt-4 flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+          <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            <strong>This executor can place orders.</strong>{" "}
+            {row.effective_mode === "LIVE_TRADE"
+              ? "Mode is LIVE_TRADE against Binance mainnet — orders use real funds."
+              : "Mode is TESTNET_TRADE — orders are placed on the Binance testnet."}
+          </span>
+        </div>
+      )}
+
+      {!fresh && (
+        <div className="mt-4 flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-3 text-xs text-warning">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            No executor heartbeat for {fmtAgo(row.last_heartbeat)}. The values
+            below are the last known snapshot and may no longer be true —
+            including the mode.
+          </span>
+        </div>
+      )}
+
+      <div className="mt-5 grid gap-4 md:grid-cols-2">
+        <KV k="Execution mode" v={row.effective_mode} tone={tone === "live" ? "destructive" : tone === "warn" ? "warn" : undefined} />
+        <KV k="Env ceiling" v={row.env_mode_ceiling ?? "—"} />
+        <KV k="Wallet balance" v={row.wallet_balance_usd === null ? "—" : fmtUSD(row.wallet_balance_usd)} />
+        <KV k="Available balance" v={row.available_balance_usd === null ? "—" : fmtUSD(row.available_balance_usd)} />
+        <KV k="Binance position" v={row.position_side ?? "—"} tone={row.position_side && row.position_side !== "FLAT" ? "warn" : undefined} />
+        <KV k="Position size" v={num(row.position_amt)} />
+        <KV k="Entry price" v={row.entry_price === null || row.entry_price === 0 ? "—" : fmtUSD(row.entry_price)} />
+        <KV k="Position leverage" v={row.position_leverage === null ? "—" : `${row.position_leverage}×`} />
+        <KV k="Margin type" v={row.margin_type ? row.margin_type.toUpperCase() : "—"} />
+        <KV k="Keys present" v={row.keys_present === null ? "—" : row.keys_present ? "YES" : "NO"} tone={row.keys_present === false ? "destructive" : undefined} />
+        <KV
+          k="Key permissions"
+          v={row.permission_status ? PERMISSION_LABEL[row.permission_status] : "—"}
+          tone={row.permission_status === "failed" ? "destructive" : row.permission_status === "unknown" ? "warn" : undefined}
+        />
+        <KV k="Last heartbeat" v={fmtAgo(row.last_heartbeat)} tone={fresh ? "success" : "warn"} />
+      </div>
+
+      <div className="mt-6">
+        <div className="text-xs uppercase tracking-wider text-muted-foreground">Last reconcile</div>
+        <div className="mt-3 grid gap-4 md:grid-cols-2">
+          <KV
+            k="Match"
+            v={row.reconcile_match === null ? "—" : row.reconcile_match ? "MATCH" : "MISMATCH"}
+            tone={row.reconcile_match === null ? undefined : row.reconcile_match ? "success" : "destructive"}
+          />
+          <KV k="When" v={fmtAgo(row.last_reconcile_at)} />
+          <KV k="Expected" v={num(row.reconcile_expected)} />
+          <KV k="Actual" v={num(row.reconcile_actual)} />
+        </div>
+        {row.reconcile_match === false && (
+          <p className="mt-3 text-xs text-destructive">
+            The app's expected position disagrees with Binance. The executor
+            blocks new OPENs while this is true; CLOSEs remain allowed.
+          </p>
+        )}
+      </div>
+
+      {row.message && (
+        <div className="mt-5 rounded-lg border border-border bg-card/40 px-4 py-3">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Executor says</div>
+          <div className="mt-1 wrap-break-word font-mono text-xs">{row.message}</div>
+        </div>
+      )}
     </div>
   );
 }

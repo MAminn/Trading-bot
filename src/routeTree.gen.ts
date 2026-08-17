@@ -32,6 +32,7 @@ import { Route as ApiPublicEngineIngestSignalRouteImport } from './routes/api/pu
 import { Route as ApiPublicEngineIngestOrder_updateRouteImport } from './routes/api/public/engine/ingest.order_update'
 import { Route as ApiPublicEngineIngestOrderRouteImport } from './routes/api/public/engine/ingest.order'
 import { Route as ApiPublicEngineIngestOpen_positionsRouteImport } from './routes/api/public/engine/ingest.open_positions'
+import { Route as ApiPublicEngineIngestExecutor_statusRouteImport } from './routes/api/public/engine/ingest.executor_status'
 
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
@@ -156,6 +157,12 @@ const ApiPublicEngineIngestOpen_positionsRoute =
     path: '/api/public/engine/ingest/open_positions',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ApiPublicEngineIngestExecutor_statusRoute =
+  ApiPublicEngineIngestExecutor_statusRouteImport.update({
+    id: '/api/public/engine/ingest/executor_status',
+    path: '/api/public/engine/ingest/executor_status',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -174,6 +181,7 @@ export interface FileRoutesByFullPath {
   '/api/public/engine/demo-tick': typeof ApiPublicEngineDemoTickRoute
   '/api/public/engine/eth-price': typeof ApiPublicEngineEthPriceRoute
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
+  '/api/public/engine/ingest/executor_status': typeof ApiPublicEngineIngestExecutor_statusRoute
   '/api/public/engine/ingest/open_positions': typeof ApiPublicEngineIngestOpen_positionsRoute
   '/api/public/engine/ingest/order': typeof ApiPublicEngineIngestOrderRoute
   '/api/public/engine/ingest/order_update': typeof ApiPublicEngineIngestOrder_updateRoute
@@ -198,6 +206,7 @@ export interface FileRoutesByTo {
   '/api/public/engine/demo-tick': typeof ApiPublicEngineDemoTickRoute
   '/api/public/engine/eth-price': typeof ApiPublicEngineEthPriceRoute
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
+  '/api/public/engine/ingest/executor_status': typeof ApiPublicEngineIngestExecutor_statusRoute
   '/api/public/engine/ingest/open_positions': typeof ApiPublicEngineIngestOpen_positionsRoute
   '/api/public/engine/ingest/order': typeof ApiPublicEngineIngestOrderRoute
   '/api/public/engine/ingest/order_update': typeof ApiPublicEngineIngestOrder_updateRoute
@@ -224,6 +233,7 @@ export interface FileRoutesById {
   '/api/public/engine/demo-tick': typeof ApiPublicEngineDemoTickRoute
   '/api/public/engine/eth-price': typeof ApiPublicEngineEthPriceRoute
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
+  '/api/public/engine/ingest/executor_status': typeof ApiPublicEngineIngestExecutor_statusRoute
   '/api/public/engine/ingest/open_positions': typeof ApiPublicEngineIngestOpen_positionsRoute
   '/api/public/engine/ingest/order': typeof ApiPublicEngineIngestOrderRoute
   '/api/public/engine/ingest/order_update': typeof ApiPublicEngineIngestOrder_updateRoute
@@ -251,6 +261,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/demo-tick'
     | '/api/public/engine/eth-price'
     | '/api/public/engine/heartbeat'
+    | '/api/public/engine/ingest/executor_status'
     | '/api/public/engine/ingest/open_positions'
     | '/api/public/engine/ingest/order'
     | '/api/public/engine/ingest/order_update'
@@ -275,6 +286,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/demo-tick'
     | '/api/public/engine/eth-price'
     | '/api/public/engine/heartbeat'
+    | '/api/public/engine/ingest/executor_status'
     | '/api/public/engine/ingest/open_positions'
     | '/api/public/engine/ingest/order'
     | '/api/public/engine/ingest/order_update'
@@ -300,6 +312,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/demo-tick'
     | '/api/public/engine/eth-price'
     | '/api/public/engine/heartbeat'
+    | '/api/public/engine/ingest/executor_status'
     | '/api/public/engine/ingest/open_positions'
     | '/api/public/engine/ingest/order'
     | '/api/public/engine/ingest/order_update'
@@ -317,6 +330,7 @@ export interface RootRouteChildren {
   ApiPublicEngineDemoTickRoute: typeof ApiPublicEngineDemoTickRoute
   ApiPublicEngineEthPriceRoute: typeof ApiPublicEngineEthPriceRoute
   ApiPublicEngineHeartbeatRoute: typeof ApiPublicEngineHeartbeatRoute
+  ApiPublicEngineIngestExecutor_statusRoute: typeof ApiPublicEngineIngestExecutor_statusRoute
   ApiPublicEngineIngestOpen_positionsRoute: typeof ApiPublicEngineIngestOpen_positionsRoute
   ApiPublicEngineIngestOrderRoute: typeof ApiPublicEngineIngestOrderRoute
   ApiPublicEngineIngestOrder_updateRoute: typeof ApiPublicEngineIngestOrder_updateRoute
@@ -489,6 +503,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiPublicEngineIngestOpen_positionsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/public/engine/ingest/executor_status': {
+      id: '/api/public/engine/ingest/executor_status'
+      path: '/api/public/engine/ingest/executor_status'
+      fullPath: '/api/public/engine/ingest/executor_status'
+      preLoaderRoute: typeof ApiPublicEngineIngestExecutor_statusRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -526,6 +547,8 @@ const rootRouteChildren: RootRouteChildren = {
   ApiPublicEngineDemoTickRoute: ApiPublicEngineDemoTickRoute,
   ApiPublicEngineEthPriceRoute: ApiPublicEngineEthPriceRoute,
   ApiPublicEngineHeartbeatRoute: ApiPublicEngineHeartbeatRoute,
+  ApiPublicEngineIngestExecutor_statusRoute:
+    ApiPublicEngineIngestExecutor_statusRoute,
   ApiPublicEngineIngestOpen_positionsRoute:
     ApiPublicEngineIngestOpen_positionsRoute,
   ApiPublicEngineIngestOrderRoute: ApiPublicEngineIngestOrderRoute,
