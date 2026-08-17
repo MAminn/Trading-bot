@@ -110,13 +110,17 @@ export type Database = {
       engine_config: {
         Row: {
           account_size_usd: number | null
+          auto_execute_enabled: boolean
           capital_allocation_pct: number
           capital_usd: number
           created_at: string
           demo_mode: boolean
+          execution_mode: string
           id: string
           is_running: boolean
           leverage: number
+          live_allow_full_capital: boolean
+          live_order_cap_usd: number
           max_daily_loss_usd: number
           max_notional_usd: number
           max_position_size_usd: number
@@ -131,9 +135,12 @@ export type Database = {
           capital_usd?: number
           created_at?: string
           demo_mode?: boolean
+          execution_mode?: string
           id?: string
           is_running?: boolean
           leverage?: number
+          live_allow_full_capital?: boolean
+          live_order_cap_usd?: number
           max_daily_loss_usd?: number
           max_notional_usd?: number
           max_position_size_usd?: number
@@ -148,9 +155,12 @@ export type Database = {
           capital_usd?: number
           created_at?: string
           demo_mode?: boolean
+          execution_mode?: string
           id?: string
           is_running?: boolean
           leverage?: number
+          live_allow_full_capital?: boolean
+          live_order_cap_usd?: number
           max_daily_loss_usd?: number
           max_notional_usd?: number
           max_position_size_usd?: number
