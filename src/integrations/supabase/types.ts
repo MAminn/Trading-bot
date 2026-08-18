@@ -206,8 +206,14 @@ export type Database = {
       }
       executor_status: {
         Row: {
+          auto_execute_enabled: boolean | null
           available_balance_usd: number | null
+          blocked_reason: string | null
           created_at: string
+          db_execution_mode: string | null
+          live_order_cap_env_max: number | null
+          live_order_cap_usd: number | null
+          orders_enabled: boolean | null
           effective_mode: string
           entry_price: number | null
           env_mode_ceiling: string | null
@@ -229,8 +235,14 @@ export type Database = {
           wallet_balance_usd: number | null
         }
         Insert: {
+          auto_execute_enabled?: boolean | null
           available_balance_usd?: number | null
+          blocked_reason?: string | null
           created_at?: string
+          db_execution_mode?: string | null
+          live_order_cap_env_max?: number | null
+          live_order_cap_usd?: number | null
+          orders_enabled?: boolean | null
           effective_mode: string
           entry_price?: number | null
           env_mode_ceiling?: string | null
@@ -252,8 +264,14 @@ export type Database = {
           wallet_balance_usd?: number | null
         }
         Update: {
+          auto_execute_enabled?: boolean | null
           available_balance_usd?: number | null
+          blocked_reason?: string | null
           created_at?: string
+          db_execution_mode?: string | null
+          live_order_cap_env_max?: number | null
+          live_order_cap_usd?: number | null
+          orders_enabled?: boolean | null
           effective_mode?: string
           entry_price?: number | null
           env_mode_ceiling?: string | null

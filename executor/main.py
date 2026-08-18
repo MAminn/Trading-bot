@@ -230,10 +230,23 @@ def run_executor(mode: str) -> int:
         ReadOnlyFuturesClient,
     )
     from executor_status import build_snapshot, permission_status_for_error
+    from live_controls import (
+        is_trade_capable,
+        placement_block_reason,
+        resolve_effective_mode,
+    )
     from signal_consumer import SignalConsumer, SignalConsumerError
 
+    # What this HOST is permitted to do. The database may narrow it per cycle,
+    # never widen it, so this stays the ceiling for the life of the process.
     trade_capable = mode in TRADE_CAPABLE_MODES
     base_url = MODE_BASE_URLS[mode]
+
+    # Re-checked as a placement gate every cycle, not just at startup: the
+    # acknowledgement is what distinguishes a host that may risk real funds.
+    ack_present = (
+        os.environ.get(LIVE_TRADING_ACK_ENV, "").strip() == LIVE_TRADING_ACK_VALUE
+    )
 
     refusal, live_order_cap_usd = live_preflight(mode)
     if refusal is not None:
@@ -319,15 +332,24 @@ def run_executor(mode: str) -> int:
         SYMBOL,
         start_after=start_after,
         risk_guard=risk_guard,
-        # Placement is enabled only in trade-capable modes; read modes get no
-        # trader, and the object they do hold has no write methods anyway.
-        binance_trader=client if trade_capable else None,
+        # Starts detached. The trader is attached per cycle by set_trader(),
+        # and only when the EFFECTIVE mode is trade-capable — so the process
+        # begins in the closed position and stays there until the database has
+        # actually been read.
+        binance_trader=None,
         live_order_cap_usd=live_order_cap_usd,
     )
 
     # Telemetry only. The env vars it needs were validated above, so this is
     # non-None here in every non-OFF mode.
     reporter = build_reporter()
+
+    # The mode this cycle actually runs in: env capability AND database request.
+    # Starts at OFF so anything that reads it before the first successful config
+    # refresh sees the closed position.
+    effective_mode = "OFF"
+    orders_enabled = False
+    block_reason_live: str | None = None
 
     def report(account=None, positions=None, message=None, permission=None):
         """Send one telemetry snapshot. Contains its own failures — a telemetry
@@ -336,10 +358,15 @@ def run_executor(mode: str) -> int:
             return
         reporter.report(
             build_snapshot(
-                mode=mode,
-                # Today the env IS the mode; the two diverge only once the DB is
-                # allowed to narrow it, which this phase does not do.
+                mode=effective_mode,
+                # `mode` here is the .env value: the ceiling, not the outcome.
                 env_mode_ceiling=mode,
+                db_execution_mode=consumer.db_execution_mode,
+                auto_execute_enabled=consumer.db_auto_execute_enabled,
+                live_order_cap_usd=consumer.live_order_cap_usd,
+                live_order_cap_env_max=consumer.live_order_cap_ceiling,
+                orders_enabled=orders_enabled,
+                blocked_reason=block_reason_live,
                 account=account,
                 positions=positions,
                 reconcile=consumer.last_reconcile,
@@ -499,6 +526,11 @@ def run_executor(mode: str) -> int:
         return True
 
     probed = False
+    # Startup work (clock sync, symbol filters, first account log) is tracked
+    # separately from the failure counter: a cycle that idles at effective OFF
+    # completes successfully without doing any of it, and must not be mistaken
+    # for a cycle that did.
+    startup_done = False
     liquidation_warning_logged = False
     # Set the instant the smoke test may have sent its first order. From that
     # point a failed cycle must NOT be retried: a retry could place a second
@@ -509,8 +541,80 @@ def run_executor(mode: str) -> int:
         """One unified fetch cycle. Startup-only work runs until the first
         success. Returns None normally; in smoke-test mode it returns the
         process exit code once the synthetic OPEN/CLOSE pair has run."""
-        nonlocal probed, liquidation_warning_logged, smoke_started
-        if not first_success:
+        nonlocal probed, startup_done, liquidation_warning_logged, smoke_started
+        nonlocal effective_mode, orders_enabled, block_reason_live
+
+        # The config drives the mode decision, so it is refreshed before any
+        # exchange call. A failed refresh raises and fails the cycle, which
+        # leaves the previous (already-computed) state untouched and places
+        # nothing — the same fail-closed retry every other fetch failure gets.
+        consumer.ensure_config()
+
+        previous_mode = effective_mode
+        effective_mode = resolve_effective_mode(mode, consumer.db_execution_mode)
+        effective_trade_capable = is_trade_capable(effective_mode)
+        if effective_mode != previous_mode:
+            log.warning(
+                "EFFECTIVE MODE | %s -> %s | env_ceiling=%s | db_request=%s",
+                previous_mode,
+                effective_mode,
+                mode,
+                consumer.db_execution_mode,
+            )
+
+        # Why an OPEN may not be placed. Evaluated every cycle, from the values
+        # just read, so switching auto-execute off or pressing Stop takes effect
+        # on the next cycle rather than at the next restart.
+        block_reason_live = placement_block_reason(
+            effective_mode=effective_mode,
+            db_execution_mode=consumer.db_execution_mode,
+            auto_execute_enabled=consumer.db_auto_execute_enabled,
+            is_running=consumer.db_is_running,
+            live_order_cap_usd=consumer.live_order_cap_usd,
+            ack_present=ack_present,
+        )
+        orders_enabled = block_reason_live is None
+
+        # Attach the placement client only when the effective mode is
+        # trade-capable. Detaching removes the placement path itself rather than
+        # setting a flag beside it: the consumer reaches _place_order only via
+        # `self._binance_trader is not None`.
+        consumer.set_trader(client if effective_trade_capable else None)
+
+        # A database request the environment refuses is the single most
+        # important thing to see in a log, so it is stated plainly every cycle
+        # it holds rather than only on transition.
+        if consumer.db_execution_mode != effective_mode and consumer.db_execution_mode != "OFF":
+            log.warning(
+                "DB REQUEST DEGRADED | database asks for %s, host .env permits at "
+                "most %s — running %s",
+                consumer.db_execution_mode,
+                mode,
+                effective_mode,
+            )
+
+        if effective_mode == "OFF":
+            # No exchange call of any kind, exactly like run_off — but the
+            # process stays alive so a later database change can bring it back
+            # without a restart.
+            log.info(
+                "executor idle | effective=OFF | env_ceiling=%s | db_request=%s",
+                mode,
+                consumer.db_execution_mode,
+            )
+            report(
+                message=(
+                    f"idle: effective OFF (env {mode}, database "
+                    f"{consumer.db_execution_mode})"
+                ),
+            )
+            # poll_once is what normally reopens the cycle. Returning here
+            # without it would strand the flag and stop every later refresh —
+            # the executor would stay OFF even after the database changed back.
+            consumer.end_cycle()
+            return None
+
+        if not startup_done:
             offset = client.sync_clock()
             log.info("clock synced | offset=%dms", offset)
 
@@ -529,7 +633,9 @@ def run_executor(mode: str) -> int:
 
         # Trade-capable only: learn the exchange's authoritative leverage
         # ceiling and notional cap before any enforcement or sizing happens.
-        if trade_capable and not probed:
+        # Gated on the EFFECTIVE mode: a host whose .env permits trading but
+        # whose database asks for read-only must not probe or enforce.
+        if effective_trade_capable and not probed:
             probe_leverage_brackets()
             probed = True
 
@@ -537,7 +643,8 @@ def run_executor(mode: str) -> int:
         account = client.get_account()
         consumer.set_available_balance(Decimal(str(account["availableBalance"])))
 
-        if not first_success:
+        if not startup_done:
+            startup_done = True
             log.info(
                 "account | total_wallet_balance=%s | available_balance=%s",
                 account.get("totalWalletBalance"),
@@ -569,12 +676,15 @@ def run_executor(mode: str) -> int:
         except (TypeError, ValueError):
             position_amt = 0.0
 
-        # Refresh the engine config first: the desired leverage drives both
-        # account enforcement and order sizing this cycle.
-        consumer.ensure_config()
+        # Config was refreshed at the top of the cycle; ensure_config() is
+        # idempotent within a cycle, so the desired leverage below is the value
+        # the mode decision was made from.
         leverage_blocked = False
         desired = consumer.desired_leverage
-        if trade_capable and desired is not None:
+        # set_leverage / set_margin_type are writes. Gating them on the
+        # EFFECTIVE mode is what makes a degraded LIVE_READ genuinely read-only
+        # even on a host whose .env would permit trading.
+        if effective_trade_capable and desired is not None:
             if not liquidation_warning_logged:
                 liquidation_warning_logged = True
                 if desired > 0 and 1 / desired < SL_PCT_ASSUMED:
@@ -599,6 +709,16 @@ def run_executor(mode: str) -> int:
             opens_blocked = True
             if block_reason is None:
                 block_reason = "leverage_config_mismatch"
+        if block_reason_live is not None:
+            # The live-control gates (mode, auto-execute, kill switch, cap, ack)
+            # block OPENs only. A position that is already open must stay
+            # closable when auto-execute is switched off or Stop is pressed —
+            # stranding real exposure behind a control flag would be worse than
+            # the exposure itself. CLOSE remains reachable while the effective
+            # mode is trade-capable; below that there is no trader at all.
+            opens_blocked = True
+            if block_reason is None:
+                block_reason = block_reason_live
 
         # Report once per cycle, here: reconcile has just run, and every branch
         # below (smoke, blocked, normal) is reached through this point, so a
@@ -621,6 +741,16 @@ def run_executor(mode: str) -> int:
             # full startup path above (clock, filters, bracket probe, account
             # enforcement, reconcile) has succeeded, so it is gated by exactly
             # the same preconditions a natural OPEN would face.
+            if not effective_trade_capable:
+                log.error(
+                    "SMOKE ABORTED | effective mode is %s (env %s, database %s) "
+                    "— the smoke test never runs outside a trade-capable "
+                    "effective mode",
+                    effective_mode,
+                    mode,
+                    consumer.db_execution_mode,
+                )
+                return 1
             if opens_blocked:
                 log.error(
                     "SMOKE ABORTED | OPENs are blocked (%s) — refusing to place "

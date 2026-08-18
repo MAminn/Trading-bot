@@ -33,6 +33,10 @@ class RiskGuard:
         # be raised by a config refresh, and applies in EVERY sizing mode —
         # including full_capital, which has no internal ceiling of its own.
         self._live_cap_usd = None if live_cap_usd is None else float(live_cap_usd)
+        # The value handed in at construction comes from .env and is this host's
+        # hard ceiling. It is captured separately and never reassigned, so
+        # set_live_cap() below can only ever narrow the effective cap.
+        self._live_cap_ceiling = self._live_cap_usd
 
     def update_limits(self, *, max_notional_usd=None, max_leverage=None) -> None:
         """Update only the limits supplied. main.py sets max_leverage after the
@@ -41,6 +45,29 @@ class RiskGuard:
             self._max_notional_usd = max_notional_usd
         if max_leverage is not None:
             self._max_leverage = max_leverage
+
+    def set_live_cap(self, cap) -> None:
+        """Apply a database-supplied per-order cap.
+
+        Clamped to the ceiling captured at construction, so a config refresh can
+        only ever lower the cap. A None from the database leaves the host
+        ceiling in force rather than removing the cap: 'unspecified' must not
+        read as 'unlimited'.
+        """
+        if cap is None:
+            self._live_cap_usd = self._live_cap_ceiling
+            return
+        try:
+            requested = float(cap)
+        except (TypeError, ValueError):
+            # Unreadable input never widens: fall back to the host ceiling.
+            log.error("unreadable live cap %r — keeping host ceiling %s", cap, self._live_cap_ceiling)
+            self._live_cap_usd = self._live_cap_ceiling
+            return
+        if self._live_cap_ceiling is None:
+            self._live_cap_usd = requested
+            return
+        self._live_cap_usd = min(self._live_cap_ceiling, requested)
 
     def set_sizing_mode(self, mode: str) -> None:
         """Select which notional-ceiling rule applies to OPENs.

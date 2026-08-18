@@ -21,12 +21,16 @@ from decimal import ROUND_DOWN, Decimal
 import requests
 
 from binance_client import BinanceAPIError, BinanceFuturesClient
+from live_controls import allow_full_capital, resolve_live_order_cap
 from reconciler import Reconciler, ReconcilerError
 
 log = logging.getLogger("executor.consumer")
 
 REQUEST_TIMEOUT_SECONDS = 10
-CONFIG_REFRESH_EVERY_CYCLES = 10
+# The live controls are read from this config, so it is refreshed every cycle:
+# a stop, a mode change or a cap change must take effect on the next cycle, not
+# up to ten minutes later.
+CONFIG_REFRESH_EVERY_CYCLES = 1
 
 STEP_SIZE = Decimal("0.001")
 MIN_NOTIONAL_USD = Decimal("20")
@@ -135,9 +139,21 @@ class SignalConsumer:
             None if live_order_cap_usd is None else Decimal(str(live_order_cap_usd))
         )
         # Read once at construction: a mid-run env change must not widen sizing.
-        self._live_allow_full_capital = (
+        # This is the HOST's consent to full-capital sizing; the database carries
+        # the operator's, and both are required.
+        self._live_allow_full_capital_env = (
             os.environ.get(LIVE_ALLOW_FULL_CAPITAL_ENV, "").strip() == "1"
         )
+        self._live_allow_full_capital_db = False
+        # The env cap is this host's hard ceiling. A database cap may lower the
+        # effective cap but can never raise it past this value.
+        self._live_order_cap_ceiling = self._live_order_cap_usd
+        # Live controls read from the database on every refresh. Every one
+        # defaults to the closed position, so a missing column, an unreadable
+        # value or a failed refresh can never enable anything.
+        self._db_execution_mode = "OFF"
+        self._db_auto_execute_enabled = False
+        self._db_is_running = False
         # Optional RiskGuard (trade-capable modes only); None keeps read modes pure.
         self._risk_guard = risk_guard
         # Authenticated client for order placement; supplied ONLY in TESTNET_TRADE.
@@ -259,20 +275,47 @@ class SignalConsumer:
                     "unreadable account_size_usd=%r — OPENs blocked", raw_account_size
                 )
 
-        # On mainnet, full_capital is opt-in via env and off by default. The
-        # config alone can never move a live executor onto the uncapped sizing
-        # path — someone with server access has to set the flag as well.
-        if (
-            self._is_live
-            and self._sizing_mode == "full_capital"
-            and not self._live_allow_full_capital
+        # --- live execution controls --------------------------------------- #
+        # Every one of these fails closed: an absent column, a null, or an
+        # unrecognised value leaves the control in its most restrictive state.
+        # The precedence rule against the environment lives in live_controls.py;
+        # here we only record what the database asked for.
+        raw_exec_mode = config.get("execution_mode")
+        self._db_execution_mode = (
+            raw_exec_mode if isinstance(raw_exec_mode, str) else "OFF"
+        )
+        if "execution_mode" not in config:
+            log.error(
+                "config has no execution_mode — treating the database request as "
+                "OFF. The app may predate the live-control columns."
+            )
+
+        self._db_auto_execute_enabled = config.get("auto_execute_enabled") is True
+        self._db_is_running = config.get("is_running") is True
+        self._live_allow_full_capital_db = config.get("live_allow_full_capital") is True
+
+        # The effective cap is the smaller of the host ceiling and the request.
+        self._live_order_cap_usd = resolve_live_order_cap(
+            self._live_order_cap_ceiling, config.get("live_order_cap_usd")
+        )
+        if self._risk_guard is not None:
+            self._risk_guard.set_live_cap(self._live_order_cap_usd)
+
+        # On mainnet, full_capital needs consent from BOTH the database and the
+        # host. The config alone can never move a live executor onto the
+        # uncapped sizing path — someone with server access has to agree too.
+        if self._is_live and self._sizing_mode == "full_capital" and not allow_full_capital(
+            self._live_allow_full_capital_env, self._live_allow_full_capital_db
         ):
             self._config_invalid = True
             log.error(
-                "sizing_mode=full_capital is not permitted in %s without %s=1 "
+                "sizing_mode=full_capital is not permitted in %s without both "
+                "%s=1 (host: %s) and live_allow_full_capital (database: %s) "
                 "— OPENs blocked",
                 self._execution_mode,
                 LIVE_ALLOW_FULL_CAPITAL_ENV,
+                self._live_allow_full_capital_env,
+                self._live_allow_full_capital_db,
             )
 
         # full_capital sizes directly off account_size_usd, so a missing or
@@ -308,6 +351,20 @@ class SignalConsumer:
             self._leverage,
             self._max_notional_usd,
         )
+        # The control plane, logged every refresh. Never the response body:
+        # these are the only fields worth reading and none of them is a secret.
+        log.info(
+            "live controls | db_execution_mode=%s | auto_execute=%s | "
+            "is_running=%s | db_allow_full_capital=%s | cap: host=%s db=%s "
+            "effective=%s",
+            self._db_execution_mode,
+            self._db_auto_execute_enabled,
+            self._db_is_running,
+            self._live_allow_full_capital_db,
+            self._live_order_cap_ceiling,
+            config.get("live_order_cap_usd"),
+            self._live_order_cap_usd,
+        )
         if self._risk_guard is not None:
             self._risk_guard.update_limits(max_notional_usd=self._max_notional_usd)
             self._risk_guard.set_sizing_mode(self._sizing_mode)
@@ -324,6 +381,51 @@ class SignalConsumer:
             self._refresh_config()
         self._cycles += 1
         self._cycle_counted = True
+
+    # ------------------------------------------------------------------ #
+    # live controls, as last read from the database
+    # ------------------------------------------------------------------ #
+
+    @property
+    def db_execution_mode(self) -> str:
+        return self._db_execution_mode
+
+    @property
+    def db_auto_execute_enabled(self) -> bool:
+        return self._db_auto_execute_enabled
+
+    @property
+    def db_is_running(self) -> bool:
+        return self._db_is_running
+
+    @property
+    def live_order_cap_usd(self):
+        """The cap actually in force: min(host ceiling, database request)."""
+        return self._live_order_cap_usd
+
+    @property
+    def live_order_cap_ceiling(self):
+        """This host's hard ceiling from .env; never raised by any config."""
+        return self._live_order_cap_ceiling
+
+    def end_cycle(self) -> None:
+        """Close the cycle without running poll_once.
+
+        ensure_config() refuses to refresh twice in one cycle, and poll_once's
+        `finally` is normally what reopens it. A caller that returns early —
+        idling at effective OFF, for instance — must call this instead, or the
+        next ensure_config() sees a stranded flag, skips its refresh, and the
+        executor never notices the database changing back."""
+        self._cycle_counted = False
+
+    def set_trader(self, trader) -> None:
+        """Attach or detach the order-placement client for this cycle.
+
+        None removes the placement path entirely: `_process_intent` reaches
+        `_place_order` only through `self._binance_trader is not None`, so a
+        detached trader is not a flag that a later edit could invert — there is
+        no object to place with."""
+        self._binance_trader = trader
 
     @property
     def desired_leverage(self) -> int | None:

@@ -255,7 +255,22 @@ FULL_CAPITAL_CONFIG = {
     "max_notional_usd": 500,
     "sizing_mode": "full_capital",
     "account_size_usd": 10000,
+    # The operator's half of the full-capital consent. The env flag is the
+    # host's half, and these tests vary that one; both are required.
+    "live_allow_full_capital": True,
 }
+
+
+def test_full_capital_blocked_when_only_the_host_consents(monkeypatch, caplog):
+    """Env flag set, database consent absent — still blocked.
+
+    The mirror of the default case below: neither side's consent is sufficient
+    on its own, and this is the direction a database edit could reach."""
+    config = dict(FULL_CAPITAL_CONFIG, live_allow_full_capital=False)
+    with caplog.at_level(logging.ERROR, logger="executor.consumer"):
+        c = consumer_with_config("LIVE_TRADE", config, monkeypatch, allow_full_capital=True)
+    assert c._config_invalid is True
+    assert "live_allow_full_capital" in caplog.text
 
 
 def test_full_capital_blocks_opens_in_live_trade_by_default(monkeypatch, caplog):

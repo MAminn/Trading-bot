@@ -353,16 +353,55 @@ function ExecutorCard({
         </div>
       </div>
 
-      {requested !== undefined && requested !== null && requested !== row.effective_mode && (
-        <div className="mt-3 flex items-start gap-2 rounded-lg border border-border bg-card/40 p-3 text-xs">
-          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      {/* The executor now reports the request it saw, so prefer its value over
+          the one this page read from the database — they are the same row, but
+          the executor's is the one it actually acted on. */}
+      {(() => {
+        const seen = row.db_execution_mode ?? requested ?? null;
+        if (seen === null || seen === row.effective_mode) return null;
+        return (
+          <div className="mt-3 flex items-start gap-2 rounded-lg border border-warning/40 bg-warning/10 p-3 text-xs">
+            <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" />
+            <span className="text-warning">
+              Requested <span className="font-mono">{seen}</span>, running{" "}
+              <span className="font-mono">{row.effective_mode}</span>. The host's{" "}
+              <span className="font-mono">.env</span> ceiling is{" "}
+              <span className="font-mono">{row.env_mode_ceiling ?? "unknown"}</span> and it
+              cannot be raised from this dashboard. The{" "}
+              <strong>running</strong> value is the one that describes real behaviour.
+            </span>
+          </div>
+        );
+      })()}
+
+      <div className="mt-4 grid gap-4 md:grid-cols-2">
+        <KV
+          k="Orders enabled"
+          v={row.orders_enabled === null ? "—" : row.orders_enabled ? "YES" : "NO"}
+          tone={row.orders_enabled ? "destructive" : undefined}
+        />
+        <KV
+          k="Auto-execute"
+          v={row.auto_execute_enabled === null ? "—" : row.auto_execute_enabled ? "ON" : "OFF"}
+        />
+        <KV
+          k="Effective order cap"
+          v={row.live_order_cap_usd === null ? "—" : fmtUSD(row.live_order_cap_usd)}
+        />
+        <KV
+          k="Host cap ceiling"
+          v={row.live_order_cap_env_max === null ? "—" : fmtUSD(row.live_order_cap_env_max)}
+        />
+      </div>
+
+      {row.orders_enabled === false && row.blocked_reason && (
+        <div className="mt-3 rounded-lg border border-border bg-card/40 px-4 py-3 text-xs">
+          <span className="text-muted-foreground">OPENs blocked by </span>
+          <span className="font-mono">{row.blocked_reason}</span>
           <span className="text-muted-foreground">
-            Requested <span className="font-mono text-foreground">{requested}</span>, running{" "}
-            <span className="font-mono text-foreground">{row.effective_mode}</span>. This is
-            expected: the executor does not read the requested mode yet and
-            continues to follow its own environment. The{" "}
-            <strong className="text-foreground">actual</strong> value is the one that
-            describes real behaviour.
+            {" "}
+            — closing an existing position is still permitted while the effective
+            mode is trade-capable.
           </span>
         </div>
       )}

@@ -23,6 +23,13 @@ const CONFIG_FIELDS = [
   "max_position_size_usd",
   "is_running",
   "demo_mode",
+  // Live controls. The executor reads these every cycle and combines them with
+  // its own environment, which stays the ceiling — nothing here can raise
+  // capability, only lower it.
+  "execution_mode",
+  "live_order_cap_usd",
+  "live_allow_full_capital",
+  "auto_execute_enabled",
   "updated_at",
 ] as const;
 

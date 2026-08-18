@@ -17,6 +17,14 @@ BASE_CONFIG = {
     "max_notional_usd": 500,
     "sizing_mode": "allocation",
     "account_size_usd": 1667,
+    # Live controls, as a current engine_config row carries them. Present but
+    # closed: this fixture must describe a real row, and a real row always has
+    # these columns since the Phase 1 migration.
+    "execution_mode": "OFF",
+    "live_order_cap_usd": 0,
+    "live_allow_full_capital": False,
+    "auto_execute_enabled": False,
+    "is_running": False,
 }
 
 

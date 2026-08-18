@@ -27,8 +27,18 @@ export type ExecutionMode = (typeof EXECUTION_MODES)[number];
 
 export interface ExecutorStatusRow {
   user_id: string;
+  // Three separate facts. `db_execution_mode` is what was asked for,
+  // `env_mode_ceiling` is what the host permits, `effective_mode` is what is
+  // running. They differ whenever a request is degraded, and the UI must show
+  // that rather than picking one.
   effective_mode: ExecutionMode;
   env_mode_ceiling: ExecutionMode | null;
+  db_execution_mode: "OFF" | "LIVE_READ" | "LIVE_TRADE" | null;
+  auto_execute_enabled: boolean | null;
+  live_order_cap_usd: number | null;
+  live_order_cap_env_max: number | null;
+  orders_enabled: boolean | null;
+  blocked_reason: string | null;
   wallet_balance_usd: number | null;
   available_balance_usd: number | null;
   position_amt: number | null;

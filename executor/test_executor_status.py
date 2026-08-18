@@ -155,16 +155,49 @@ def test_snapshot_carries_no_credential_material():
         assert forbidden not in text
 
 
-def test_snapshot_has_no_control_fields():
-    """Phase 0 is telemetry only: nothing here may look like a control input."""
+def test_snapshot_never_fabricates_a_control_state():
+    """Phase 3 reports the control values; it must never invent them.
+
+    These fields are a REPORT of a decision made elsewhere, never an input to
+    one. When the caller supplies nothing, they read None rather than
+    defaulting to a value that would describe a state nobody chose."""
+    s = snapshot()
     for control in (
-        "execution_mode",
+        "db_execution_mode",
         "auto_execute_enabled",
         "live_order_cap_usd",
-        "live_allow_full_capital",
-        "is_running",
+        "live_order_cap_env_max",
+        "orders_enabled",
+        "blocked_reason",
     ):
-        assert control not in snapshot()
+        assert control in s, control
+        assert s[control] is None, control
+
+
+def test_snapshot_reports_the_control_values_it_is_given():
+    s = snapshot(
+        db_execution_mode="LIVE_TRADE",
+        auto_execute_enabled=True,
+        live_order_cap_usd=30,
+        live_order_cap_env_max=30,
+        orders_enabled=False,
+        blocked_reason="auto_execute_disabled",
+    )
+    assert s["db_execution_mode"] == "LIVE_TRADE"
+    assert s["auto_execute_enabled"] is True
+    assert s["live_order_cap_usd"] == 30.0
+    assert s["live_order_cap_env_max"] == 30.0
+    assert s["orders_enabled"] is False
+    assert s["blocked_reason"] == "auto_execute_disabled"
+
+
+def test_effective_and_requested_modes_are_reported_separately():
+    """A degraded request must be visible as a degradation, not hidden behind
+    a single 'mode' field that could be read as either."""
+    s = snapshot(mode="LIVE_READ", env_mode_ceiling="LIVE_READ", db_execution_mode="LIVE_TRADE")
+    assert s["effective_mode"] == "LIVE_READ"
+    assert s["env_mode_ceiling"] == "LIVE_READ"
+    assert s["db_execution_mode"] == "LIVE_TRADE"
 
 
 # --- permission status --------------------------------------------------- #
