@@ -8,6 +8,15 @@ import {
   SIZING_MODES,
   capitalFromAllocation,
 } from "@/lib/sizing";
+import {
+  LIVE_CONTROL_TUPLE,
+  LIVE_ORDER_CAP_MAX_USD,
+  LIVE_STATE_INPUTS,
+  PRIVILEGED_CONFIG_FIELDS,
+  REQUESTED_EXECUTION_MODES,
+  formatViolations,
+  validateLiveState,
+} from "@/lib/live-controls";
 import { z } from "zod";
 
 export const setEngineRunning = createServerFn({ method: "POST" })
@@ -63,15 +72,44 @@ export const ConfigPatch = z.object({
   max_daily_loss_usd: z.number().min(0).max(1e9).optional(),
   max_position_size_usd: z.number().min(0).max(1e9).optional(),
   demo_mode: z.boolean().optional(),
-  // mode is locked to signal_only for now
-  mode: z.enum(["signal_only"]).optional(),
+  // Auto-execute. The DB derives auto_execute_enabled from this column, so it
+  // is the single switch — there is no separate boolean to disagree with it.
+  mode: z.enum(["signal_only", "auto"]).optional(),
+  // ----- live execution controls (privileged; service-role write only) -----
+  execution_mode: z.enum(REQUESTED_EXECUTION_MODES).optional(),
+  live_order_cap_usd: z.number().min(0).max(LIVE_ORDER_CAP_MAX_USD).optional(),
+  live_allow_full_capital: z.boolean().optional(),
 }).superRefine((val, ctx) => {
+  const reject = (path: string, message: string) =>
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: [path], message });
+
+  // ----- live execution controls -----
+  // Same principle as the sizing block below: validating execution_mode
+  // without the cap it will be paired with is not validation, so a patch
+  // touching any of the tuple must declare all of it.
+  const liveTouched = LIVE_CONTROL_TUPLE.filter((f) => val[f] !== undefined);
+  if (liveTouched.length > 0) {
+    const missing = LIVE_CONTROL_TUPLE.filter((f) => val[f] === undefined);
+    if (missing.length > 0) {
+      for (const f of missing) {
+        reject(
+          f,
+          `${f} is required when updating ${liveTouched.join(", ")} — a ` +
+            `live-execution patch must declare the whole control set`,
+        );
+      }
+    } else {
+      // Cross-field rules, evaluated on whatever this patch fully determines.
+      // The handler re-runs the same function against the merged row, so
+      // fields absent here (sizing_mode, demo_mode) are still checked before
+      // the write — and the DB CHECKs remain the final authority.
+      for (const v of validateLiveState(val)) reject(v.field, v.message);
+    }
+  }
+
   const touched = SIZING_FIELDS.filter((f) => val[f] !== undefined);
   // Unrelated patches (e.g. a demo_mode toggle) pass through untouched.
   if (touched.length === 0) return;
-
-  const reject = (path: string, message: string) =>
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: [path], message });
 
   if (val.sizing_mode === undefined) {
     reject(
@@ -139,11 +177,52 @@ export const updateEngineConfig = createServerFn({ method: "POST" })
   .inputValidator((d: unknown) => ConfigPatch.parse(d))
   .handler(async ({ data, context }) => {
     if (Object.keys(data).length === 0) return { ok: true };
+
+    // Migration 20260817131000 revoked UPDATE on these columns from
+    // `authenticated`, so RLS is no longer what protects them — this function
+    // is. A patch touching any of them is written with the service role, and
+    // the row is selected by the user id from the verified JWT claims, never
+    // from anything the caller supplied. (ConfigPatch is a plain z.object, so
+    // an injected user_id is stripped before it reaches here.)
+    const touchesPrivileged = PRIVILEGED_CONFIG_FIELDS.some((f) => data[f] !== undefined);
+    // Any input to the live-execution invariants forces a merged-state check:
+    // a patch that flips demo_mode alone, or sizing_mode alone, can still
+    // produce a forbidden combination with columns it does not mention.
+    const touchesLiveState = LIVE_STATE_INPUTS.some((f) => data[f] !== undefined);
+
+    const nowIso = new Date().toISOString();
+
+    if (touchesLiveState || touchesPrivileged) {
+      const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+
+      const { data: current, error: readErr } = await supabaseAdmin
+        .from("engine_config")
+        .select(
+          "execution_mode, live_order_cap_usd, live_allow_full_capital, sizing_mode, demo_mode",
+        )
+        .eq("user_id", context.userId)
+        .maybeSingle();
+      if (readErr) throw new Error(readErr.message);
+      if (!current) throw new Error("no engine_config row for this account");
+
+      // Validate the state the row will END UP in, not the patch in isolation.
+      const violations = validateLiveState({ ...current, ...data });
+      if (violations.length > 0) throw new Error(formatViolations(violations));
+
+      const db = touchesPrivileged ? supabaseAdmin : context.supabase;
+      const { error } = await db
+        .from("engine_config")
+        .update({ ...data, updated_at: nowIso })
+        .eq("user_id", context.userId);
+      if (error) throw new Error(error.message);
+      return { ok: true };
+    }
+
     const { error } = await context.supabase
       .from("engine_config")
       // The generated types now carry every engine_config column this patch can
       // write, so the previous `as never` escape hatch is no longer needed.
-      .update({ ...data, updated_at: new Date().toISOString() })
+      .update({ ...data, updated_at: nowIso })
       .eq("user_id", context.userId);
     if (error) throw new Error(error.message);
     return { ok: true };

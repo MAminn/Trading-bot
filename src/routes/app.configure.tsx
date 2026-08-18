@@ -1,9 +1,19 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
-import { Sliders, ExternalLink, Loader2, Check, AlertTriangle } from "lucide-react";
+import { Sliders, ExternalLink, Loader2, Check, AlertTriangle, Radio, Info } from "lucide-react";
 import { toast } from "sonner";
 import { Slider } from "@/components/ui/slider";
-import { useEngineConfig, useUpdateConfig, fmtUSD } from "@/lib/engine";
+import { Switch } from "@/components/ui/switch";
+import { useEngineConfig, useUpdateConfig, fmtUSD, type EngineConfigRow } from "@/lib/engine";
+import {
+  LIVE_ORDER_CAP_MAX_USD,
+  LIVE_ORDER_CAP_MIN_TRADE_USD,
+  REQUESTED_EXECUTION_MODES,
+  formatViolations,
+  isRequestedLiveMode,
+  validateLiveState,
+  type RequestedExecutionMode,
+} from "@/lib/live-controls";
 import {
   ALLOC_MAX,
   ALLOC_MIN,
@@ -301,6 +311,250 @@ function Configure() {
           </button>
         </div>
       </form>
+
+      <LiveExecutionSection config={config} />
+    </div>
+  );
+}
+
+const MODE_COPY: Record<RequestedExecutionMode, { label: string; hint: string }> = {
+  OFF: {
+    label: "Off",
+    hint: "No exchange connectivity requested. Signals are recorded only.",
+  },
+  LIVE_READ: {
+    label: "Live · read-only",
+    hint: "Read mainnet balances and positions. Structurally cannot place an order.",
+  },
+  LIVE_TRADE: {
+    label: "Live trading",
+    hint: "Place real orders on Binance mainnet with real funds.",
+  },
+};
+
+function LiveExecutionSection({ config }: { config: EngineConfigRow | null | undefined }) {
+  const update = useUpdateConfig();
+  // Fail-closed defaults, matching the database: a row that has never been
+  // configured displays as OFF / $0 / auto disabled / no full-capital consent.
+  const [execMode, setExecMode] = useState<RequestedExecutionMode>("OFF");
+  const [cap, setCap] = useState("0");
+  const [allowFullCapital, setAllowFullCapital] = useState(false);
+  const [autoExecute, setAutoExecute] = useState(false);
+
+  useEffect(() => {
+    if (!config) return;
+    const stored = config.execution_mode;
+    setExecMode(
+      (REQUESTED_EXECUTION_MODES as readonly string[]).includes(stored)
+        ? (stored as RequestedExecutionMode)
+        : "OFF",
+    );
+    const storedCap = Number(config.live_order_cap_usd);
+    setCap(String(Number.isFinite(storedCap) && storedCap > 0 ? storedCap : 0));
+    setAllowFullCapital(!!config.live_allow_full_capital);
+    setAutoExecute(config.mode === "auto");
+  }, [config]);
+
+  const capNum = Number(cap) || 0;
+  const isLive = isRequestedLiveMode(execMode);
+
+  // The same rule module the server and the database enforce, run against the
+  // state this form would produce — so the UI refuses what the server would.
+  const violations = useMemo(
+    () =>
+      validateLiveState({
+        execution_mode: execMode,
+        live_order_cap_usd: capNum,
+        live_allow_full_capital: allowFullCapital,
+        sizing_mode: config?.sizing_mode,
+        demo_mode: config?.demo_mode,
+      }),
+    [execMode, capNum, allowFullCapital, config?.sizing_mode, config?.demo_mode],
+  );
+
+  async function onSave(e: React.FormEvent) {
+    e.preventDefault();
+    if (violations.length > 0) {
+      toast.error(formatViolations(violations));
+      return;
+    }
+    try {
+      await update.mutateAsync({
+        // The control tuple is always sent as a set: the server rejects a
+        // partial live-execution patch, because validating one field without
+        // the others it pairs with is not validation.
+        execution_mode: execMode,
+        live_order_cap_usd: capNum,
+        live_allow_full_capital: allowFullCapital,
+        mode: autoExecute ? "auto" : "signal_only",
+      });
+      toast.success("Live execution settings saved");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Save failed");
+    }
+  }
+
+  const dirty =
+    !!config &&
+    (execMode !== config.execution_mode ||
+      capNum !== Number(config.live_order_cap_usd) ||
+      allowFullCapital !== !!config.live_allow_full_capital ||
+      autoExecute !== (config.mode === "auto"));
+
+  return (
+    <form onSubmit={onSave} className="card-elevated space-y-6 p-6">
+      <div className="flex items-center gap-2 text-sm font-medium">
+        <Radio className="h-4 w-4 text-primary" /> Live execution
+      </div>
+
+      {/* The single most important thing on this page right now. */}
+      <div className="flex items-start gap-2 rounded-lg border border-primary/40 bg-primary/10 p-3 text-xs">
+        <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+        <span className="space-y-1">
+          <strong className="block text-primary">Not yet connected to the executor.</strong>
+          <span className="block text-muted-foreground">
+            These settings are saved to the database and validated, but the
+            executor does not read them yet — it still follows its own
+            environment on the VPS. Changing anything here has no effect on live
+            trading until the executor is updated. What the executor is{" "}
+            <em>actually</em> doing is shown on the{" "}
+            <Link to="/app/engine" className="text-primary hover:underline">
+              Engine page
+            </Link>
+            .
+          </span>
+        </span>
+      </div>
+
+      <div>
+        <span className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Requested execution mode
+        </span>
+        <div className="inline-flex flex-wrap rounded-lg border border-border p-1">
+          {REQUESTED_EXECUTION_MODES.map((m) => (
+            <ModeButton
+              key={m}
+              active={execMode === m}
+              label={MODE_COPY[m].label}
+              onClick={() => setExecMode(m)}
+            />
+          ))}
+        </div>
+        <p className="mt-2 text-xs text-muted-foreground">{MODE_COPY[execMode].hint}</p>
+      </div>
+
+      <label className="block">
+        <span className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Live order cap (USD)
+        </span>
+        <input
+          type="number"
+          value={cap}
+          min={0}
+          max={LIVE_ORDER_CAP_MAX_USD}
+          onChange={(e) => setCap(e.target.value)}
+          className="w-full rounded-lg border border-border bg-input/40 px-3 py-2.5 font-mono text-sm focus:border-primary/60 focus:outline-none focus:ring-2 focus:ring-primary/20"
+        />
+        <span className="mt-1 block text-xs text-muted-foreground">
+          Absolute ceiling per order, applied on top of every sizing rule.
+          Maximum ${LIVE_ORDER_CAP_MAX_USD}; live trading requires at least $
+          {LIVE_ORDER_CAP_MIN_TRADE_USD}, since smaller orders fall under the
+          exchange minimum notional.
+        </span>
+      </label>
+
+      <ToggleRow
+        label="Auto-execute"
+        checked={autoExecute}
+        onChange={setAutoExecute}
+        disabled={update.isPending}
+        hint={
+          autoExecute
+            ? "Accepted signals are intended to be executed, not just recorded."
+            : "Signals are recorded only. This is the safe default."
+        }
+      />
+
+      <ToggleRow
+        label="Allow full-capital sizing on live"
+        checked={allowFullCapital}
+        onChange={setAllowFullCapital}
+        disabled={update.isPending}
+        tone={allowFullCapital ? "danger" : undefined}
+        hint="Full-capital sizing has no internal notional ceiling. Required before live trading may use it — the executor additionally requires its own environment flag."
+      />
+
+      {isLive && (
+        <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            {execMode === "LIVE_TRADE"
+              ? `Requesting real orders on Binance mainnet, capped at ${fmtUSD(capNum)} per order.`
+              : "Requesting mainnet access. Read-only: no order can be placed in this mode."}
+          </span>
+        </div>
+      )}
+
+      {violations.length > 0 && (
+        <ul className="space-y-1 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+          {violations.map((v) => (
+            <li key={v.field}>{v.message}</li>
+          ))}
+        </ul>
+      )}
+
+      <div className="flex items-center justify-end gap-3">
+        <span className="text-xs text-muted-foreground">
+          Saved:{" "}
+          {config
+            ? `${config.execution_mode} · ${fmtUSD(Number(config.live_order_cap_usd))} cap · auto ${
+                config.mode === "auto" ? "on" : "off"
+              }`
+            : "—"}
+        </span>
+        <button
+          type="submit"
+          disabled={update.isPending || violations.length > 0 || !dirty}
+          className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary to-accent px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-60"
+        >
+          {update.isPending ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Check className="h-4 w-4" />
+          )}{" "}
+          Save live settings
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function ToggleRow({
+  label,
+  hint,
+  checked,
+  onChange,
+  disabled,
+  tone,
+}: {
+  label: string;
+  hint: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+  tone?: "danger";
+}) {
+  return (
+    <div
+      className={`flex items-start justify-between gap-4 rounded-lg border p-4 ${
+        tone === "danger" ? "border-destructive/40 bg-destructive/5" : "border-border bg-card/40"
+      }`}
+    >
+      <div className="min-w-0">
+        <div className="text-sm font-medium">{label}</div>
+        <p className="mt-1 text-xs text-muted-foreground">{hint}</p>
+      </div>
+      <Switch checked={checked} onCheckedChange={onChange} disabled={disabled} aria-label={label} />
     </div>
   );
 }

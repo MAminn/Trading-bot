@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import {
-  Play, Square, Activity, Copy, Check, AlertTriangle, Cpu, FlaskConical, Radio, ShieldAlert,
+  Play, Square, Activity, Copy, Check, AlertTriangle, Cpu, FlaskConical, Radio, ShieldAlert, Info,
 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useQuery } from "@tanstack/react-query";
@@ -97,7 +97,11 @@ function EnginePage() {
       </div>
 
       {/* Executor: the real Binance-facing process */}
-      <ExecutorCard row={executor.data} loading={executor.isLoading} />
+      <ExecutorCard
+        row={executor.data}
+        loading={executor.isLoading}
+        requested={config.data?.execution_mode}
+      />
 
       {/* ML signal worker status — the strategy's own view, NOT the exchange's */}
       <div className="card-elevated p-6">
@@ -210,7 +214,17 @@ function EnginePage() {
   );
 }
 
-function ExecutorCard({ row, loading }: { row: ExecutorStatusRow | null | undefined; loading: boolean }) {
+function ExecutorCard({
+  row,
+  loading,
+  requested,
+}: {
+  row: ExecutorStatusRow | null | undefined;
+  loading: boolean;
+  /** What the database has been asked for. The executor does not read this
+   *  yet, so a difference from effective_mode is expected, not an alarm. */
+  requested: string | null | undefined;
+}) {
   const fresh = executorFresh(row);
   const tone = executorTone(row);
   const ring =
@@ -244,6 +258,14 @@ function ExecutorCard({ row, loading }: { row: ExecutorStatusRow | null | undefi
               The executor has not reported yet. This does <strong>not</strong>{" "}
               mean it is stopped — check the executor host directly before
               assuming anything about live execution.
+              {requested ? (
+                <>
+                  {" "}
+                  The database currently requests{" "}
+                  <span className="font-mono text-foreground">{requested}</span>, which
+                  says nothing about what the executor is running.
+                </>
+              ) : null}
             </p>
           </div>
         </div>
@@ -303,8 +325,49 @@ function ExecutorCard({ row, loading }: { row: ExecutorStatusRow | null | undefi
         </div>
       )}
 
+      {/* Requested vs actual. These are two different facts and the page must
+          never let them be read as one: the database records what was asked
+          for, executor_status records what is running. */}
+      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+        <div className="rounded-lg border border-border bg-card/40 px-4 py-3">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            Requested (database)
+          </div>
+          <div className="mt-1 font-mono text-sm">{requested ?? "—"}</div>
+        </div>
+        <div
+          className={`rounded-lg border px-4 py-3 ${
+            tone === "live"
+              ? "border-destructive/50 bg-destructive/10"
+              : tone === "warn"
+                ? "border-warning/50 bg-warning/10"
+                : "border-border bg-card/40"
+          }`}
+        >
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            Actual (executor)
+          </div>
+          <div className={`mt-1 font-mono text-sm font-semibold ${modeColor}`}>
+            {row.effective_mode}
+          </div>
+        </div>
+      </div>
+
+      {requested !== undefined && requested !== null && requested !== row.effective_mode && (
+        <div className="mt-3 flex items-start gap-2 rounded-lg border border-border bg-card/40 p-3 text-xs">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          <span className="text-muted-foreground">
+            Requested <span className="font-mono text-foreground">{requested}</span>, running{" "}
+            <span className="font-mono text-foreground">{row.effective_mode}</span>. This is
+            expected: the executor does not read the requested mode yet and
+            continues to follow its own environment. The{" "}
+            <strong className="text-foreground">actual</strong> value is the one that
+            describes real behaviour.
+          </span>
+        </div>
+      )}
+
       <div className="mt-5 grid gap-4 md:grid-cols-2">
-        <KV k="Execution mode" v={row.effective_mode} tone={tone === "live" ? "destructive" : tone === "warn" ? "warn" : undefined} />
         <KV k="Env ceiling" v={row.env_mode_ceiling ?? "—"} />
         <KV k="Wallet balance" v={row.wallet_balance_usd === null ? "—" : fmtUSD(row.wallet_balance_usd)} />
         <KV k="Available balance" v={row.available_balance_usd === null ? "—" : fmtUSD(row.available_balance_usd)} />
