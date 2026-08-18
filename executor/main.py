@@ -92,6 +92,32 @@ class FatalConfigError(Exception):
     """Account config could not be verified — refuse to run trade-capable."""
 
 
+def read_env_order_cap_for_telemetry():
+    """This host's configured LIVE_ORDER_CAP_USD, for REPORTING only.
+
+    live_preflight() deliberately parses the cap only in LIVE_TRADE — it is the
+    mode where the cap is mandatory and where refusing to start on a bad value
+    is correct. Every other mode leaves it None, which is right for enforcement
+    (a mode that cannot place needs no cap) but wrong for telemetry: the
+    dashboard then shows "host ceiling: —" on a host that plainly has one
+    configured, and the operator cannot see the ceiling they would be bounded
+    by until they are already trading.
+
+    So this reads the same variable leniently and independently. It feeds the
+    heartbeat and nothing else — it is never passed to the RiskGuard, the
+    consumer, or any sizing path, so it cannot change what is traded. An
+    unreadable or non-positive value reports None rather than guessing.
+    """
+    raw = os.environ.get(LIVE_ORDER_CAP_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        cap = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        return None
+    return cap if cap > 0 else None
+
+
 def build_reporter():
     """Telemetry reporter, or None when the app API is not configured.
 
@@ -344,6 +370,10 @@ def run_executor(mode: str) -> int:
     # non-None here in every non-OFF mode.
     reporter = build_reporter()
 
+    # Reporting copy of the host cap. Never reaches an enforcement path — the
+    # cap that binds orders is still the one live_preflight() returned.
+    env_order_cap_reported = read_env_order_cap_for_telemetry()
+
     # The mode this cycle actually runs in: env capability AND database request.
     # Starts at OFF so anything that reads it before the first successful config
     # refresh sees the closed position.
@@ -364,7 +394,11 @@ def run_executor(mode: str) -> int:
                 db_execution_mode=consumer.db_execution_mode,
                 auto_execute_enabled=consumer.db_auto_execute_enabled,
                 live_order_cap_usd=consumer.live_order_cap_usd,
-                live_order_cap_env_max=consumer.live_order_cap_ceiling,
+                # Read from the environment directly rather than from the
+                # consumer's ceiling: outside LIVE_TRADE the consumer has no
+                # ceiling (preflight never parses one), and reporting None
+                # there would hide a cap this host really does have configured.
+                live_order_cap_env_max=env_order_cap_reported,
                 orders_enabled=orders_enabled,
                 blocked_reason=block_reason_live,
                 account=account,

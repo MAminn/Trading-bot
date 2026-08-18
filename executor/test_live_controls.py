@@ -284,6 +284,102 @@ def test_config_is_refreshed_every_cycle():
     assert CONFIG_REFRESH_EVERY_CYCLES == 1
 
 
+# --- the idle heartbeat must carry the control state, not nulls ------------ #
+
+def idle_snapshot(env_cap=None):
+    """The snapshot the effective-OFF idle path builds, as main.py builds it."""
+    from executor_status import build_snapshot
+
+    effective = resolve_effective_mode("LIVE_READ", "OFF")
+    reason = placement_block_reason(
+        effective_mode=effective,
+        db_execution_mode="OFF",
+        auto_execute_enabled=False,
+        is_running=False,
+        live_order_cap_usd=Decimal("0"),
+        ack_present=False,
+    )
+    return build_snapshot(
+        mode=effective,
+        env_mode_ceiling="LIVE_READ",
+        db_execution_mode="OFF",
+        auto_execute_enabled=False,
+        live_order_cap_usd=Decimal("0"),
+        live_order_cap_env_max=env_cap,
+        orders_enabled=reason is None,
+        blocked_reason=reason,
+        account=None,
+        positions=None,
+        reconcile=None,
+        keys_present=True,
+        permission_status=None,
+        message=f"idle: effective OFF (env LIVE_READ, database OFF)",
+    )
+
+
+def test_idle_telemetry_reports_the_control_state_rather_than_nulls():
+    """env LIVE_READ + database OFF: the heartbeat must say WHY it is idle.
+
+    The regression this pins: these fields arrived null in production because
+    the ingest route's schema omitted them, so an idle executor looked
+    indistinguishable from one that had never reported a control state."""
+    s = idle_snapshot(env_cap=Decimal("30"))
+    assert s["effective_mode"] == "OFF"
+    assert s["env_mode_ceiling"] == "LIVE_READ"
+    assert s["db_execution_mode"] == "OFF"
+    assert s["auto_execute_enabled"] is False
+    assert s["live_order_cap_usd"] == 0.0
+    assert s["live_order_cap_env_max"] == 30.0
+    assert s["orders_enabled"] is False
+    assert s["blocked_reason"] == "effective_mode=OFF"
+    for field in (
+        "db_execution_mode",
+        "auto_execute_enabled",
+        "live_order_cap_usd",
+        "live_order_cap_env_max",
+        "orders_enabled",
+        "blocked_reason",
+    ):
+        assert s[field] is not None, field
+
+
+def test_idle_telemetry_env_cap_is_none_only_when_the_host_has_none():
+    """None here must mean "this host configured no cap", never "we did not
+    bother to look"."""
+    assert idle_snapshot(env_cap=None)["live_order_cap_env_max"] is None
+
+
+def test_env_cap_telemetry_parse_is_lenient_and_never_guesses(monkeypatch):
+    import main
+
+    for raw, expected in (
+        ("30", Decimal("30")),
+        ("  30  ", Decimal("30")),
+        ("0.5", Decimal("0.5")),
+        ("", None),
+        ("banana", None),
+        ("0", None),
+        ("-5", None),
+    ):
+        monkeypatch.setenv("LIVE_ORDER_CAP_USD", raw)
+        assert main.read_env_order_cap_for_telemetry() == expected, raw
+    monkeypatch.delenv("LIVE_ORDER_CAP_USD", raising=False)
+    assert main.read_env_order_cap_for_telemetry() is None
+
+
+def test_env_cap_telemetry_does_not_reach_the_enforcement_path(monkeypatch):
+    """The reporting parse must not become a second source of the real cap:
+    live_preflight still refuses to supply one outside LIVE_TRADE."""
+    import main
+
+    monkeypatch.setenv("LIVE_ORDER_CAP_USD", "30")
+    monkeypatch.setenv("LIVE_TRADING_ACK", ACK)
+    refusal, enforced_cap = main.live_preflight("LIVE_READ")
+    assert refusal is None
+    assert enforced_cap is None  # unchanged: LIVE_READ enforces no cap
+    assert main.read_env_order_cap_for_telemetry() == Decimal("30")
+
+
 # --- full capital needs both consents -------------------------------------- #
 
 @pytest.mark.parametrize(

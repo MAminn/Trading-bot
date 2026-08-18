@@ -30,7 +30,23 @@ const Body = z.object({
   keys_present: z.boolean().nullable().optional(),
   permission_status: z.enum(["verified_futures", "unknown", "failed"]).nullable().optional(),
   message: z.string().max(500).nullable().optional(),
+  // Live-control telemetry (Phase 3). These MUST be listed here: z.object()
+  // strips unknown keys, so a field the executor sends but this schema omits is
+  // discarded silently — the row simply keeps its old value and nothing errors.
+  // That is exactly how these six arrived as null while effective_mode,
+  // env_mode_ceiling and message (the fields that were listed) came through.
+  db_execution_mode: z.enum(["OFF", "LIVE_READ", "LIVE_TRADE"]).nullable().optional(),
+  auto_execute_enabled: z.boolean().nullable().optional(),
+  live_order_cap_usd: z.number().nullable().optional(),
+  live_order_cap_env_max: z.number().nullable().optional(),
+  orders_enabled: z.boolean().nullable().optional(),
+  blocked_reason: z.string().max(200).nullable().optional(),
 });
+
+// Every telemetry key the executor sends. Kept beside the schema so the drift
+// that caused the Phase 3 null columns is a test failure rather than silent
+// data loss. Asserted against Body's own key list below.
+export const EXECUTOR_STATUS_FIELDS = Object.keys(Body.shape).filter((k) => k !== "user_id");
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
