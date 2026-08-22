@@ -178,7 +178,14 @@ function Configure() {
               </p>
             </div>
 
+            {/* A sizing input, not a balance. Nothing here moves money or
+                reflects a wallet: it is the number the strategy sizes against,
+                and it is capped independently by the live order cap. */}
             <Field label="Account size (USD)" value={accountSize} onChange={setAccountSize} type="number" />
+            <p className="-mt-2 text-xs text-muted-foreground">
+              Used to size orders. This is not your Binance balance — your real wallet
+              balance is read from Binance and shown on the Dashboard and Engine pages.
+            </p>
 
             <div className="grid gap-6 md:grid-cols-2">
               <div>

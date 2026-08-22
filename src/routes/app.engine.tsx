@@ -435,8 +435,16 @@ function ExecutorCard({
 
       <div className="mt-5 grid gap-4 md:grid-cols-2">
         <KV k="Env ceiling" v={row.env_mode_ceiling ?? "—"} />
-        <KV k="Wallet balance" v={row.wallet_balance_usd === null ? "—" : fmtUSD(row.wallet_balance_usd)} />
-        <KV k="Available balance" v={row.available_balance_usd === null ? "—" : fmtUSD(row.available_balance_usd)} />
+        <KV
+          k="Wallet balance (Binance)"
+          v={row.wallet_balance_usd === null ? "not read yet" : fmtUSD(row.wallet_balance_usd)}
+          tone={row.wallet_balance_usd === null ? "warn" : undefined}
+        />
+        <KV
+          k="Available balance (Binance)"
+          v={row.available_balance_usd === null ? "not read yet" : fmtUSD(row.available_balance_usd)}
+          tone={row.available_balance_usd === null ? "warn" : undefined}
+        />
         <KV k="Binance position" v={row.position_side ?? "—"} tone={row.position_side && row.position_side !== "FLAT" ? "warn" : undefined} />
         <KV k="Position size" v={num(row.position_amt)} />
         <KV k="Entry price" v={row.entry_price === null || row.entry_price === 0 ? "—" : fmtUSD(row.entry_price)} />

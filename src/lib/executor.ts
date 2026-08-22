@@ -137,6 +137,15 @@ export function useExecutorStatus() {
   });
 }
 
+// ----- Wallet balance vs strategy baseline -----
+//
+// The rule deciding whether a figure may be shown to a client as their money
+// lives in wallet-display.ts, which imports nothing — so it can be tested
+// directly, without a Supabase client. Re-exported here because the UI reads
+// everything executor-related from this module.
+export { resolveWalletDisplay, WALLET_FRESH_MS } from "./wallet-display.ts";
+export type { WalletDisplay } from "./wallet-display.ts";
+
 // ----- Mode semantics -----
 
 /** Modes that touch mainnet with real funds. */

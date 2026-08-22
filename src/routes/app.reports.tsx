@@ -107,7 +107,7 @@ function Reports() {
         <div>
           <div className="text-xs uppercase tracking-[0.2em] text-primary">Performance</div>
           <h1 className="mt-2 font-display text-3xl font-semibold">Reports</h1>
-          <p className="mt-1 text-sm text-muted-foreground">{range.toUpperCase()} · {metrics.totalTrades} closed trades · {fmtUSD(capital)} base</p>
+          <p className="mt-1 text-sm text-muted-foreground">{range.toUpperCase()} · {metrics.totalTrades} closed trades · {fmtUSD(capital)} model baseline</p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2 print:hidden">
@@ -146,7 +146,12 @@ function Reports() {
         <>
           <div className="grid gap-6 lg:grid-cols-3">
             <div className="card-elevated p-6 lg:col-span-2">
-              <div className="mb-3 text-sm font-medium">Equity curve</div>
+              <div className="mb-3 text-sm font-medium">
+                Strategy equity curve
+                <span className="ml-2 text-xs font-normal text-muted-foreground">
+                  model baseline — not your wallet
+                </span>
+              </div>
               <ResponsiveContainer width="100%" height={280}>
                 <AreaChart data={equitySeries}>
                   <defs>

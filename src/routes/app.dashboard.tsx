@@ -10,6 +10,7 @@ import {
   AlertTriangle,
   Cpu,
   Inbox,
+  Wallet,
 } from "lucide-react";
 import { Sparkline } from "@/components/Sparkline";
 
@@ -39,6 +40,7 @@ import {
 } from "@/lib/engine";
 import {
   useExecutorStatus, executionModeLabel, executorFresh, executorTone, canPlaceOrders,
+  resolveWalletDisplay,
 } from "@/lib/executor";
 import { useLivePrice } from "@/lib/live-price";
 import { toast } from "sonner";
@@ -70,9 +72,16 @@ function Dashboard() {
   const execTone = executorTone(executor.data);
   const execFresh = executorFresh(executor.data);
   const execCanTrade = canPlaceOrders(executor.data?.effective_mode);
+  // The strategy's model baseline. Used for sizing and for the simulated equity
+  // curve — NEVER presented as the client's funds. For a new user this is the
+  // 10,000 default of a config column and has no relationship to any wallet.
   const capital = Number(config.data?.capital_usd ?? 10000);
   const metrics = computeMetrics(trades.data ?? [], capital);
-  const equity = capital + metrics.netPnl;
+  const baselineEquity = capital + metrics.netPnl;
+
+  // The client's actual money, and only when a signed read of THEIR Binance
+  // account produced it.
+  const wallet = resolveWalletDisplay(executor.data);
 
   const today = new Date().toDateString();
   const todayPnl = (trades.data ?? [])
@@ -273,17 +282,33 @@ function Dashboard() {
       )}
 
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+        {/* Wallet, not "Equity". This tile used to render capital_usd plus
+            strategy P&L under the label "Equity" — for a new user, the 10,000
+            default of a config column presented as money in their account.
+            A number appears here only when it came from a signed read of their
+            own Binance wallet. */}
         <BigStat
-          label="Equity"
-          value={fmtUSD(equity)}
-          delta={fmtPct((metrics.netPnl / capital) * 100, true)}
-          up={metrics.netPnl >= 0}
-          icon={<Activity className="h-4 w-4" />}
+          label="Wallet balance"
+          value={
+            wallet.state === "connected" ? fmtUSD(wallet.walletUsd) :
+            wallet.state === "awaiting_read" ? "—" :
+            "Not connected"
+          }
+          delta={
+            wallet.state === "connected"
+              ? (wallet.stale ? "Binance · reading is stale" : "Binance · live")
+              : wallet.state === "awaiting_read"
+                ? "waiting for the first live read"
+                : "connect Binance to see your balance"
+          }
+          up={wallet.state === "connected" && !wallet.stale}
+          muted={wallet.state !== "connected"}
+          icon={<Wallet className="h-4 w-4" />}
         />
         <BigStat
           label="Today P&L"
           value={fmtUSD(todayPnl, true)}
-          delta="closed today"
+          delta="strategy · closed today"
           up={todayPnl >= 0}
           icon={
             todayPnl >= 0 ? (
@@ -314,12 +339,19 @@ function Dashboard() {
           <div className="flex items-center justify-between">
             <div>
               <div className="text-xs uppercase tracking-widest text-muted-foreground">
-                Equity curve
+                Strategy equity curve
               </div>
-              <div className="mt-1 font-display text-2xl font-semibold">{fmtUSD(equity)}</div>
+              <div className="mt-1 font-display text-2xl font-semibold">
+                {fmtUSD(baselineEquity)}
+              </div>
+              {/* Said plainly and next to the number, because a currency figure
+                  on a trading dashboard is read as money by default. */}
+              <div className="mt-1 text-xs text-muted-foreground">
+                Model baseline — not your wallet
+              </div>
             </div>
             <span className="text-xs text-muted-foreground">
-              starting {fmtUSD(capital)} · {metrics.equityCurve.length} closed trades
+              baseline {fmtUSD(capital)} · {metrics.equityCurve.length} closed trades
             </span>
           </div>
           <div className="mt-4">
