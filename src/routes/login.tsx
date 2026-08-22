@@ -1,10 +1,9 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { ArrowRight, Mail } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { LogoMark } from "@/components/Logo";
 import { supabase } from "@/integrations/supabase/client";
-import { lovable } from "@/integrations/lovable";
 
 export const Route = createFileRoute("/login")({
   head: () => ({
@@ -55,20 +54,6 @@ function Login() {
     }
   }
 
-  async function handleGoogle() {
-    setLoading(true);
-    const result = await lovable.auth.signInWithOAuth("google", {
-      redirect_uri: window.location.origin,
-    });
-    if (result.error) {
-      toast.error(result.error.message || "Google sign-in failed");
-      setLoading(false);
-      return;
-    }
-    if (result.redirected) return;
-    navigate({ to: "/app/dashboard" });
-  }
-
   return (
     <div className="relative grid min-h-screen lg:grid-cols-2">
       <div className="pointer-events-none absolute inset-0 bg-aurora opacity-80" aria-hidden />
@@ -76,7 +61,9 @@ function Login() {
 
       {/* Left: form */}
       <div className="relative z-10 flex flex-col px-8 py-10 md:px-16">
-        <Link to="/"><LogoMark /></Link>
+        <Link to="/">
+          <LogoMark />
+        </Link>
         <div className="mx-auto flex w-full max-w-sm flex-1 flex-col justify-center">
           <h1 className="font-display text-4xl font-semibold tracking-tight">
             {mode === "signin" ? "Welcome back." : "Create your account."}
@@ -113,20 +100,22 @@ function Login() {
             </button>
           </form>
 
-          <div className="my-6 flex items-center gap-3 text-xs text-muted-foreground">
-            <div className="h-px flex-1 bg-border" /> or <div className="h-px flex-1 bg-border" />
-          </div>
-
-          <div className="grid grid-cols-1 gap-3">
-            <button
-              type="button"
-              onClick={handleGoogle}
-              disabled={loading}
-              className="inline-flex items-center justify-center gap-2 rounded-lg border border-border bg-card/40 px-3 py-2 text-sm hover:bg-card/70 disabled:opacity-60"
-            >
-              <Mail className="h-4 w-4" /> Continue with Google
-            </button>
-          </div>
+          {/* Google OAuth is DISABLED on this self-hosted VPS deployment.
+           *
+           * The button here called lovable.auth.signInWithOAuth("google"), which
+           * redirects to /~oauth/initiate — a route that only exists on
+           * Lovable-hosted infrastructure. On our own VPS it 404s, so the button
+           * could never do anything but fail.
+           *
+           * To re-enable, do NOT restore this button: configure the Google
+           * provider in Supabase Auth (dashboard -> Authentication -> Providers,
+           * plus the redirect URL for this domain) and then call
+           * supabase.auth.signInWithOAuth({ provider: "google" }) directly.
+           * That path is self-hosted and needs no Lovable route.
+           *
+           * The email/password form above is unaffected and is the only
+           * sign-in method offered until then.
+           */}
 
           <p className="mt-8 text-center text-sm text-muted-foreground">
             {mode === "signin" ? (
@@ -154,7 +143,9 @@ function Login() {
         <div className="absolute inset-0 bg-grid opacity-60" aria-hidden />
         <div className="relative flex h-full flex-col items-center justify-center gap-6 p-12">
           <div className="card-elevated w-full max-w-md p-6">
-            <div className="text-xs uppercase tracking-widest text-muted-foreground">Live engine</div>
+            <div className="text-xs uppercase tracking-widest text-muted-foreground">
+              Live engine
+            </div>
             <div className="mt-1 font-display text-3xl font-semibold">ETHUSDT · v4.2</div>
             <div className="mt-6 grid grid-cols-3 gap-3">
               {[
@@ -173,7 +164,8 @@ function Login() {
             </div>
           </div>
           <p className="max-w-md text-center text-sm text-muted-foreground">
-            "It's the first dashboard that feels like it was built by traders, not by a backend team."
+            "It's the first dashboard that feels like it was built by traders, not by a backend
+            team."
           </p>
         </div>
       </div>
