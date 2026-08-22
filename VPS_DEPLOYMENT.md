@@ -108,14 +108,26 @@ EXECUTION_MODE=LIVE_READ            # or LIVE_TRADE
 APP_API_BASE=https://YOUR_DOMAIN_OR_SERVER_IP
 ENGINE_SERVICE_TOKEN=same_value_as_frontend
 ENGINE_CREDENTIALS_TOKEN=same_value_as_frontend_and_different_from_the_above
-ENGINE_USER_ID=the_client_supabase_user_uuid
+ENGINE_USER_ID=                     # EMPTY = multi-tenant. See below.
 
 BINANCE_LIVE_API_KEY=               # legacy — leave EMPTY, see below
 BINANCE_LIVE_API_SECRET=            # legacy — leave EMPTY, see below
 ```
 
-`ENGINE_USER_ID` selects whose keys sign. One executor process serves one
-client; a second client needs a second process with its own `ENGINE_USER_ID`.
+### Worker: leave ENGINE_USER_ID empty too
+
+The ML signal worker runs ONE frozen ETHUSDT strategy, so a signal is a property
+of the market, not of a client. With `ENGINE_USER_ID` empty the worker posts each
+signal, trade and heartbeat once with no user id, and the app fans it out to
+every running client — which is what lets a client who signed up minutes ago
+start receiving the stream. Setting it pins the worker to one client, as before.
+
+Do **not** run one worker per client: they would recompute identical signals.
+
+`ENGINE_USER_ID` is **optional and normally left empty**. Empty means
+multi-tenant: the executor polls `/api/public/engine/users/active` and runs an
+isolated session per client, so onboarding needs no operator action. Setting it
+pins the process to one client (used for smoke tests).
 
 > **Legacy server-wide live keys.** `BINANCE_LIVE_API_KEY` and
 > `BINANCE_LIVE_API_SECRET` are no longer read by any live code path — they are

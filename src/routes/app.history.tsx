@@ -4,6 +4,10 @@ import { Download, Inbox } from "lucide-react";
 import { useTrades, useEngineConfig, useEngineStatus, fmtUSD, fmtPct, liveState, tradePnlUsd, type TradeRow } from "@/lib/engine";
 import { SignalStatusBadge } from "@/components/SignalStatusBadge";
 import { SignalTimelinePanel } from "@/components/SignalTimelinePanel";
+import {
+  useEngineOrders, ORDER_STATUS_LABEL, ORDER_REACHED_EXCHANGE, ORDER_FILLED,
+  type EngineOrderRow,
+} from "@/lib/executor";
 
 export const Route = createFileRoute("/app/history")({
   head: () => ({ meta: [{ title: "Trade History — Helix" }] }),
@@ -27,6 +31,7 @@ function History() {
   const cfg = useEngineConfig();
   const capital = Number(cfg.data?.capital_usd ?? 10000);
   const trades = useTrades(500);
+  const orders = useEngineOrders(200);
   const [filter, setFilter] = useState<Filter>("All");
   const [timelineId, setTimelineId] = useState<string | null>(null);
 
@@ -66,7 +71,9 @@ function History() {
         <div>
           <div className="text-xs uppercase tracking-[0.2em] text-primary">History</div>
           <h1 className="mt-2 font-display text-3xl font-semibold">Closed trades</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Every closed cycle from the engine — your full audit trail.</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            What the <strong>strategy</strong> did. Real Binance orders are listed separately below.
+          </p>
         </div>
         <button onClick={exportCsv} disabled={!trades.data?.length}
           className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary to-accent px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-50">
@@ -146,9 +153,122 @@ function History() {
         )}
       </div>
 
+      <ExchangeOrders rows={orders.data ?? []} loading={orders.isLoading} />
+
       {timelineId && (
         <SignalTimelinePanel tradeId={timelineId} onClose={() => setTimelineId(null)} />
       )}
+    </div>
+  );
+}
+
+/** The exchange layer of the history.
+ *
+ *  Kept as its own table rather than merged into the closed-trades list above,
+ *  because these are three different facts and a client must be able to tell
+ *  them apart:
+ *
+ *    1. the strategy opened/closed a position  -> the table above (user_trades)
+ *    2. an order was SENT to Binance           -> here, status SENT
+ *    3. the order FILLED, moving real money    -> here, status FILLED
+ *
+ *  A strategy trade with no matching filled order made no money and cost none.
+ *  Presenting the two as one list is how a client comes to believe a paper
+ *  result was a real one.
+ */
+function ExchangeOrders({ rows, loading }: { rows: EngineOrderRow[]; loading: boolean }) {
+  const reached = rows.filter((r) => (ORDER_REACHED_EXCHANGE as readonly string[]).includes(r.status)).length;
+  const filled = rows.filter((r) => (ORDER_FILLED as readonly string[]).includes(r.status)).length;
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h2 className="font-display text-2xl font-semibold">Binance orders</h2>
+        <p className="mt-1 text-sm text-muted-foreground">
+          What the <strong>executor</strong> actually sent to your Binance account. An entry
+          here with no <span className="font-mono">Filled</span> status never moved money.
+        </p>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-3">
+        <Tile label="Order records" value={`${rows.length}`} />
+        <Tile label="Sent to Binance" value={`${reached}`} />
+        <Tile label="Filled" value={`${filled}`} tone={filled > 0 ? "success" : undefined} />
+      </div>
+
+      <div className="card-elevated overflow-hidden p-0">
+        {rows.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-card/60 text-left text-xs uppercase tracking-wider text-muted-foreground">
+                <tr>
+                  <th className="px-4 py-3">When</th>
+                  <th className="px-4 py-3">Intent</th>
+                  <th className="px-4 py-3">Side</th>
+                  <th className="px-4 py-3 text-right">Qty</th>
+                  <th className="px-4 py-3 text-right">Notional</th>
+                  <th className="px-4 py-3">Mode</th>
+                  <th className="px-4 py-3">Outcome</th>
+                  <th className="px-4 py-3">Binance ID</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => {
+                  const didFill = (ORDER_FILLED as readonly string[]).includes(r.status);
+                  const failed = r.status === "FAILED";
+                  return (
+                    <tr key={r.id} className="border-t border-border/60">
+                      <td className="px-4 py-3 text-xs text-muted-foreground">
+                        {new Date(r.created_at).toLocaleString()}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-xs">{r.intent}</td>
+                      <td className="px-4 py-3 font-mono text-xs">{r.side}</td>
+                      <td className="px-4 py-3 text-right font-mono text-xs">{r.qty ?? "—"}</td>
+                      <td className="px-4 py-3 text-right font-mono text-xs">
+                        {r.notional_usd === null ? "—" : fmtUSD(Number(r.notional_usd))}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-xs">{r.execution_mode ?? "—"}</td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={
+                            "rounded-full px-2 py-0.5 text-xs " +
+                            (didFill
+                              ? "bg-success/15 text-success"
+                              : failed
+                                ? "bg-destructive/15 text-destructive"
+                                : "bg-muted text-muted-foreground")
+                          }
+                        >
+                          {ORDER_STATUS_LABEL[r.status] ?? r.status}
+                        </span>
+                        {r.error && (
+                          <div className="mt-1 max-w-xs truncate text-xs text-destructive" title={r.error}>
+                            {r.error}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-xs text-muted-foreground">
+                        {r.binance_order_id ?? "—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-3 p-10 text-center">
+            <Inbox className="h-6 w-6 text-muted-foreground" />
+            <div className="text-sm font-medium">
+              {loading ? "Loading orders…" : "No Binance orders yet"}
+            </div>
+            <p className="max-w-md text-xs text-muted-foreground">
+              Orders appear here once the executor is in a live trading mode with your
+              Binance keys connected and auto-execute enabled.
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -138,8 +138,13 @@ def utc_now_z() -> str:
 class StatusReporter:
     """POSTs telemetry to the app. Every failure is contained here."""
 
-    def __init__(self, app_api_base: str, engine_service_token: str, user_id: str):
+    def __init__(
+        self, app_api_base: str, engine_service_token: str, user_id: str | None = None
+    ):
         self._url = f"{app_api_base.rstrip('/')}{INGEST_PATH}"
+        # The default recipient, for a single-user executor. A multi-tenant loop
+        # leaves this None and names the user on every report() instead, so one
+        # reporter can serve many sessions without ever holding a user's state.
         self._user_id = user_id
         self._session = requests.Session()
         self._session.headers.update(
@@ -147,10 +152,22 @@ class StatusReporter:
         )
         self._failures = 0
 
-    def report(self, snapshot: dict) -> bool:
+    def report(self, snapshot: dict, user_id: str | None = None) -> bool:
         """Send one snapshot. Returns True on success. Never raises: telemetry
-        is not permitted to fail a trading cycle."""
-        payload = {"user_id": self._user_id, **snapshot}
+        is not permitted to fail a trading cycle.
+
+        `user_id` names the user this snapshot describes. It is required when
+        the reporter was constructed without a default — a multi-tenant loop
+        shares one reporter across sessions, and a snapshot posted to the wrong
+        user would show one client another client's balance and position.
+        """
+        target = user_id or self._user_id
+        if not target:
+            # Refusing is the only safe option: there is no correct user to
+            # attribute this snapshot to, and guessing would misattribute it.
+            self._note_failure("no user_id for snapshot")
+            return False
+        payload = {"user_id": target, **snapshot}
         try:
             resp = self._session.post(
                 self._url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS

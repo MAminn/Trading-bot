@@ -31,8 +31,10 @@ executor ──► GET /api/public/engine/credentials?user_id=…
          └─► BinanceFuturesClient(LIVE_BASE_URL, api_key, api_secret)
 ```
 
-`ENGINE_USER_ID` selects whose keys sign. One executor process serves one
-client.
+`ENGINE_USER_ID` is optional. Left empty (the production setting) the executor
+runs a session per active client, each fetching its own user id's keys. Set, it
+pins the process to one client. Either way a session can only ever fetch the
+keys of the user it was constructed for — see ONBOARDING_ARCHITECTURE.md.
 
 ### Where decryption happens
 

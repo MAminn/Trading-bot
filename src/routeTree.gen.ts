@@ -26,6 +26,7 @@ import { Route as ApiPublicEngineEthPriceRouteImport } from './routes/api/public
 import { Route as ApiPublicEngineDemoTickRouteImport } from './routes/api/public/engine/demo-tick'
 import { Route as ApiPublicEngineCredentialsRouteImport } from './routes/api/public/engine/credentials'
 import { Route as ApiPublicEngineConfigRouteImport } from './routes/api/public/engine/config'
+import { Route as ApiPublicEngineUsersActiveRouteImport } from './routes/api/public/engine/users.active'
 import { Route as ApiPublicEngineSignalsPendingRouteImport } from './routes/api/public/engine/signals.pending'
 import { Route as ApiPublicEngineOrdersStateRouteImport } from './routes/api/public/engine/orders.state'
 import { Route as ApiPublicEngineIngestTradeRouteImport } from './routes/api/public/engine/ingest.trade'
@@ -122,6 +123,12 @@ const ApiPublicEngineConfigRoute = ApiPublicEngineConfigRouteImport.update({
   path: '/api/public/engine/config',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiPublicEngineUsersActiveRoute =
+  ApiPublicEngineUsersActiveRouteImport.update({
+    id: '/api/public/engine/users/active',
+    path: '/api/public/engine/users/active',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiPublicEngineSignalsPendingRoute =
   ApiPublicEngineSignalsPendingRouteImport.update({
     id: '/api/public/engine/signals/pending',
@@ -197,6 +204,7 @@ export interface FileRoutesByFullPath {
   '/api/public/engine/ingest/trade': typeof ApiPublicEngineIngestTradeRoute
   '/api/public/engine/orders/state': typeof ApiPublicEngineOrdersStateRoute
   '/api/public/engine/signals/pending': typeof ApiPublicEngineSignalsPendingRoute
+  '/api/public/engine/users/active': typeof ApiPublicEngineUsersActiveRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
@@ -223,6 +231,7 @@ export interface FileRoutesByTo {
   '/api/public/engine/ingest/trade': typeof ApiPublicEngineIngestTradeRoute
   '/api/public/engine/orders/state': typeof ApiPublicEngineOrdersStateRoute
   '/api/public/engine/signals/pending': typeof ApiPublicEngineSignalsPendingRoute
+  '/api/public/engine/users/active': typeof ApiPublicEngineUsersActiveRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -251,6 +260,7 @@ export interface FileRoutesById {
   '/api/public/engine/ingest/trade': typeof ApiPublicEngineIngestTradeRoute
   '/api/public/engine/orders/state': typeof ApiPublicEngineOrdersStateRoute
   '/api/public/engine/signals/pending': typeof ApiPublicEngineSignalsPendingRoute
+  '/api/public/engine/users/active': typeof ApiPublicEngineUsersActiveRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -280,6 +290,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/ingest/trade'
     | '/api/public/engine/orders/state'
     | '/api/public/engine/signals/pending'
+    | '/api/public/engine/users/active'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
@@ -306,6 +317,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/ingest/trade'
     | '/api/public/engine/orders/state'
     | '/api/public/engine/signals/pending'
+    | '/api/public/engine/users/active'
   id:
     | '__root__'
     | '/'
@@ -333,6 +345,7 @@ export interface FileRouteTypes {
     | '/api/public/engine/ingest/trade'
     | '/api/public/engine/orders/state'
     | '/api/public/engine/signals/pending'
+    | '/api/public/engine/users/active'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -352,6 +365,7 @@ export interface RootRouteChildren {
   ApiPublicEngineIngestTradeRoute: typeof ApiPublicEngineIngestTradeRoute
   ApiPublicEngineOrdersStateRoute: typeof ApiPublicEngineOrdersStateRoute
   ApiPublicEngineSignalsPendingRoute: typeof ApiPublicEngineSignalsPendingRoute
+  ApiPublicEngineUsersActiveRoute: typeof ApiPublicEngineUsersActiveRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -475,6 +489,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiPublicEngineConfigRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/public/engine/users/active': {
+      id: '/api/public/engine/users/active'
+      path: '/api/public/engine/users/active'
+      fullPath: '/api/public/engine/users/active'
+      preLoaderRoute: typeof ApiPublicEngineUsersActiveRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/public/engine/signals/pending': {
       id: '/api/public/engine/signals/pending'
       path: '/api/public/engine/signals/pending'
@@ -580,6 +601,7 @@ const rootRouteChildren: RootRouteChildren = {
   ApiPublicEngineIngestTradeRoute: ApiPublicEngineIngestTradeRoute,
   ApiPublicEngineOrdersStateRoute: ApiPublicEngineOrdersStateRoute,
   ApiPublicEngineSignalsPendingRoute: ApiPublicEngineSignalsPendingRoute,
+  ApiPublicEngineUsersActiveRoute: ApiPublicEngineUsersActiveRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

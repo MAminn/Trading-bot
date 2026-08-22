@@ -41,11 +41,19 @@ _heartbeat_started = False
 
 
 def _post(path: str, payload: Dict[str, Any]) -> None:
-    if not API_BASE or not SERVICE_TOKEN or not USER_ID:
-        log.debug("[ingest] skipped: missing API_BASE/TOKEN/USER_ID")
+    # ENGINE_USER_ID is OPTIONAL now. Set, it pins every post to one client,
+    # exactly as before. Unset, the post carries no user_id and the app fans it
+    # out to every running client — which is what lets a client who signed up
+    # minutes ago start receiving this stream with no operator action.
+    #
+    # One worker, one strategy: live_code.py computes the same ETHUSDT signal
+    # for everyone, so a worker per client would only recompute identical output.
+    if not API_BASE or not SERVICE_TOKEN:
+        log.debug("[ingest] skipped: missing API_BASE/TOKEN")
         return
     url = f"{API_BASE}{path}"
-    payload = {**payload, "user_id": USER_ID}
+    if USER_ID:
+        payload = {**payload, "user_id": USER_ID}
     try:
         r = _session.post(
             url,
@@ -188,4 +196,8 @@ def attach_ingester(live_code_module) -> None:
 
     live_code_module.append_csv_row = patched
     _start_heartbeat()
-    log.info("[ingest] attached. base=%s user=%s", API_BASE or "(none)", USER_ID or "(none)")
+    log.info(
+        "[ingest] attached. base=%s user=%s",
+        API_BASE or "(none)",
+        USER_ID or "(broadcast: every running client)",
+    )

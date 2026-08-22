@@ -43,6 +43,8 @@ ENV_LIVE_SECRET = "ENVLIVESECRET_ffffffffffffffffffffffffffff"
 
 SECRET_STRINGS = (USER_KEY, USER_SECRET, ROTATED_KEY, ROTATED_SECRET)
 
+PINNED_USER = "11111111-2222-3333-4444-555555555555"
+
 
 class LoopBreak(BaseException):
     """Ends run_executor's infinite loop from inside time.sleep.
@@ -145,12 +147,27 @@ class FakeConsumer:
         raise AssertionError("smoke test must not run here")
 
 
+class FakeRiskGuard:
+    """Real caps are exercised in test_risk_guard.py; here it only has to exist."""
+
+    def __init__(self, *a, **kw):
+        self.limits = kw
+
+    def update_limits(self, **kw):
+        self.limits.update(kw)
+
+
 class FakeReporter:
     def __init__(self):
         self.snapshots: list = []
+        # Who each snapshot was attributed to. In a multi-tenant loop one
+        # reporter serves every session, so misattribution would show a client
+        # someone else's balance — the pairing is worth recording.
+        self.addressed: list = []
 
-    def report(self, snapshot):
+    def report(self, snapshot, user_id=None):
         self.snapshots.append(snapshot)
+        self.addressed.append(user_id)
         return True
 
 
@@ -194,13 +211,16 @@ def harness(monkeypatch):
     monkeypatch.setattr("binance_client.BinanceFuturesClient", FakeBinanceClient)
     monkeypatch.setattr("binance_client.ReadOnlyFuturesClient", FakeBinanceClient)
     monkeypatch.setattr("signal_consumer.SignalConsumer", FakeConsumer)
-    monkeypatch.setattr(main, "build_reporter", lambda: reporter)
+    monkeypatch.setattr("risk_guard.RiskGuard", FakeRiskGuard)
+    monkeypatch.setattr(main, "build_reporter", lambda **kwargs: reporter)
 
     # The env every non-OFF mode validates before it does anything else.
     monkeypatch.setenv("APP_API_BASE", "https://app.example.test")
     monkeypatch.setenv("ENGINE_SERVICE_TOKEN", "service-token")
     monkeypatch.setenv("ENGINE_CREDENTIALS_TOKEN", "credentials-token")
-    monkeypatch.setenv("ENGINE_USER_ID", "11111111-2222-3333-4444-555555555555")
+    # Pinned: every test in this file is about ONE user's credentials. The
+    # multi-tenant loop has its own suite.
+    monkeypatch.setenv("ENGINE_USER_ID", PINNED_USER)
     monkeypatch.setenv("LIVE_TRADING_ACK", "I_UNDERSTAND_REAL_MONEY")
     monkeypatch.setenv("LIVE_ORDER_CAP_USD", "25")
     monkeypatch.setenv("BINANCE_TESTNET_API_KEY", "testnet-key")
@@ -502,6 +522,14 @@ def test_credentials_repr_never_exposes_the_pair():
     result = CredentialsResult(credentials=creds)
     assert USER_SECRET not in repr(result)
     assert USER_SECRET not in str(result)
+
+
+def test_every_snapshot_names_the_user_it_describes(harness):
+    reporter = harness("LIVE_TRADE", FakeCredentialsClient(present()))
+    assert reporter.addressed, "no snapshot was reported"
+    # A snapshot posted without a user, or with the wrong one, would show a
+    # client another client's balance and position.
+    assert all(u == PINNED_USER for u in reporter.addressed)
 
 
 def test_blocked_result_repr_is_safe():

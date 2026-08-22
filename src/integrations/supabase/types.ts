@@ -171,6 +171,60 @@ export type Database = {
         }
         Relationships: []
       }
+      engine_orders: {
+        Row: {
+          binance_order_id: string | null
+          created_at: string
+          error: string | null
+          execution_mode: string
+          id: string
+          idempotency_key: string
+          intent: string
+          notional_usd: number | null
+          qty: number
+          ref_price: number | null
+          side: string
+          signal_bar_time: string
+          status: string
+          symbol: string
+          user_id: string
+        }
+        Insert: {
+          binance_order_id?: string | null
+          created_at?: string
+          error?: string | null
+          execution_mode: string
+          id?: string
+          idempotency_key: string
+          intent: string
+          notional_usd?: number | null
+          qty: number
+          ref_price?: number | null
+          side: string
+          signal_bar_time: string
+          status?: string
+          symbol?: string
+          user_id: string
+        }
+        Update: {
+          binance_order_id?: string | null
+          created_at?: string
+          error?: string | null
+          execution_mode?: string
+          id?: string
+          idempotency_key?: string
+          intent?: string
+          notional_usd?: number | null
+          qty?: number
+          ref_price?: number | null
+          side?: string
+          signal_bar_time?: string
+          status?: string
+          symbol?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
       engine_status: {
         Row: {
           created_at: string

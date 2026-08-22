@@ -57,6 +57,72 @@ export interface ExecutorStatusRow {
   updated_at: string | null;
 }
 
+/** One row of engine_orders: what the EXECUTOR did about a strategy signal.
+ *
+ *  Distinct from user_trades, which is what the STRATEGY did. The two are
+ *  deliberately never merged: a strategy signal that was never sent to Binance,
+ *  an order that was sent and rejected, and an order that filled are three
+ *  different facts, and collapsing them is how a client comes to believe a
+ *  paper result was a real one.
+ */
+export interface EngineOrderRow {
+  id: string;
+  signal_bar_time: string;
+  symbol: string | null;
+  side: "LONG" | "SHORT";
+  intent: "OPEN" | "CLOSE";
+  qty: number | null;
+  ref_price: number | null;
+  notional_usd: number | null;
+  execution_mode: string | null;
+  /** INTENT_LOGGED | DRYRUN | SENT | FILLED | FAILED | SKIPPED */
+  status: string;
+  binance_order_id: string | null;
+  error: string | null;
+  created_at: string;
+}
+
+/** Which order states mean an order actually reached Binance. */
+export const ORDER_REACHED_EXCHANGE = ["SENT", "FILLED"] as const;
+
+/** Which order states mean real money actually moved. */
+export const ORDER_FILLED = ["FILLED"] as const;
+
+/**
+ * Plain-language meaning of each engine_orders.status.
+ *
+ * Written for a client reading their own history, not for an operator: the
+ * distinction that matters to them is "did this actually happen on my Binance
+ * account", and every label answers that first.
+ */
+export const ORDER_STATUS_LABEL: Record<string, string> = {
+  INTENT_LOGGED: "Not sent — recorded only",
+  DRYRUN: "Not sent — dry run",
+  SKIPPED: "Not sent — blocked",
+  SENT: "Sent to Binance",
+  FILLED: "Filled on Binance",
+  FAILED: "Rejected by Binance",
+};
+
+export function useEngineOrders(limit = 200) {
+  return useQuery({
+    queryKey: ["engine", "orders", limit],
+    queryFn: async () => {
+      // RLS scopes this to the signed-in user; one client can never read
+      // another's orders even though the executor writes everyone's.
+      const { data, error } = await supabase
+        .from("engine_orders")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(limit);
+      // The table may not exist yet on an app deployed ahead of its migration.
+      if (error) return [] as EngineOrderRow[];
+      return (data ?? []) as unknown as EngineOrderRow[];
+    },
+    refetchInterval: POLL,
+  });
+}
+
 export function useExecutorStatus() {
   return useQuery({
     queryKey: EXECUTOR_STATUS_KEY,
