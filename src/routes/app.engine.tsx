@@ -12,6 +12,8 @@ import {
   useExecutorStatus, executorFresh, executorTone, canPlaceOrders, isLiveMode,
   MODE_LABEL, PERMISSION_LABEL, type ExecutorStatusRow,
 } from "@/lib/executor";
+import { getBinanceKeyInfo } from "@/lib/binance.functions";
+import { useServerFn } from "@tanstack/react-start";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "sonner";
 
@@ -31,6 +33,24 @@ function useUserId() {
   });
 }
 
+/** The connected key's last 4 characters, for display.
+ *
+ *  Deliberately routed through getBinanceKeyInfo rather than through the
+ *  executor's telemetry: that function is RLS-scoped to the signed-in user and
+ *  returns last4 plus timestamps, so this page cannot render a secret even if a
+ *  later change tried to. The plaintext key never exists in the browser at all
+ *  — the one place it is decrypted is the executor's credentials endpoint,
+ *  server-side, and that response never reaches a page.
+ */
+function useBinanceKeyInfo() {
+  const fetchInfo = useServerFn(getBinanceKeyInfo);
+  return useQuery({
+    queryKey: ["binance", "key-info"],
+    queryFn: () => fetchInfo(),
+    staleTime: 60_000,
+  });
+}
+
 function EnginePage() {
   const status = useEngineStatus();
   const config = useEngineConfig();
@@ -38,6 +58,7 @@ function EnginePage() {
   const setRunning = useSetRunning();
   const updateConfig = useUpdateConfig();
   const { data: userId } = useUserId();
+  const keyInfo = useBinanceKeyInfo();
   const state = liveState(status.data, !!config.data?.is_running);
   const isRunning = !!config.data?.is_running;
   const demoMode = !!config.data?.demo_mode;
@@ -101,6 +122,7 @@ function EnginePage() {
         row={executor.data}
         loading={executor.isLoading}
         requested={config.data?.execution_mode}
+        keyLast4={keyInfo.data?.api_key_last4 ?? null}
       />
 
       {/* ML signal worker status — the strategy's own view, NOT the exchange's */}
@@ -218,12 +240,17 @@ function ExecutorCard({
   row,
   loading,
   requested,
+  keyLast4,
 }: {
   row: ExecutorStatusRow | null | undefined;
   loading: boolean;
   /** What the database has been asked for. The executor does not read this
    *  yet, so a difference from effective_mode is expected, not an alarm. */
   requested: string | null | undefined;
+  /** Last 4 characters of the connected Binance API key. Never the key itself
+   *  and never the secret — this is the only key-derived value the browser is
+   *  ever given. */
+  keyLast4: string | null;
 }) {
   const fresh = executorFresh(row);
   const tone = executorTone(row);
@@ -415,6 +442,11 @@ function ExecutorCard({
         <KV k="Entry price" v={row.entry_price === null || row.entry_price === 0 ? "—" : fmtUSD(row.entry_price)} />
         <KV k="Position leverage" v={row.position_leverage === null ? "—" : `${row.position_leverage}×`} />
         <KV k="Margin type" v={row.margin_type ? row.margin_type.toUpperCase() : "—"} />
+        <KV
+          k="Connected key"
+          v={keyLast4 ? "····" + keyLast4 : "not connected"}
+          tone={keyLast4 ? undefined : "destructive"}
+        />
         <KV k="Keys present" v={row.keys_present === null ? "—" : row.keys_present ? "YES" : "NO"} tone={row.keys_present === false ? "destructive" : undefined} />
         <KV
           k="Key permissions"

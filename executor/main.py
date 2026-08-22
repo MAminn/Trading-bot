@@ -11,6 +11,13 @@ Implemented modes:
                   and a mandatory per-order USD cap, or it refuses to start.
 
 Default is OFF. No mode is inferred; EXECUTION_MODE must name one explicitly.
+
+Both LIVE modes sign with the CONNECTED USER's Binance keys — the pair they
+entered on the website, stored encrypted and served decrypted to this process
+by the app. They are never read from this host's environment. A live order must
+move the client's funds; signing one with the server operator's keys would be
+the wrong wallet, not merely the wrong configuration. If the user has connected
+no keys, both LIVE modes refuse every mainnet call and report why.
 """
 
 import logging
@@ -54,14 +61,29 @@ MODE_BASE_URLS = {
     "LIVE_TRADE": LIVE_BASE_URL,
 }
 
-# Live and testnet credentials live in separate variables so a stale testnet
-# key can never authenticate against mainnet, nor a live key against testnet.
+# TESTNET ONLY. Testnet keys are throwaway host credentials and stay in the
+# environment where they have always been.
+#
+# The LIVE entries are gone, and their absence is the fix: mainnet credentials
+# now come from the connected user's account via the app, so no expression in
+# this process can turn an environment variable into a mainnet signing key any
+# more. A live mode that reached in here would raise a KeyError rather than
+# quietly sign with the wrong wallet.
 MODE_CREDENTIAL_ENV = {
     "TESTNET_READ": ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET"),
     "TESTNET_TRADE": ("BINANCE_TESTNET_API_KEY", "BINANCE_TESTNET_API_SECRET"),
-    "LIVE_READ": ("BINANCE_LIVE_API_KEY", "BINANCE_LIVE_API_SECRET"),
-    "LIVE_TRADE": ("BINANCE_LIVE_API_KEY", "BINANCE_LIVE_API_SECRET"),
 }
+
+# Token for the app's credentials endpoint. Separate from ENGINE_SERVICE_TOKEN
+# by design — that one is shared with the signal, config and telemetry routes,
+# and key material must not sit behind a token so many endpoints accept.
+ENGINE_CREDENTIALS_TOKEN_ENV = "ENGINE_CREDENTIALS_TOKEN"
+
+# Legacy server-wide live keys. Read for exactly one purpose: to warn that they
+# are present and ignored. They are never passed to a client, and nothing in
+# this process will sign with them.
+LEGACY_LIVE_KEY_ENV = "BINANCE_LIVE_API_KEY"
+LEGACY_LIVE_SECRET_ENV = "BINANCE_LIVE_API_SECRET"
 
 # LIVE_TRADE will not start unless this env var carries this exact value.
 LIVE_TRADING_ACK_ENV = "LIVE_TRADING_ACK"
@@ -116,6 +138,19 @@ def read_env_order_cap_for_telemetry():
     except (InvalidOperation, ValueError):
         return None
     return cap if cap > 0 else None
+
+
+def _live_env_keys_present() -> bool:
+    """Whether the deprecated server-wide live keys are still in the env.
+
+    Presence only. The values are never returned, logged or used — this exists
+    so the operator is told the variables are dead weight, not so anything can
+    fall back to them.
+    """
+    return bool(
+        os.environ.get(LEGACY_LIVE_KEY_ENV, "").strip()
+        or os.environ.get(LEGACY_LIVE_SECRET_ENV, "").strip()
+    )
 
 
 def build_reporter():
@@ -262,6 +297,7 @@ def run_executor(mode: str) -> int:
         resolve_effective_mode,
     )
     from signal_consumer import SignalConsumer, SignalConsumerError
+    from user_credentials import CredentialsUnavailable, UserCredentialsClient
 
     # What this HOST is permitted to do. The database may narrow it per cycle,
     # never widen it, so this stays the ceiling for the life of the process.
@@ -278,13 +314,8 @@ def run_executor(mode: str) -> int:
     if refusal is not None:
         return refusal
 
-    key_env, secret_env = MODE_CREDENTIAL_ENV[mode]
-    api_key = os.environ.get(key_env, "").strip()
-    api_secret = os.environ.get(secret_env, "").strip()
-    if not api_key or not api_secret:
-        log.error("%s and %s must be set for %s mode", key_env, secret_env, mode)
-        return 1
-
+    # Validated before credentials, because on a live host the app IS the
+    # credential source and there is nothing to resolve without it.
     app_api_base = os.environ.get("APP_API_BASE", "").strip()
     engine_service_token = os.environ.get("ENGINE_SERVICE_TOKEN", "").strip()
     engine_user_id = os.environ.get("ENGINE_USER_ID", "").strip()
@@ -295,6 +326,59 @@ def run_executor(mode: str) -> int:
             mode,
         )
         return 1
+
+    # ---- credentials ------------------------------------------------------ #
+    # Testnet signs with this host's own throwaway keys, exactly as before.
+    # Mainnet signs with the CONNECTED USER's keys, fetched from the app. This
+    # is the whole point of the split: a live order must move the client's
+    # funds, and this host's environment is not where the client's keys live.
+    api_key = api_secret = ""
+    credentials_client = None
+    if mode in LIVE_MODES:
+        credentials_token = os.environ.get(ENGINE_CREDENTIALS_TOKEN_ENV, "").strip()
+        if not credentials_token:
+            log.error(
+                "REFUSING TO START | %s must be set for %s mode — live "
+                "credentials come from the connected user's account, and this "
+                "is the token used to ask for them",
+                ENGINE_CREDENTIALS_TOKEN_ENV,
+                mode,
+            )
+            return 1
+        if credentials_token == engine_service_token:
+            # Reusing the service token would hand key material to every holder
+            # of the token the ingest and config routes already accept — the
+            # exact widening the separate token exists to prevent. Checked on
+            # both sides: the app refuses to serve, and this refuses to ask.
+            log.error(
+                "REFUSING TO START | %s must differ from ENGINE_SERVICE_TOKEN — "
+                "key material must not sit behind the token shared with the "
+                "signal, config and telemetry routes",
+                ENGINE_CREDENTIALS_TOKEN_ENV,
+            )
+            return 1
+        credentials_client = UserCredentialsClient(
+            app_api_base, credentials_token, engine_user_id
+        )
+        if _live_env_keys_present():
+            log.warning(
+                "IGNORING %s / %s | live credentials now come from the connected "
+                "user's account; these environment values are legacy, are never "
+                "used to sign a mainnet order, and should be removed",
+                LEGACY_LIVE_KEY_ENV,
+                LEGACY_LIVE_SECRET_ENV,
+            )
+        # Deliberately NOT fetched here. Resolution happens inside the cycle so
+        # one code path covers every case that actually occurs in production:
+        # a first start with nothing connected, a client who connects keys while
+        # the executor is already running, a rotation, and a disconnection.
+    else:
+        key_env, secret_env = MODE_CREDENTIAL_ENV[mode]
+        api_key = os.environ.get(key_env, "").strip()
+        api_secret = os.environ.get(secret_env, "").strip()
+        if not api_key or not api_secret:
+            log.error("%s and %s must be set for %s mode", key_env, secret_env, mode)
+            return 1
 
     start_after = os.environ.get("CONSUMER_START_AFTER", "").strip() or None
     if start_after is not None:
@@ -334,11 +418,23 @@ def run_executor(mode: str) -> int:
     # Read modes get a facade that does not define set_leverage, set_margin_type
     # or place_market_order at all. Placement is not merely gated off — the
     # method does not exist on the object, so no code path can reach it.
-    client = (
-        BinanceFuturesClient(base_url, api_key, api_secret)
-        if trade_capable
-        else ReadOnlyFuturesClient(base_url, api_key, api_secret)
-    )
+    def build_client(key: str, secret: str):
+        return (
+            BinanceFuturesClient(base_url, key, secret)
+            if trade_capable
+            else ReadOnlyFuturesClient(base_url, key, secret)
+        )
+
+    # Testnet binds its client once, here. A live host starts with NO client at
+    # all: it has no credentials until the app has been asked for the user's,
+    # and holding an unauthenticated mainnet client would not be safer than
+    # holding none — it is the same object, one assignment away from signing.
+    client = None if credentials_client is not None else build_client(api_key, api_secret)
+    # The pair currently bound into `client`, so a rotation is detectable.
+    active_credentials = None
+    # Reported as keys_present. None until a live host has actually asked:
+    # "not yet known" is not the same claim as "none connected".
+    credentials_present = None if credentials_client is not None else True
 
     risk_guard = None
     if trade_capable:
@@ -404,7 +500,7 @@ def run_executor(mode: str) -> int:
                 account=account,
                 positions=positions,
                 reconcile=consumer.last_reconcile,
-                keys_present=True,
+                keys_present=credentials_present,
                 permission_status=permission,
                 message=message,
             )
@@ -577,6 +673,7 @@ def run_executor(mode: str) -> int:
         process exit code once the synthetic OPEN/CLOSE pair has run."""
         nonlocal probed, startup_done, liquidation_warning_logged, smoke_started
         nonlocal effective_mode, orders_enabled, block_reason_live
+        nonlocal client, active_credentials, credentials_present
 
         # The config drives the mode decision, so it is refreshed before any
         # exchange call. A failed refresh raises and fails the cycle, which
@@ -596,6 +693,52 @@ def run_executor(mode: str) -> int:
                 consumer.db_execution_mode,
             )
 
+        # The connected user's live credentials, re-resolved every cycle. Doing
+        # it here rather than once at startup is what lets a client connect
+        # their keys, rotate them, or disconnect them on the website and have
+        # this process follow within one cycle instead of at the next restart.
+        #
+        # Skipped entirely at effective OFF: that mode makes no exchange call,
+        # so it needs no key and should not be asking the app for one.
+        credentials_reason = None
+        if credentials_client is not None and effective_mode != "OFF":
+            # A transport failure raises CredentialsUnavailable and fails the
+            # cycle, which is the same fail-closed retry every other fetch
+            # failure gets. Only a definitive answer reaches the branches below.
+            result = credentials_client.fetch()
+            if result.present:
+                credentials_present = True
+                if result.credentials != active_credentials:
+                    rotated = active_credentials is not None
+                    active_credentials = result.credentials
+                    client = build_client(
+                        active_credentials.api_key, active_credentials.api_secret
+                    )
+                    # A new key pair is a different account as far as this
+                    # process is concerned. The clock offset, symbol filters,
+                    # bracket ladder and leverage enforcement were all
+                    # established against the old one, so they are redone before
+                    # anything is sized against the new one.
+                    probed = False
+                    startup_done = False
+                    log.warning(
+                        "LIVE CREDENTIALS %s | user=%s | key ...%s",
+                        "ROTATED" if rotated else "BOUND",
+                        engine_user_id,
+                        active_credentials.last4,
+                    )
+            else:
+                credentials_present = False
+                credentials_reason = result.blocked_reason
+                # The client is dropped, not merely bypassed. Once the user's
+                # keys are gone this process must hold no means of signing on
+                # their behalf — a live client sitting behind a boolean is one
+                # refactor away from being used.
+                active_credentials = None
+                client = None
+                probed = False
+                startup_done = False
+
         # Why an OPEN may not be placed. Evaluated every cycle, from the values
         # just read, so switching auto-execute off or pressing Stop takes effect
         # on the next cycle rather than at the next restart.
@@ -609,11 +752,22 @@ def run_executor(mode: str) -> int:
         )
         orders_enabled = block_reason_live is None
 
+        if credentials_reason is not None:
+            # Outranks every other reason. Without the user's keys there is no
+            # authenticated path to the exchange at all, so this is both the
+            # most fundamental gate and the most actionable thing to report:
+            # every other reason is fixed by an operator, this one by the
+            # client pressing Connect.
+            block_reason_live = credentials_reason
+            orders_enabled = False
+
         # Attach the placement client only when the effective mode is
         # trade-capable. Detaching removes the placement path itself rather than
         # setting a flag beside it: the consumer reaches _place_order only via
         # `self._binance_trader is not None`.
-        consumer.set_trader(client if effective_trade_capable else None)
+        consumer.set_trader(
+            client if (effective_trade_capable and client is not None) else None
+        )
 
         # A database request the environment refuses is the single most
         # important thing to see in a log, so it is stated plainly every cycle
@@ -645,6 +799,26 @@ def run_executor(mode: str) -> int:
             # poll_once is what normally reopens the cycle. Returning here
             # without it would strand the flag and stop every later refresh —
             # the executor would stay OFF even after the database changed back.
+            consumer.end_cycle()
+            return None
+
+        if credentials_reason is not None:
+            # Fail closed on mainnet. No client was built, so no signed call is
+            # made, no balance is read and no order can be placed — the refusal
+            # is structural, not a flag checked further down.
+            #
+            # The process stays alive and keeps heartbeating rather than
+            # exiting, because a dead executor and one waiting on a key look
+            # identical from outside, and only one of them is fixed by the
+            # client connecting their account. The website shows the reason.
+            log.error(
+                "LIVE ACCESS BLOCKED | %s | effective=%s | no mainnet call will "
+                "be made and no order can be placed until the connected user's "
+                "Binance keys are available",
+                credentials_reason,
+                effective_mode,
+            )
+            report(message=f"blocked: {credentials_reason}")
             consumer.end_cycle()
             return None
 
@@ -828,7 +1002,13 @@ def run_executor(mode: str) -> int:
             report(message=f"rate limited, backing off {backoff}s")
             time.sleep(backoff)
             continue
-        except (BinanceAPIError, SignalConsumerError, EnforcementError, OSError) as exc:
+        except (
+            BinanceAPIError,
+            SignalConsumerError,
+            EnforcementError,
+            CredentialsUnavailable,
+            OSError,
+        ) as exc:
             if smoke_started:
                 log.error(
                     "SMOKE FAILED MID-FLIGHT | %s | NOT retrying — verify the "

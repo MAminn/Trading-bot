@@ -7,8 +7,11 @@ ingest/order_update). Read modes (TESTNET_READ / LIVE_READ) stay pure-read and
 are refused a trader outright; trade-capable modes (TESTNET_TRADE / LIVE_TRADE)
 record intents, place allowed MARKET orders, and persist the outcome.
 
-The config endpoint response contains decrypted Binance credentials, so the
-raw response is never logged; only the sizing fields are extracted.
+The config endpoint returns NO key material — only sizing and live-control
+fields, and the public key's last 4 characters. Credentials are served by the
+separate /api/public/engine/credentials endpoint, behind its own token, and are
+handled exclusively by user_credentials.py; nothing in this module ever holds
+or sees one.
 """
 
 import hashlib
@@ -213,7 +216,9 @@ class SignalConsumer:
 
     def _refresh_config(self) -> None:
         body = self._get("/api/public/engine/config", {"user_id": self._user_id})
-        # Response includes decrypted secrets — never log it. Extract sizing only.
+        # No secret is in this response, and the raw body is still not logged:
+        # it is a control surface, and a log line is not where a control change
+        # should first be noticed. Extract the sizing fields only.
         config = body.get("config") or {}
 
         # A refresh re-derives validity from scratch, so a corrected config

@@ -61,15 +61,54 @@ def test_testnet_modes_still_use_testnet_endpoint():
     assert main.MODE_BASE_URLS["TESTNET_TRADE"] == main.TESTNET_BASE_URL
 
 
-def test_live_credentials_come_from_separate_env_vars():
-    assert main.MODE_CREDENTIAL_ENV["LIVE_TRADE"] == (
-        "BINANCE_LIVE_API_KEY",
-        "BINANCE_LIVE_API_SECRET",
-    )
+def test_testnet_credentials_still_come_from_the_environment():
+    """Unchanged: testnet keys are throwaway host credentials."""
     assert main.MODE_CREDENTIAL_ENV["TESTNET_TRADE"] == (
         "BINANCE_TESTNET_API_KEY",
         "BINANCE_TESTNET_API_SECRET",
     )
+    assert main.MODE_CREDENTIAL_ENV["TESTNET_READ"] == (
+        "BINANCE_TESTNET_API_KEY",
+        "BINANCE_TESTNET_API_SECRET",
+    )
+
+
+def test_no_live_mode_can_source_credentials_from_the_environment():
+    """The regression this whole change exists to prevent.
+
+    A client connects their Binance account on the website; the executor must
+    sign with THEIR keys. Previously both live modes mapped to
+    BINANCE_LIVE_API_KEY/SECRET, so every live order moved the server
+    operator's funds no matter who was logged in.
+
+    Asserted as the absence of a mapping rather than as a behaviour: with no
+    entry here there is no expression left in main.py that turns an environment
+    variable into a mainnet signing key.
+    """
+    for live_mode in main.LIVE_MODES:
+        assert live_mode not in main.MODE_CREDENTIAL_ENV
+
+    env_names = {name for pair in main.MODE_CREDENTIAL_ENV.values() for name in pair}
+    assert not any("LIVE" in name for name in env_names)
+
+
+def test_legacy_live_env_names_are_referenced_only_as_a_warning():
+    """The legacy names still exist as constants — for the 'these are ignored'
+    warning — but they are not wired to any mode."""
+    assert main.LEGACY_LIVE_KEY_ENV == "BINANCE_LIVE_API_KEY"
+    assert main.LEGACY_LIVE_SECRET_ENV == "BINANCE_LIVE_API_SECRET"
+    assert main.LEGACY_LIVE_KEY_ENV not in {
+        name for pair in main.MODE_CREDENTIAL_ENV.values() for name in pair
+    }
+
+
+def test_live_env_key_probe_reports_presence_only(monkeypatch):
+    monkeypatch.delenv("BINANCE_LIVE_API_KEY", raising=False)
+    monkeypatch.delenv("BINANCE_LIVE_API_SECRET", raising=False)
+    assert main._live_env_keys_present() is False
+    monkeypatch.setenv("BINANCE_LIVE_API_KEY", "legacy-key-value")
+    # Returns a bool, never the value — this is what keeps it out of a log line.
+    assert main._live_env_keys_present() is True
 
 
 def test_testnet_trade_is_not_trade_capable_for_live_and_vice_versa():

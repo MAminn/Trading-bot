@@ -24,6 +24,7 @@ import { Route as AppAdminRouteImport } from './routes/app.admin'
 import { Route as ApiPublicEngineHeartbeatRouteImport } from './routes/api/public/engine/heartbeat'
 import { Route as ApiPublicEngineEthPriceRouteImport } from './routes/api/public/engine/eth-price'
 import { Route as ApiPublicEngineDemoTickRouteImport } from './routes/api/public/engine/demo-tick'
+import { Route as ApiPublicEngineCredentialsRouteImport } from './routes/api/public/engine/credentials'
 import { Route as ApiPublicEngineConfigRouteImport } from './routes/api/public/engine/config'
 import { Route as ApiPublicEngineSignalsPendingRouteImport } from './routes/api/public/engine/signals.pending'
 import { Route as ApiPublicEngineOrdersStateRouteImport } from './routes/api/public/engine/orders.state'
@@ -110,6 +111,12 @@ const ApiPublicEngineDemoTickRoute = ApiPublicEngineDemoTickRouteImport.update({
   path: '/api/public/engine/demo-tick',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiPublicEngineCredentialsRoute =
+  ApiPublicEngineCredentialsRouteImport.update({
+    id: '/api/public/engine/credentials',
+    path: '/api/public/engine/credentials',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiPublicEngineConfigRoute = ApiPublicEngineConfigRouteImport.update({
   id: '/api/public/engine/config',
   path: '/api/public/engine/config',
@@ -178,6 +185,7 @@ export interface FileRoutesByFullPath {
   '/app/settings': typeof AppSettingsRoute
   '/app/': typeof AppIndexRoute
   '/api/public/engine/config': typeof ApiPublicEngineConfigRoute
+  '/api/public/engine/credentials': typeof ApiPublicEngineCredentialsRoute
   '/api/public/engine/demo-tick': typeof ApiPublicEngineDemoTickRoute
   '/api/public/engine/eth-price': typeof ApiPublicEngineEthPriceRoute
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
@@ -203,6 +211,7 @@ export interface FileRoutesByTo {
   '/app/settings': typeof AppSettingsRoute
   '/app': typeof AppIndexRoute
   '/api/public/engine/config': typeof ApiPublicEngineConfigRoute
+  '/api/public/engine/credentials': typeof ApiPublicEngineCredentialsRoute
   '/api/public/engine/demo-tick': typeof ApiPublicEngineDemoTickRoute
   '/api/public/engine/eth-price': typeof ApiPublicEngineEthPriceRoute
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
@@ -230,6 +239,7 @@ export interface FileRoutesById {
   '/app/settings': typeof AppSettingsRoute
   '/app/': typeof AppIndexRoute
   '/api/public/engine/config': typeof ApiPublicEngineConfigRoute
+  '/api/public/engine/credentials': typeof ApiPublicEngineCredentialsRoute
   '/api/public/engine/demo-tick': typeof ApiPublicEngineDemoTickRoute
   '/api/public/engine/eth-price': typeof ApiPublicEngineEthPriceRoute
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
@@ -258,6 +268,7 @@ export interface FileRouteTypes {
     | '/app/settings'
     | '/app/'
     | '/api/public/engine/config'
+    | '/api/public/engine/credentials'
     | '/api/public/engine/demo-tick'
     | '/api/public/engine/eth-price'
     | '/api/public/engine/heartbeat'
@@ -283,6 +294,7 @@ export interface FileRouteTypes {
     | '/app/settings'
     | '/app'
     | '/api/public/engine/config'
+    | '/api/public/engine/credentials'
     | '/api/public/engine/demo-tick'
     | '/api/public/engine/eth-price'
     | '/api/public/engine/heartbeat'
@@ -309,6 +321,7 @@ export interface FileRouteTypes {
     | '/app/settings'
     | '/app/'
     | '/api/public/engine/config'
+    | '/api/public/engine/credentials'
     | '/api/public/engine/demo-tick'
     | '/api/public/engine/eth-price'
     | '/api/public/engine/heartbeat'
@@ -327,6 +340,7 @@ export interface RootRouteChildren {
   AppRoute: typeof AppRouteWithChildren
   LoginRoute: typeof LoginRoute
   ApiPublicEngineConfigRoute: typeof ApiPublicEngineConfigRoute
+  ApiPublicEngineCredentialsRoute: typeof ApiPublicEngineCredentialsRoute
   ApiPublicEngineDemoTickRoute: typeof ApiPublicEngineDemoTickRoute
   ApiPublicEngineEthPriceRoute: typeof ApiPublicEngineEthPriceRoute
   ApiPublicEngineHeartbeatRoute: typeof ApiPublicEngineHeartbeatRoute
@@ -447,6 +461,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiPublicEngineDemoTickRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/public/engine/credentials': {
+      id: '/api/public/engine/credentials'
+      path: '/api/public/engine/credentials'
+      fullPath: '/api/public/engine/credentials'
+      preLoaderRoute: typeof ApiPublicEngineCredentialsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/public/engine/config': {
       id: '/api/public/engine/config'
       path: '/api/public/engine/config'
@@ -544,6 +565,7 @@ const rootRouteChildren: RootRouteChildren = {
   AppRoute: AppRouteWithChildren,
   LoginRoute: LoginRoute,
   ApiPublicEngineConfigRoute: ApiPublicEngineConfigRoute,
+  ApiPublicEngineCredentialsRoute: ApiPublicEngineCredentialsRoute,
   ApiPublicEngineDemoTickRoute: ApiPublicEngineDemoTickRoute,
   ApiPublicEngineEthPriceRoute: ApiPublicEngineEthPriceRoute,
   ApiPublicEngineHeartbeatRoute: ApiPublicEngineHeartbeatRoute,

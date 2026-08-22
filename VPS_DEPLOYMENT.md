@@ -68,8 +68,19 @@ SUPABASE_PUBLISHABLE_KEY=
 VITE_SUPABASE_URL=
 VITE_SUPABASE_PUBLISHABLE_KEY=
 ENGINE_SERVICE_TOKEN=
+ENGINE_CREDENTIALS_TOKEN=
 BINANCE_KEY_ENCRYPTION_SECRET=
 ```
+
+> `ENGINE_CREDENTIALS_TOKEN` authenticates the executor against
+> `/api/public/engine/credentials`, the one endpoint that returns a decrypted
+> Binance key. It **must differ from `ENGINE_SERVICE_TOKEN`** — the app returns
+> 503 and the executor refuses to start if they are equal. Generate it with
+> `openssl rand -hex 32`.
+>
+> `BINANCE_KEY_ENCRYPTION_SECRET` is the AES-256-GCM key for every stored
+> client credential. Changing it makes every existing row unreadable, and each
+> affected client must re-enter their keys at `/app/connect`.
 
 ### Worker
 
@@ -86,6 +97,36 @@ ENGINE_USER_ID=your_supabase_user_uuid
 >
 > Do not commit real values. Keep them in untracked `.env` files on the VPS
 > (`.env` for the Node app, `worker/.env` for the worker).
+
+### Executor — live Binance credentials
+
+The executor signs mainnet orders with the **connected user's** Binance keys,
+never with a server-wide pair. See `executor/.env.example`; the essentials:
+
+```
+EXECUTION_MODE=LIVE_READ            # or LIVE_TRADE
+APP_API_BASE=https://YOUR_DOMAIN_OR_SERVER_IP
+ENGINE_SERVICE_TOKEN=same_value_as_frontend
+ENGINE_CREDENTIALS_TOKEN=same_value_as_frontend_and_different_from_the_above
+ENGINE_USER_ID=the_client_supabase_user_uuid
+
+BINANCE_LIVE_API_KEY=               # legacy — leave EMPTY, see below
+BINANCE_LIVE_API_SECRET=            # legacy — leave EMPTY, see below
+```
+
+`ENGINE_USER_ID` selects whose keys sign. One executor process serves one
+client; a second client needs a second process with its own `ENGINE_USER_ID`.
+
+> **Legacy server-wide live keys.** `BINANCE_LIVE_API_KEY` and
+> `BINANCE_LIVE_API_SECRET` are no longer read by any live code path — they are
+> not a fallback. A live mode with no connected client keys fails closed
+> (`blocked_reason=missing_user_binance_keys`) rather than reaching for them.
+> Delete them from the VPS `.env`; if they are still present the executor logs
+> a warning that they are being ignored. Revoke them on Binance once the first
+> real client run is verified.
+>
+> `BINANCE_TESTNET_API_KEY` / `BINANCE_TESTNET_API_SECRET` are unchanged: they
+> are throwaway host credentials and still come from the environment.
 
 ## Install outline
 
