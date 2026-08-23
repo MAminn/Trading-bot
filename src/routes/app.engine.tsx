@@ -10,10 +10,11 @@ import {
 } from "@/lib/engine";
 import {
   useExecutorStatus, executorFresh, executorTone, canPlaceOrders, isLiveMode,
-  MODE_LABEL, PERMISSION_LABEL, type ExecutorStatusRow,
+  MODE_LABEL, PERMISSION_LABEL, resolveWalletDisplay, type ExecutorStatusRow,
 } from "@/lib/executor";
-import { getBinanceKeyInfo } from "@/lib/binance.functions";
-import { useServerFn } from "@tanstack/react-start";
+import { keysConnected, useBinanceKeyInfo } from "@/lib/binance-keys";
+import { resolveExecutorLink, type ExecutorLinkState } from "@/lib/executor-link";
+import { ExecutorLinkRow } from "@/components/ExecutorLinkRow";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "sonner";
 
@@ -29,24 +30,6 @@ function useUserId() {
       const { data } = await supabase.auth.getUser();
       return data.user?.id ?? null;
     },
-    staleTime: 60_000,
-  });
-}
-
-/** The connected key's last 4 characters, for display.
- *
- *  Deliberately routed through getBinanceKeyInfo rather than through the
- *  executor's telemetry: that function is RLS-scoped to the signed-in user and
- *  returns last4 plus timestamps, so this page cannot render a secret even if a
- *  later change tried to. The plaintext key never exists in the browser at all
- *  — the one place it is decrypted is the executor's credentials endpoint,
- *  server-side, and that response never reaches a page.
- */
-function useBinanceKeyInfo() {
-  const fetchInfo = useServerFn(getBinanceKeyInfo);
-  return useQuery({
-    queryKey: ["binance", "key-info"],
-    queryFn: () => fetchInfo(),
     staleTime: 60_000,
   });
 }
@@ -123,6 +106,8 @@ function EnginePage() {
         loading={executor.isLoading}
         requested={config.data?.execution_mode}
         keyLast4={keyInfo.data?.api_key_last4 ?? null}
+        link={resolveExecutorLink(executor.data, { keysConnected: keysConnected(keyInfo) })}
+        linkPending={keyInfo.isLoading || executor.isLoading}
       />
 
       {/* ML signal worker status — the strategy's own view, NOT the exchange's */}
@@ -182,8 +167,9 @@ function EnginePage() {
         {isLiveMode(executor.data?.effective_mode) && (
           <p className="mt-2 max-w-2xl text-xs text-muted-foreground">
             These are sizing inputs only. What the executor is permitted to do
-            is set in its own environment on the VPS and is shown in the
-            executor card above — not by the signal mode below.
+            is your saved live settings capped by the host's own environment
+            ceiling, and is shown in the executor card above — not by the signal
+            mode below.
           </p>
         )}
         {config.data ? (
@@ -241,19 +227,30 @@ function ExecutorCard({
   loading,
   requested,
   keyLast4,
+  link,
+  linkPending,
 }: {
   row: ExecutorStatusRow | null | undefined;
   loading: boolean;
-  /** What the database has been asked for. The executor does not read this
-   *  yet, so a difference from effective_mode is expected, not an alarm. */
+  /** What the database has been asked for. The executor reads this every cycle
+   *  now, but the host's env ceiling still caps it — so a difference from
+   *  effective_mode means the request was degraded, not ignored. */
   requested: string | null | undefined;
   /** Last 4 characters of the connected Binance API key. Never the key itself
    *  and never the secret — this is the only key-derived value the browser is
    *  ever given. */
   keyLast4: string | null;
+  /** This user's exchange link, in the wording shared with Configure and the
+   *  Dashboard. Says nothing about balances — see resolveWalletDisplay. */
+  link: ExecutorLinkState;
+  linkPending: boolean;
 }) {
   const fresh = executorFresh(row);
   const tone = executorTone(row);
+  // `link` already carries "is there a signed read"; this carries the figure
+  // that read produced. Both come from the same rule module, so the card cannot
+  // show a balance beside a "connect Binance first" line.
+  const wallet = resolveWalletDisplay(row, { keysConnected: keyLast4 !== null });
   const ring =
     tone === "live" ? "ring-1 ring-destructive/50" : tone === "warn" ? "ring-1 ring-warning/40" : "";
 
@@ -276,6 +273,9 @@ function ExecutorCard({
       <div className="card-elevated p-6">
         <div className="flex items-center gap-2 text-sm font-medium">
           <Radio className="h-4 w-4 text-muted-foreground" /> Executor (Binance)
+        </div>
+        <div className="mt-4">
+          <ExecutorLinkRow link={link} pending={linkPending} />
         </div>
         <div className="mt-4 flex items-start gap-3 rounded-lg border border-border bg-card/40 p-4 text-sm">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
@@ -327,6 +327,13 @@ function ExecutorCard({
             </span>
           )}
         </div>
+      </div>
+
+      {/* The exchange link, before any number. A client reads this to answer
+          "is the bot actually holding my account", and it must give the same
+          answer here as on Configure and the Dashboard. */}
+      <div className="mt-4">
+        <ExecutorLinkRow link={link} pending={linkPending} />
       </div>
 
       {canPlaceOrders(row.effective_mode) && (
@@ -435,15 +442,23 @@ function ExecutorCard({
 
       <div className="mt-5 grid gap-4 md:grid-cols-2">
         <KV k="Env ceiling" v={row.env_mode_ceiling ?? "—"} />
+        {/* Routed through the same rule the Dashboard uses, so a balance left
+            on the row after a client withdrew their keys cannot keep being
+            rendered as their money here. A figure appears only when a signed
+            read of THIS account produced it. */}
         <KV
           k="Wallet balance (Binance)"
-          v={row.wallet_balance_usd === null ? "not read yet" : fmtUSD(row.wallet_balance_usd)}
-          tone={row.wallet_balance_usd === null ? "warn" : undefined}
+          v={wallet.state === "connected" ? fmtUSD(wallet.walletUsd) : "not read yet"}
+          tone={wallet.state === "connected" ? undefined : "warn"}
         />
         <KV
           k="Available balance (Binance)"
-          v={row.available_balance_usd === null ? "not read yet" : fmtUSD(row.available_balance_usd)}
-          tone={row.available_balance_usd === null ? "warn" : undefined}
+          v={
+            wallet.state === "connected" && wallet.availableUsd !== null
+              ? fmtUSD(wallet.availableUsd)
+              : "not read yet"
+          }
+          tone={wallet.state === "connected" && wallet.availableUsd !== null ? undefined : "warn"}
         />
         <KV k="Binance position" v={row.position_side ?? "—"} tone={row.position_side && row.position_side !== "FLAT" ? "warn" : undefined} />
         <KV k="Position size" v={num(row.position_amt)} />

@@ -50,8 +50,9 @@ export interface EngineConfigRow {
   is_running: boolean;
   demo_mode: boolean;
   // ----- live execution controls -----
-  // What the user has REQUESTED. The executor does not read these yet; the
-  // authoritative "what is actually running" lives in executor_status.
+  // What the user has REQUESTED. The executor reads these every cycle, but the
+  // host's env ceiling can still degrade them, so the authoritative "what is
+  // actually running" remains executor_status.
   execution_mode: RequestedExecutionMode;
   live_order_cap_usd: number;
   live_allow_full_capital: boolean;

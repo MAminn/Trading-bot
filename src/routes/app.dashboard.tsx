@@ -42,6 +42,8 @@ import {
   useExecutorStatus, executionModeLabel, executorFresh, executorTone, canPlaceOrders,
   resolveWalletDisplay,
 } from "@/lib/executor";
+import { keysConnected, useBinanceKeyInfo } from "@/lib/binance-keys";
+import { EXECUTOR_LINK_LABEL, resolveExecutorLink } from "@/lib/executor-link";
 import { useLivePrice } from "@/lib/live-price";
 import { toast } from "sonner";
 
@@ -80,8 +82,18 @@ function Dashboard() {
   const baselineEquity = capital + metrics.netPnl;
 
   // The client's actual money, and only when a signed read of THEIR Binance
-  // account produced it.
-  const wallet = resolveWalletDisplay(executor.data);
+  // account produced it. The key metadata is passed in so that a client who
+  // connected seconds ago reads "waiting for the first executor read" rather
+  // than "not connected" — a different, and true, statement.
+  const keyInfo = useBinanceKeyInfo();
+  const wallet = resolveWalletDisplay(executor.data, {
+    keysConnected: keysConnected(keyInfo),
+  });
+  // The same three states the Configure and Engine pages name, so a client
+  // moving between pages is never told two different things about one link.
+  const link = resolveExecutorLink(executor.data, {
+    keysConnected: keysConnected(keyInfo),
+  });
 
   const today = new Date().toDateString();
   const todayPnl = (trades.data ?? [])
@@ -294,12 +306,12 @@ function Dashboard() {
             wallet.state === "awaiting_read" ? "—" :
             "Not connected"
           }
+          // The sub-label is the same sentence Configure and the Engine page
+          // use for this state, so the three pages cannot drift apart.
           delta={
-            wallet.state === "connected"
-              ? (wallet.stale ? "Binance · reading is stale" : "Binance · live")
-              : wallet.state === "awaiting_read"
-                ? "waiting for the first live read"
-                : "connect Binance to see your balance"
+            wallet.state === "connected" && wallet.stale
+              ? `${EXECUTOR_LINK_LABEL[link]} · reading is stale`
+              : EXECUTOR_LINK_LABEL[link]
           }
           up={wallet.state === "connected" && !wallet.stale}
           muted={wallet.state !== "connected"}

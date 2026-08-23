@@ -5,8 +5,9 @@
 // exchange's real one, the real execution mode, and real balances. The two
 // disagree routinely and both are correct — they describe different things.
 //
-// Read-only. Nothing here controls the executor: its live capability comes
-// from its own environment, not from the database.
+// Read-only. Nothing here controls the executor: it reads each user's request
+// from the database every cycle, but its live capability is capped by its own
+// environment and nothing written from a page can raise that ceiling.
 
 import { useQuery } from "@tanstack/react-query";
 import { supabase } from "@/integrations/supabase/client";

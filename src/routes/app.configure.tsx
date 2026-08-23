@@ -5,6 +5,15 @@ import { toast } from "sonner";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { useEngineConfig, useUpdateConfig, fmtUSD, type EngineConfigRow } from "@/lib/engine";
+import { useExecutorStatus } from "@/lib/executor";
+import { keysConnected, useBinanceKeyInfo } from "@/lib/binance-keys";
+import {
+  EXECUTOR_CONNECTED_TITLE,
+  EXECUTOR_LIVE_ORDER_REQUIREMENTS,
+  EXECUTOR_READS_SETTINGS,
+  resolveExecutorLink,
+} from "@/lib/executor-link";
+import { ExecutorLinkRow } from "@/components/ExecutorLinkRow";
 import {
   LIVE_ORDER_CAP_MAX_USD,
   LIVE_ORDER_CAP_MIN_TRADE_USD,
@@ -290,19 +299,18 @@ function Configure() {
             )}
 
             <div>
+              {/* Read-only mirror of the saved mode. The control itself lives in
+                  Live execution below — auto-execute is a real, enforced setting
+                  the executor reads, so showing it here as "coming soon" beside a
+                  working toggle would misdescribe the product in both directions. */}
               <span className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">Mode</span>
               <div className="flex gap-2">
-                <button type="button" disabled
-                  className="rounded-lg border border-primary/60 bg-primary/15 px-3 py-2 text-sm font-medium text-primary">
-                  Signal only (active)
-                </button>
-                <button type="button" disabled
-                  className="cursor-not-allowed rounded-lg border border-border bg-card/40 px-3 py-2 text-sm text-muted-foreground line-through opacity-60">
-                  Auto-execute (coming soon)
-                </button>
+                <ModeChip label="Signal only" active={config?.mode !== "auto"} />
+                <ModeChip label="Auto-execute" active={config?.mode === "auto"} />
               </div>
               <p className="mt-2 text-xs text-muted-foreground">
-                Auto-execution is locked at the database level until Phase 2.
+                Set this in Live execution below. Auto-execute is one of several
+                gates: on its own it does not place an order.
               </p>
             </div>
           </>
@@ -341,6 +349,19 @@ const MODE_COPY: Record<RequestedExecutionMode, { label: string; hint: string }>
 
 function LiveExecutionSection({ config }: { config: EngineConfigRow | null | undefined }) {
   const update = useUpdateConfig();
+  // Two independent sources, on purpose. The key metadata answers "has this
+  // client connected a wallet"; the executor telemetry answers "has the
+  // executor actually used those keys". Neither can stand in for the other.
+  const executor = useExecutorStatus();
+  const keyInfo = useBinanceKeyInfo();
+  const link = resolveExecutorLink(executor.data, {
+    keysConnected: keysConnected(keyInfo),
+  });
+  // Neither query has answered yet. Showing the not-connected wording to a
+  // client who connected months ago, for the half-second before the key
+  // metadata lands, is exactly the kind of false statement this page is being
+  // fixed for.
+  const linkPending = keyInfo.isLoading || executor.isLoading;
   // Fail-closed defaults, matching the database: a row that has never been
   // configured displays as OFF / $0 / auto disabled / no full-capital consent.
   const [execMode, setExecMode] = useState<RequestedExecutionMode>("OFF");
@@ -414,17 +435,18 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
         <Radio className="h-4 w-4 text-primary" /> Live execution
       </div>
 
-      {/* The single most important thing on this page right now. */}
+      {/* The single most important thing on this page: what saving here does.
+          Since multi-tenant onboarding the executor polls the roster and reads
+          each user's config every cycle, so these settings ARE live inputs —
+          but reading a setting is not the same as being able to act on it, and
+          the gate list is what separates the two. */}
       <div className="flex items-start gap-2 rounded-lg border border-primary/40 bg-primary/10 p-3 text-xs">
         <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
         <span className="space-y-1">
-          <strong className="block text-primary">Not yet connected to the executor.</strong>
+          <strong className="block text-primary">{EXECUTOR_CONNECTED_TITLE}</strong>
           <span className="block text-muted-foreground">
-            These settings are saved to the database and validated, but the
-            executor does not read them yet — it still follows its own
-            environment on the VPS. Changing anything here has no effect on live
-            trading until the executor is updated. What the executor is{" "}
-            <em>actually</em> doing is shown on the{" "}
+            {EXECUTOR_READS_SETTINGS} {EXECUTOR_LIVE_ORDER_REQUIREMENTS} What the
+            executor is <em>actually</em> doing is shown on the{" "}
             <Link to="/app/engine" className="text-primary hover:underline">
               Engine page
             </Link>
@@ -432,6 +454,11 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
           </span>
         </span>
       </div>
+
+      {/* This client's own exchange link, in the same words every other page
+          uses. No figure is named here — only whether a signed read of their
+          Binance account has happened at all. */}
+      <ExecutorLinkRow link={link} pending={linkPending} />
 
       <div>
         <span className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -563,6 +590,24 @@ function ToggleRow({
       </div>
       <Switch checked={checked} onCheckedChange={onChange} disabled={disabled} aria-label={label} />
     </div>
+  );
+}
+
+/** A read-only chip showing which mode is saved. Not a button: the control is
+ *  the auto-execute toggle in Live execution, and offering two of them would be
+ *  two places to disagree. */
+function ModeChip({ label, active }: { label: string; active: boolean }) {
+  return (
+    <span
+      className={`rounded-lg border px-3 py-2 text-sm font-medium ${
+        active
+          ? "border-primary/60 bg-primary/15 text-primary"
+          : "border-border bg-card/40 text-muted-foreground"
+      }`}
+    >
+      {label}
+      {active ? " (active)" : ""}
+    </span>
   );
 }
 
