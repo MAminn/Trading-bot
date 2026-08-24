@@ -16,8 +16,18 @@
 // the other.
 
 /** Percentage of the real Binance Futures wallet balance committed as margin.
- *  Exactly these values are selectable, persisted and accepted. */
-export const ALLOCATION_PCTS = [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100] as const;
+ *  Exactly these values are selectable, persisted and accepted.
+ *
+ *  1% is a deliberate special first step — the smallest meaningful commitment,
+ *  below the regular grid. From 5% onward the scale is exact 5% increments
+ *  through 100%. This is the ONE list; the Configure selector, the Zod
+ *  validator and the database CHECK all derive from it, so none of them can
+ *  drift into permitting a value another layer refuses. */
+export const ALLOCATION_PCTS = [
+  1,
+  5, 10, 15, 20, 25, 30, 35, 40, 45, 50,
+  55, 60, 65, 70, 75, 80, 85, 90, 95, 100,
+] as const;
 export type AllocationPct = (typeof ALLOCATION_PCTS)[number];
 
 /** Leverage multipliers. Independent of allocation — this table is NOT indexed

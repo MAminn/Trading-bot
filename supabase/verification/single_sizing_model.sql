@@ -75,17 +75,25 @@ BEGIN
   END IF;
 
   -- B1: every permitted allocation is accepted, up to 100%.
-  FOREACH pct IN ARRAY ARRAY[1,5,10,20,30,40,50,60,70,80,90,100]::numeric[] LOOP
+  FOREACH pct IN ARRAY ARRAY[1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100]::numeric[] LOOP
     UPDATE public.engine_config SET capital_allocation_pct = pct WHERE user_id = uid;
   END LOOP;
-  RAISE NOTICE 'PASS B1: allocation accepts 1%% through 100%% at every step';
+  RAISE NOTICE 'PASS B1: allocation accepts 1%%, then every 5%% step to 100%%';
 
-  -- B2: a value between the steps is refused.
+  -- B2: a value between the 5%% steps is refused.
   BEGIN
     UPDATE public.engine_config SET capital_allocation_pct = 7 WHERE user_id = uid;
     RAISE EXCEPTION 'FAIL B2: allocation 7%% accepted';
   EXCEPTION WHEN check_violation THEN
     RAISE NOTICE 'PASS B2: an off-step allocation is refused';
+  END;
+
+  -- B2b: 1%% is the ONLY value below 5%%. 2, 3 and 4 are not steps.
+  BEGIN
+    UPDATE public.engine_config SET capital_allocation_pct = 3 WHERE user_id = uid;
+    RAISE EXCEPTION 'FAIL B2b: allocation 3%% accepted';
+  EXCEPTION WHEN check_violation THEN
+    RAISE NOTICE 'PASS B2b: 1%% is the only sub-5%% allocation';
   END;
 
   -- B3: above 100% is refused.
@@ -146,7 +154,7 @@ BEGIN
 
   -- C4: ... and the reverse.
   UPDATE public.engine_config SET leverage = 30 WHERE user_id = uid;
-  FOREACH lev IN ARRAY ARRAY[1,5,10,20,30,40,50,60,70,80,90,100]::numeric[] LOOP
+  FOREACH lev IN ARRAY ARRAY[1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100]::numeric[] LOOP
     UPDATE public.engine_config SET capital_allocation_pct = lev WHERE user_id = uid;
     IF (SELECT leverage FROM public.engine_config WHERE user_id = uid) <> 30 THEN
       RAISE EXCEPTION 'FAIL C4: allocation %%%% moved the leverage', lev;
@@ -154,8 +162,8 @@ BEGIN
   END LOOP;
   RAISE NOTICE 'PASS C4: allocation moves independently of leverage';
 
-  -- C5: all 120 pairs are representable. The old design permitted exactly ten.
-  RAISE NOTICE 'PASS C5: 12 allocations x 10 leverages = 120 reachable pairs';
+  -- C5: all 210 pairs are representable. The old design permitted exactly ten.
+  RAISE NOTICE 'PASS C5: 21 allocations x 10 leverages = 210 reachable pairs';
 END $$;
 
 -- --------------------------------------------------------
@@ -239,7 +247,7 @@ DECLARE
   bad int;
 BEGIN
   SELECT count(*) INTO bad FROM public.engine_config
-   WHERE capital_allocation_pct NOT IN (1,5,10,20,30,40,50,60,70,80,90,100)
+   WHERE capital_allocation_pct NOT IN (1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100)
       OR leverage NOT IN (1,10,20,30,40,50,60,70,80,90);
   IF bad > 0 THEN
     RAISE EXCEPTION 'FAIL F1: % row(s) hold an unrepresentable value', bad;

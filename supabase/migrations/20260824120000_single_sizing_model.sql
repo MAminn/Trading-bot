@@ -27,18 +27,21 @@
 -- a legacy row that cannot be represented exactly must land on LESS exposure,
 -- never more. Users below the smallest step land on it.
 
--- Permitted allocations: 1, 5, 10, 20, 30, ... 100.
+-- Permitted allocations: 1, then exact 5% steps — 5, 10, 15 ... 100.
+-- 1% is a deliberate special first step below the regular grid.
+--
+-- Snap-down rule, in one expression:
+--   >= 5  -> floor(pct / 5) * 5   (7 -> 5, 12 -> 10, 17 -> 15, 99 -> 95, 100 -> 100)
+--   < 5   -> 1                    (4 -> 1, 1 -> 1, and anything smaller)
 UPDATE public.engine_config
 SET capital_allocation_pct = CASE
       WHEN capital_allocation_pct >= 100 THEN 100
-      WHEN capital_allocation_pct >= 10 THEN floor(capital_allocation_pct / 10) * 10
-      WHEN capital_allocation_pct >= 5 THEN 5
+      WHEN capital_allocation_pct >= 5 THEN floor(capital_allocation_pct / 5) * 5
       ELSE 1
     END
 WHERE capital_allocation_pct IS DISTINCT FROM CASE
       WHEN capital_allocation_pct >= 100 THEN 100
-      WHEN capital_allocation_pct >= 10 THEN floor(capital_allocation_pct / 10) * 10
-      WHEN capital_allocation_pct >= 5 THEN 5
+      WHEN capital_allocation_pct >= 5 THEN floor(capital_allocation_pct / 5) * 5
       ELSE 1
     END;
 
@@ -59,7 +62,11 @@ ALTER TABLE public.engine_config
   DROP CONSTRAINT IF EXISTS engine_config_alloc_check;
 ALTER TABLE public.engine_config
   ADD CONSTRAINT engine_config_alloc_check
-  CHECK (capital_allocation_pct IN (1,5,10,20,30,40,50,60,70,80,90,100));
+  CHECK (capital_allocation_pct IN (
+    1,
+    5,10,15,20,25,30,35,40,45,50,
+    55,60,65,70,75,80,85,90,95,100
+  ));
 
 ALTER TABLE public.engine_config
   DROP CONSTRAINT IF EXISTS engine_config_leverage_check;
@@ -158,7 +165,7 @@ GRANT UPDATE (
 ) ON public.engine_config TO authenticated;
 
 COMMENT ON COLUMN public.engine_config.capital_allocation_pct IS
-  'Percentage of the user''s live Binance USD-M totalWalletBalance committed as margin. Independent of leverage.';
+  'Percentage of the user''s live Binance USD-M totalWalletBalance committed as margin. One of 1, or 5-100 in 5%% steps. Independent of leverage.';
 COMMENT ON COLUMN public.engine_config.leverage IS
   'Leverage multiplier applied to the allocated margin. Independent of capital_allocation_pct.';
 COMMENT ON COLUMN public.engine_config.capital_usd IS

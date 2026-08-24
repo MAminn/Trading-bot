@@ -55,7 +55,7 @@ BEGIN
   FOR r IN
     SELECT user_id, capital_allocation_pct AS pct, leverage AS lev
       FROM public.engine_config
-     WHERE capital_allocation_pct NOT IN (1,5,10,20,30,40,50,60,70,80,90,100)
+     WHERE capital_allocation_pct NOT IN (1,5,10,15,20,25,30,35,40,45,50,55,60,65,70,75,80,85,90,95,100)
         OR leverage NOT IN (1,10,20,30,40,50,60,70,80,90)
   LOOP
     n := n + 1;

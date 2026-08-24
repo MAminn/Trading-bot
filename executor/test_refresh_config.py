@@ -64,7 +64,13 @@ def test_allocation_and_leverage_are_read_independently():
     assert c._leverage == Decimal("1")
 
 
-@pytest.mark.parametrize("pct", [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100])
+@pytest.mark.parametrize(
+    "pct",
+    # 1%, then exact 5%% steps to 100%. The executor validates the RANGE rather
+    # than the grid — the UI, the Zod validator and the DB CHECK enforce the
+    # grid — but every permitted value must still refresh clean.
+    [1] + list(range(5, 101, 5)),
+)
 def test_every_permitted_allocation_is_accepted(pct):
     c, _ = make_consumer(dict(BASE_CONFIG, capital_allocation_pct=pct))
     c._refresh_config()

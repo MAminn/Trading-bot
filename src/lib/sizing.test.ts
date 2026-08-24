@@ -35,10 +35,23 @@ import {
 test("allocation offers exactly the specified percentages", () => {
   assert.deepEqual(
     [...ALLOCATION_PCTS],
-    [1, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+    [1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100],
   );
   assert.equal(ALLOC_MIN, 1);
   assert.equal(ALLOC_MAX, 100);
+  assert.equal(ALLOCATION_PCTS.length, 21);
+});
+
+test("1% is the only step below 5%, and the rest are exact 5% increments", () => {
+  const [first, ...grid] = ALLOCATION_PCTS;
+  assert.equal(first, 1, "1% must remain the special first step");
+  assert.deepEqual([...grid], Array.from({ length: 20 }, (_, i) => (i + 1) * 5));
+  // No second sub-5% value crept in.
+  assert.deepEqual(ALLOCATION_PCTS.filter((v) => v < 5), [1]);
+  // Every gap from 5% onward is exactly 5.
+  for (let i = 1; i < grid.length; i++) {
+    assert.equal(grid[i] - grid[i - 1], 5, `gap at ${grid[i]} is not 5`);
+  }
 });
 
 test("leverage offers exactly the specified multipliers", () => {
@@ -54,7 +67,9 @@ test("allocation reaches 100% — the old 1-10% ceiling is gone", () => {
 });
 
 test("values between the steps are not selectable", () => {
-  for (const bad of [0, 2, 3, 7, 15, 99, 101, -1, 1.5, Number.NaN]) {
+  // 2, 3, 4 sit below the grid and are not the special first step; 7, 12, 99
+  // sit between 5% steps. 15 is now permitted, and is asserted above.
+  for (const bad of [0, 2, 3, 4, 7, 12, 99, 101, -1, 1.5, 2.5, Number.NaN]) {
     assert.equal(isAllocationPct(bad), false, `${bad} must not be a valid allocation`);
   }
   for (const bad of [0, 5, 25, 91, 100, -1, 30.5, Number.NaN]) {
@@ -70,14 +85,41 @@ test("defaults fail small", () => {
 // --- snapping legacy rows -------------------------------------------------- //
 
 test("a stored value snaps DOWN to a permitted one, never up", () => {
+  // The exact cases named in the change request.
   assert.equal(toAllocationPct(7), 5);
-  assert.equal(toAllocationPct(9), 5);
-  assert.equal(toAllocationPct(29), 20);
+  assert.equal(toAllocationPct(12), 10);
+  assert.equal(toAllocationPct(17), 15);
+  assert.equal(toAllocationPct(99), 95);
   assert.equal(toAllocationPct(100), 100);
+  assert.equal(toAllocationPct(4), 1);
+  assert.equal(toAllocationPct(1), 1);
+  // ... and the rest of the grid.
+  assert.equal(toAllocationPct(9), 5);
+  assert.equal(toAllocationPct(29), 25);
   assert.equal(toAllocationPct(1000), 100);
   assert.equal(toLeverageStep(35), 30);
   assert.equal(toLeverageStep(9), 1);
   assert.equal(toLeverageStep(125), 90);
+});
+
+test("snapping never increases exposure, at any input", () => {
+  // The property behind the examples: for every value a legacy row could hold,
+  // the snapped result is permitted and is never larger than the original.
+  for (let v = 1; v <= 120; v += 0.5) {
+    const snapped = toAllocationPct(v);
+    assert.ok(isAllocationPct(snapped), `${v} snapped to non-permitted ${snapped}`);
+    assert.ok(snapped <= v, `${v} snapped UP to ${snapped}`);
+  }
+});
+
+test("the migration snap-down agrees with the UI snap-down", () => {
+  // The SQL in 20260824120000 is:
+  //   >= 100 -> 100 ; >= 5 -> floor(pct / 5) * 5 ; else 1
+  // A divergence would let the migration write a value the UI then refuses.
+  const sql = (v: number) => (v >= 100 ? 100 : v >= 5 ? Math.floor(v / 5) * 5 : 1);
+  for (let v = 1; v <= 150; v += 0.5) {
+    assert.equal(toAllocationPct(v), sql(v), `divergence at ${v}`);
+  }
 });
 
 test("an unreadable stored value falls back to the smallest step", () => {
@@ -124,7 +166,7 @@ test("changing allocation does not alter leverage", () => {
 });
 
 test("every allocation x leverage pair is reachable", () => {
-  // 120 combinations, none forbidden by the other's value. The old design
+  // 210 combinations, none forbidden by the other's value. The old design
   // permitted exactly ten pairs.
   const seen = new Set<string>();
   for (const pct of ALLOCATION_PCTS) {
@@ -134,7 +176,7 @@ test("every allocation x leverage pair is reachable", () => {
     }
   }
   assert.equal(seen.size, ALLOCATION_PCTS.length * LEVERAGE_STEPS.length);
-  assert.equal(seen.size, 120);
+  assert.equal(seen.size, 210);
 });
 
 test("no wallet reading means no size, not a fabricated one", () => {
