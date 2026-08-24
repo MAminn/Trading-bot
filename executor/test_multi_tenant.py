@@ -90,7 +90,6 @@ class FakeConsumer:
         self.db_execution_mode = FakeConsumer.modes.get(user_id, "LIVE_TRADE")
         self.db_auto_execute_enabled = True
         self.db_is_running = FakeConsumer.running.get(user_id, True)
-        self.live_order_cap_usd = Decimal("25")
         self.desired_leverage = 1
         self.last_reconcile = None
         self.traders: list = []
@@ -108,7 +107,7 @@ class FakeConsumer:
     def set_trader(self, trader):
         self.traders.append(trader)
 
-    def set_available_balance(self, balance):
+    def set_account_balances(self, *, wallet_balance, available_balance):
         pass
 
     def set_leverage_limits(self, max_leverage, ladder):
@@ -202,8 +201,6 @@ def limits(env_mode="LIVE_TRADE"):
         base_url="https://fapi.binance.com",
         trade_capable=env_mode == "LIVE_TRADE",
         ack_present=True,
-        live_order_cap_usd=Decimal("25"),
-        env_order_cap_reported=Decimal("25"),
         app_api_base="https://app.example.test",
         engine_service_token="service-token",
         is_live=True,

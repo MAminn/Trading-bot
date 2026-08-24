@@ -13,12 +13,16 @@ import { createFileRoute } from "@tanstack/react-router";
 
 const CONFIG_FIELDS = [
   "mode",
-  "sizing_mode",
-  "capital_usd",
-  "account_size_usd",
+  // The two, and only two, sizing inputs the executor reads. It multiplies them
+  // by the user's own Binance totalWalletBalance, which is read from the
+  // exchange and deliberately has no column here — a stored or hand-entered
+  // balance is exactly what this endpoint must not be able to supply.
   "capital_allocation_pct",
   "leverage",
-  "max_notional_usd",
+  // LEGACY, and unused by sizing. Served only so an executor build that
+  // predates the single-sizing-model change still parses this response instead
+  // of failing its config refresh mid-rollout.
+  "capital_usd",
   "max_daily_loss_usd",
   "max_position_size_usd",
   "is_running",
@@ -27,8 +31,6 @@ const CONFIG_FIELDS = [
   // its own environment, which stays the ceiling — nothing here can raise
   // capability, only lower it.
   "execution_mode",
-  "live_order_cap_usd",
-  "live_allow_full_capital",
   "auto_execute_enabled",
   "updated_at",
 ] as const;

@@ -24,9 +24,15 @@ function Landing() {
   const trades = useTrades(500);
   const eth = useLivePrice("ETHUSDT");
   const live = liveState(status.data) === "running";
+  // LEGACY MODEL BASELINE — not money, and not the Binance wallet. capital_usd
+  // is a config column that defaults to 10,000, so for a client who has
+  // connected nothing this is 10,000 of nothing. It scales the strategy's
+  // percentage returns into a currency-shaped illustration and must always be
+  // labelled as a model. A real balance comes only from resolveWalletDisplay,
+  // which reads a signed Binance account read; see app.dashboard.tsx.
   const capital = Number(config.data?.capital_usd ?? 10000);
   const metrics = computeMetrics(trades.data ?? [], capital);
-  const equity = capital + metrics.netPnl;
+  const modelledEquity = capital + metrics.netPnl;
   const lastSignal = signals.data?.[0];
   const lastSide = lastSignal ? signalSideLabel(lastSignal) : "FLAT";
   const sideClass = lastSide === "SHORT" ? "text-destructive" : lastSide === "LONG" ? "text-success" : "text-muted-foreground";
@@ -119,8 +125,14 @@ function Landing() {
             <div className="card-elevated relative overflow-hidden p-6">
               <div className="flex items-center justify-between">
                 <div>
-                  <div className="text-xs uppercase tracking-widest text-muted-foreground">Equity</div>
-                  <div className="mt-1 font-mono text-3xl font-semibold">{fmtUSD(equity)}</div>
+                  <div className="text-xs uppercase tracking-widest text-muted-foreground">
+                    Strategy model · not your wallet
+                  </div>
+                  <div className="mt-1 font-mono text-3xl font-semibold">{fmtUSD(modelledEquity)}</div>
+                  <div className="mt-1 text-[10px] text-muted-foreground">
+                    {fmtUSD(capital)} modelled baseline + strategy P&amp;L. Your real
+                    Binance balance is on the Dashboard.
+                  </div>
                 </div>
                 <div className={`rounded-md border px-2 py-1 font-mono text-xs ${metrics.netPnl >= 0 ? "border-success/30 bg-success/10 text-success" : "border-destructive/30 bg-destructive/10 text-destructive"}`}>
                   {metrics.totalTrades > 0 ? fmtPct((metrics.netPnl / 10000) * 100, true) : "—"}

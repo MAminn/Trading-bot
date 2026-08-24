@@ -131,7 +131,7 @@ class FakeConsumer:
     def set_trader(self, trader):
         self.traders.append(trader)
 
-    def set_available_balance(self, balance):
+    def set_account_balances(self, *, wallet_balance, available_balance):
         pass
 
     def set_leverage_limits(self, max_leverage, ladder):

@@ -11,6 +11,10 @@ import { SignalTimelinePanel } from "@/components/SignalTimelinePanel";
 export function OpenPositionsCard() {
   const { data: positions } = useOpenPositions();
   const { data: config } = useEngineConfig();
+  // LEGACY MODEL BASELINE, not the Binance wallet: capital_usd is a config
+  // column, and the dollar figures derived from it below are the strategy's
+  // percentage return scaled by it. They are NOT realised Binance P&L. The
+  // rate is shown alongside every one of them for that reason.
   const capital = Number(config?.capital_usd ?? 0);
   const leverage = Number(config?.leverage ?? 1);
   const [timelineId, setTimelineId] = useState<string | null>(null);
@@ -157,7 +161,10 @@ function PositionRow({ pos, capital, leverage, onTimeline }: {
               <Detail k="Bars held" v={pos.bars_held?.toString() ?? "—"} />
               <Detail k="ML prob" v={prob != null ? prob.toFixed(3) : "—"} />
               <Detail k="Threshold" v={thr != null ? thr.toFixed(3) : "—"} />
-              <Detail k="Unrealized P&L" v={`${fmtUSD(pnlUsd, true)} (${fmtPct(pnlRate * 100, true)})`} />
+              <Detail
+                k="Unrealized P&L (modelled)"
+                v={`${fmtUSD(pnlUsd, true)} (${fmtPct(pnlRate * 100, true)})`}
+              />
             </div>
 
             <div className="mt-4">

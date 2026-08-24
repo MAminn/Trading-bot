@@ -76,8 +76,6 @@ def build_snapshot(
     message: str | None,
     db_execution_mode: str | None = None,
     auto_execute_enabled: bool | None = None,
-    live_order_cap_usd=None,
-    live_order_cap_env_max=None,
     orders_enabled: bool | None = None,
     blocked_reason: str | None = None,
 ) -> dict:
@@ -97,8 +95,6 @@ def build_snapshot(
         "env_mode_ceiling": env_mode_ceiling,
         "db_execution_mode": db_execution_mode,
         "auto_execute_enabled": auto_execute_enabled,
-        "live_order_cap_usd": _as_float(live_order_cap_usd),
-        "live_order_cap_env_max": _as_float(live_order_cap_env_max),
         "orders_enabled": orders_enabled,
         "blocked_reason": blocked_reason,
         "wallet_balance_usd": _as_float((account or {}).get("totalWalletBalance")),

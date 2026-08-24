@@ -89,7 +89,10 @@ function AdminPage() {
               <tr>
                 <th className="px-4 py-2 text-left">User</th>
                 <th className="px-4 py-2 text-left">Engine</th>
-                <th className="px-4 py-2 text-right">Capital</th>
+                {/* capital_usd: the legacy P&L-scaling baseline, NOT the
+                    client's Binance balance. Labelled so an operator cannot
+                    read this column as funds under management. */}
+                <th className="px-4 py-2 text-right">Model baseline</th>
                 <th className="px-4 py-2 text-right">Trades</th>
                 <th className="px-4 py-2 text-right">Win rate</th>
                 <th className="px-4 py-2 text-right">Net P&L</th>

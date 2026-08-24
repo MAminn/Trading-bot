@@ -16,7 +16,6 @@ or sees one.
 
 import hashlib
 import logging
-import os
 import time
 from datetime import datetime, timezone
 from decimal import ROUND_DOWN, Decimal
@@ -24,7 +23,6 @@ from decimal import ROUND_DOWN, Decimal
 import requests
 
 from binance_client import BinanceAPIError, BinanceFuturesClient
-from live_controls import allow_full_capital, resolve_live_order_cap
 from reconciler import Reconciler, ReconcilerError
 
 log = logging.getLogger("executor.consumer")
@@ -36,16 +34,8 @@ REQUEST_TIMEOUT_SECONDS = 10
 CONFIG_REFRESH_EVERY_CYCLES = 1
 
 STEP_SIZE = Decimal("0.001")
+# Binance's ETHUSDT minimum notional. An exchange constraint, not a policy.
 MIN_NOTIONAL_USD = Decimal("20")
-# Code ceiling for the first soak. Not reachable from the UI.
-# Applies in allocation mode only; full_capital is bounded by available margin
-# and the exchange bracket cap instead.
-HARD_CAP_USD = Decimal("500")
-# Never commit more than this fraction of available balance as margin.
-MARGIN_SAFETY_FRACTION = Decimal("0.90")
-
-# The only two recognised sizing modes. Anything else blocks OPENs.
-SIZING_MODES = frozenset({"allocation", "full_capital"})
 
 # Transient keys carried on the intent dict for the risk guard only. They are
 # stripped before POSTing so they never reach the app's Zod schema.
@@ -83,10 +73,6 @@ MODE_BINANCE_BASE_URLS = {
 TRADE_CAPABLE_MODES = frozenset({"TESTNET_TRADE", "LIVE_TRADE"})
 LIVE_MODES = frozenset({"LIVE_READ", "LIVE_TRADE"})
 
-# full_capital is not permitted on mainnet unless this env var is explicitly
-# set to "1". The first live runs must size through the capped allocation path.
-LIVE_ALLOW_FULL_CAPITAL_ENV = "LIVE_ALLOW_FULL_CAPITAL"
-
 
 class SignalConsumerError(Exception):
     """Raised on any app-API failure so the caller's retry rules apply."""
@@ -119,7 +105,6 @@ class SignalConsumer:
         start_after: str | None = None,
         risk_guard=None,
         binance_trader=None,
-        live_order_cap_usd=None,
     ):
         if execution_mode not in MODE_BINANCE_BASE_URLS:
             raise SignalConsumerError(
@@ -138,19 +123,6 @@ class SignalConsumer:
         self._execution_mode = execution_mode
         self._symbol = symbol
         self._is_live = execution_mode in LIVE_MODES
-        self._live_order_cap_usd = (
-            None if live_order_cap_usd is None else Decimal(str(live_order_cap_usd))
-        )
-        # Read once at construction: a mid-run env change must not widen sizing.
-        # This is the HOST's consent to full-capital sizing; the database carries
-        # the operator's, and both are required.
-        self._live_allow_full_capital_env = (
-            os.environ.get(LIVE_ALLOW_FULL_CAPITAL_ENV, "").strip() == "1"
-        )
-        self._live_allow_full_capital_db = False
-        # The env cap is this host's hard ceiling. A database cap may lower the
-        # effective cap but can never raise it past this value.
-        self._live_order_cap_ceiling = self._live_order_cap_usd
         # Live controls read from the database on every refresh. Every one
         # defaults to the closed position, so a missing column, an unreadable
         # value or a failed refresh can never enable anything.
@@ -173,15 +145,18 @@ class SignalConsumer:
         # True between the first ensure_config() of a cycle and the end of
         # poll_once, so repeated calls in one cycle cannot double-count.
         self._cycle_counted = False
+        # The two, and only two, independent sizing controls.
         self._leverage: Decimal | None = None
-        self._capital_usd: Decimal | None = None
         self._alloc_pct: Decimal | None = None
-        self._max_notional_usd: Decimal | None = None
-        self._sizing_mode: str = "allocation"
-        self._account_size_usd: Decimal | None = None
         # Set by any refresh that cannot be trusted to size an order. Blocks
         # OPENs only — CLOSEs are never gated on it.
         self._config_invalid: bool = False
+        # The capital base: this user's OWN Binance USD-M totalWalletBalance,
+        # re-read from the exchange every cycle. Never a stored number, never a
+        # figure typed into the website, never another user's wallet.
+        self._wallet_balance: Decimal | None = None
+        # availableBalance. A sanity check on whether the requested margin can
+        # actually be posted — never the base the allocation is taken from.
         self._available_balance: Decimal | None = None
         self._exchange_max_leverage: int | None = None
         # Full exchange bracket ladder; the applicable cap is selected from it
@@ -225,60 +200,26 @@ class SignalConsumer:
         # recovers on the next cycle without a restart.
         self._config_invalid = False
 
-        for field, attr in (
-            ("leverage", "_leverage"),
-            ("capital_allocation_pct", "_alloc_pct"),
-            ("capital_usd", "_capital_usd"),
-        ):
+        # --- the two independent sizing controls --------------------------- #
+        # Read separately, validated separately, stored separately. Neither is
+        # derived from the other and neither constrains the other: moving
+        # allocation cannot change leverage, and moving leverage cannot change
+        # allocation. There is no third sizing input and no sizing mode.
+        for field, attr in (("leverage", "_leverage"), ("capital_allocation_pct", "_alloc_pct")):
             value = config.get(field)
             if value is None:
                 raise SignalConsumerError(f"config missing {field}")
             setattr(self, attr, Decimal(str(value)))
 
-        raw_max_notional = config.get("max_notional_usd")
-        if raw_max_notional is None:
-            # Pre-migration rows have no column; fall back to the code ceiling.
-            self._max_notional_usd = HARD_CAP_USD
-            log.info(
-                "config missing max_notional_usd, defaulting to HARD_CAP_USD=%s",
-                HARD_CAP_USD,
+        if not (0 < self._alloc_pct <= 100):
+            self._config_invalid = True
+            log.error(
+                "capital_allocation_pct=%s is outside 0-100 — OPENs blocked",
+                self._alloc_pct,
             )
-        else:
-            self._max_notional_usd = Decimal(str(raw_max_notional))
-
-        # --- sizing mode -------------------------------------------------- #
-        if "sizing_mode" not in config:
-            # Pre-migration rows have no column. Same precedent as the
-            # max_notional_usd fallback: default to the narrower mode.
-            self._sizing_mode = "allocation"
-            log.info("config missing sizing_mode, defaulting to allocation")
-        else:
-            raw_mode = config.get("sizing_mode")
-            if raw_mode in SIZING_MODES:
-                self._sizing_mode = raw_mode
-            else:
-                # Never guess: an unrecognised mode blocks OPENs outright.
-                self._sizing_mode = "allocation"
-                self._config_invalid = True
-                log.error(
-                    "invalid sizing_mode=%r (allowed: %s) — OPENs blocked",
-                    raw_mode,
-                    "/".join(sorted(SIZING_MODES)),
-                )
-
-        # --- account size -------------------------------------------------- #
-        raw_account_size = config.get("account_size_usd")
-        if raw_account_size is None:
-            self._account_size_usd = None
-        else:
-            try:
-                self._account_size_usd = Decimal(str(raw_account_size))
-            except (ArithmeticError, TypeError, ValueError):
-                self._account_size_usd = None
-                self._config_invalid = True
-                log.error(
-                    "unreadable account_size_usd=%r — OPENs blocked", raw_account_size
-                )
+        if self._leverage <= 0:
+            self._config_invalid = True
+            log.error("leverage=%s must be positive — OPENs blocked", self._leverage)
 
         # --- live execution controls --------------------------------------- #
         # Every one of these fails closed: an absent column, a null, or an
@@ -297,82 +238,30 @@ class SignalConsumer:
 
         self._db_auto_execute_enabled = config.get("auto_execute_enabled") is True
         self._db_is_running = config.get("is_running") is True
-        self._live_allow_full_capital_db = config.get("live_allow_full_capital") is True
-
-        # The effective cap is the smaller of the host ceiling and the request.
-        self._live_order_cap_usd = resolve_live_order_cap(
-            self._live_order_cap_ceiling, config.get("live_order_cap_usd")
-        )
-        if self._risk_guard is not None:
-            self._risk_guard.set_live_cap(self._live_order_cap_usd)
-
-        # On mainnet, full_capital needs consent from BOTH the database and the
-        # host. The config alone can never move a live executor onto the
-        # uncapped sizing path — someone with server access has to agree too.
-        if self._is_live and self._sizing_mode == "full_capital" and not allow_full_capital(
-            self._live_allow_full_capital_env, self._live_allow_full_capital_db
-        ):
-            self._config_invalid = True
-            log.error(
-                "sizing_mode=full_capital is not permitted in %s without both "
-                "%s=1 (host: %s) and live_allow_full_capital (database: %s) "
-                "— OPENs blocked",
-                self._execution_mode,
-                LIVE_ALLOW_FULL_CAPITAL_ENV,
-                self._live_allow_full_capital_env,
-                self._live_allow_full_capital_db,
-            )
-
-        # full_capital sizes directly off account_size_usd, so a missing or
-        # non-positive value leaves the sizing base undefined. Fail closed.
-        if self._sizing_mode == "full_capital" and (
-            self._account_size_usd is None or self._account_size_usd <= 0
-        ):
-            self._config_invalid = True
-            log.error(
-                "sizing_mode=full_capital requires account_size_usd > 0 "
-                "(got %r) — OPENs blocked",
-                self._account_size_usd,
-            )
 
         # Leverage may have moved, so the applicable bracket tier may have too.
         self._apply_bracket_selection()
 
-        log.info(
-            "config refreshed | leverage=%s | alloc_pct=%s | capital_usd=%s | "
-            "max_notional_usd=%s",
-            self._leverage,
-            self._alloc_pct,
-            self._capital_usd,
-            self._max_notional_usd,
-        )
         # The line that determines exposure. Never log the response body.
+        # wallet_balance is the live exchange reading, shown here so the log
+        # line names every input to the formula it describes.
         log.info(
-            "sizing | mode=%s | account_size_usd=%s | capital_usd=%s | "
-            "leverage=%s | max_notional_usd=%s",
-            self._sizing_mode,
-            self._account_size_usd,
-            self._capital_usd,
+            "sizing | wallet_balance=%s x alloc_pct=%s%% x leverage=%s | "
+            "allocated_margin=%s | target_notional=%s",
+            self._wallet_balance,
+            self._alloc_pct,
             self._leverage,
-            self._max_notional_usd,
+            self._allocated_margin(),
+            self._target_notional(),
         )
         # The control plane, logged every refresh. Never the response body:
         # these are the only fields worth reading and none of them is a secret.
         log.info(
-            "live controls | db_execution_mode=%s | auto_execute=%s | "
-            "is_running=%s | db_allow_full_capital=%s | cap: host=%s db=%s "
-            "effective=%s",
+            "live controls | db_execution_mode=%s | auto_execute=%s | is_running=%s",
             self._db_execution_mode,
             self._db_auto_execute_enabled,
             self._db_is_running,
-            self._live_allow_full_capital_db,
-            self._live_order_cap_ceiling,
-            config.get("live_order_cap_usd"),
-            self._live_order_cap_usd,
         )
-        if self._risk_guard is not None:
-            self._risk_guard.update_limits(max_notional_usd=self._max_notional_usd)
-            self._risk_guard.set_sizing_mode(self._sizing_mode)
 
     def ensure_config(self) -> None:
         """Refresh config if due. Safe to call every cycle.
@@ -402,16 +291,6 @@ class SignalConsumer:
     @property
     def db_is_running(self) -> bool:
         return self._db_is_running
-
-    @property
-    def live_order_cap_usd(self):
-        """The cap actually in force: min(host ceiling, database request)."""
-        return self._live_order_cap_usd
-
-    @property
-    def live_order_cap_ceiling(self):
-        """This host's hard ceiling from .env; never raised by any config."""
-        return self._live_order_cap_ceiling
 
     def end_cycle(self) -> None:
         """Close the cycle without running poll_once.
@@ -501,9 +380,54 @@ class SignalConsumer:
             self._bracket_notional_cap,
         )
 
-    def set_available_balance(self, bal: Decimal) -> None:
-        """Record the account's available balance for the margin sanity check."""
-        self._available_balance = Decimal(str(bal))
+    @staticmethod
+    def _to_decimal(value):
+        """Decimal, or None when the value is absent or unreadable. A balance
+        that cannot be read is 'unknown', which blocks OPENs — never zero, and
+        never a guess."""
+        if value is None:
+            return None
+        try:
+            return Decimal(str(value))
+        except (ArithmeticError, TypeError, ValueError):
+            return None
+
+    def set_account_balances(self, *, wallet_balance, available_balance) -> None:
+        """Record this cycle's reading of THIS user's Binance USD-M account.
+
+        `wallet_balance` is `totalWalletBalance` and is the capital base every
+        OPEN is sized from. `available_balance` is `availableBalance` and is used
+        only to check that the requested margin can actually be posted.
+
+        Both are re-read from the exchange every cycle and are never persisted:
+        there is no stored, configured or operator-supplied balance anywhere in
+        this path, and each session holds exactly one user's figures.
+        """
+        self._wallet_balance = self._to_decimal(wallet_balance)
+        self._available_balance = self._to_decimal(available_balance)
+        if self._wallet_balance is None:
+            log.error(
+                "wallet balance unreadable (%r) — OPENs blocked for this cycle",
+                wallet_balance,
+            )
+
+    @property
+    def wallet_balance(self):
+        """Last read totalWalletBalance, or None before the first signed read."""
+        return self._wallet_balance
+
+    def _allocated_margin(self):
+        """wallet_balance x allocation%, or None when either input is missing."""
+        if self._wallet_balance is None or self._alloc_pct is None:
+            return None
+        return self._wallet_balance * self._alloc_pct / Decimal(100)
+
+    def _target_notional(self):
+        """allocated_margin x leverage, or None when either input is missing."""
+        margin = self._allocated_margin()
+        if margin is None or self._leverage is None:
+            return None
+        return margin * self._leverage
 
     def _post_order(self, order: dict) -> bool:
         """POST the intent. Returns True if newly created (201), False if the
@@ -577,8 +501,6 @@ class SignalConsumer:
             "leverage": int(self._leverage),
         }
 
-        mode = self._sizing_mode
-
         # Uncertainty never widens: an unusable sizing config sizes nothing.
         if self._config_invalid:
             order["status"] = "SKIPPED"
@@ -586,40 +508,36 @@ class SignalConsumer:
             log.error("SIZE BLOCKED | invalid sizing config | key=%s", idempotency_key)
             return order
 
-        if mode == "full_capital":
-            # Load-bearing. Allocation mode tolerates an unknown balance because
-            # HARD_CAP_USD still binds; here nothing would bound the base at all.
-            if self._available_balance is None:
-                order["status"] = "SKIPPED"
-                order["error"] = "available balance unknown"
-                log.error(
-                    "SIZE BLOCKED | available balance unknown | key=%s",
-                    idempotency_key,
-                )
-                return order
-            # base = min(account_size, available_balance * MARGIN_SAFETY_FRACTION),
-            # expressed as a cap on the target so the binding constraint is named.
-            target = self._account_size_usd * self._leverage
-            caps = [
-                (
-                    "available_margin",
-                    self._available_balance
-                    * MARGIN_SAFETY_FRACTION
-                    * self._leverage,
-                )
-            ]
-        else:
-            target = self._capital_usd * self._leverage
-            caps = [
-                ("max_notional_usd", self._max_notional_usd),
-                ("hard_cap", HARD_CAP_USD),
-            ]
+        # Load-bearing, and the reason there is no fallback: the capital base is
+        # THIS user's real Binance wallet. Without a reading of it there is no
+        # defensible number to size from, so nothing is sized.
+        if self._wallet_balance is None:
+            order["status"] = "SKIPPED"
+            order["error"] = "wallet balance unknown"
+            log.error(
+                "SIZE BLOCKED | wallet balance unknown | key=%s", idempotency_key
+            )
+            return order
+
+        # ---- the sizing formula, in full ---------------------------------- #
+        #   allocated_margin = totalWalletBalance x allocation% / 100
+        #   target_notional  = allocated_margin  x leverage
+        # allocation and leverage are read independently and multiplied here;
+        # neither is derived from the other.
+        allocated_margin = self._allocated_margin()
+        target = allocated_margin * self._leverage
+
+        # Applied AFTER the formula, never folded into it, and named in the
+        # log whenever it binds.
+        #
+        # There is exactly ONE cap here, and it is the exchange's: the notional
+        # ceiling of the leverage-bracket tier that permits the configured
+        # leverage. No operator dollar cap, no config value and no code constant
+        # appears in this list — the formula above IS the size, and anything
+        # able to silently reduce it would be a second sizing model.
+        caps = []
         if self._bracket_notional_cap is not None:
             caps.append(("bracket_cap", self._bracket_notional_cap))
-        # Appended last and outside the mode branch: the live cap binds in
-        # allocation and full_capital alike, and no config value can lift it.
-        if self._live_order_cap_usd is not None:
-            caps.append(("live_order_cap", self._live_order_cap_usd))
 
         notional_target = target
         bound_by = None
@@ -628,9 +546,12 @@ class SignalConsumer:
                 notional_target = cap
                 bound_by = name
         if bound_by is not None:
-            log.info(
-                "SIZE CLAMPED | mode=%s | target=%s -> %s | bound_by=%s",
-                mode,
+            log.warning(
+                "SIZE CLAMPED | wallet=%s alloc=%s%% lev=%s | target=%s -> %s | "
+                "bound_by=%s",
+                self._wallet_balance,
+                self._alloc_pct,
+                self._leverage,
                 target,
                 notional_target,
                 bound_by,
@@ -644,12 +565,13 @@ class SignalConsumer:
         if notional < MIN_NOTIONAL_USD:
             order["status"] = "SKIPPED"
             order["error"] = "below min notional"
-        elif self._available_balance is not None and (
-            notional / self._leverage
-            > self._available_balance * MARGIN_SAFETY_FRACTION
+        elif (
+            self._available_balance is not None
+            and notional / self._leverage > self._available_balance
         ):
-            # Redundant by construction in full_capital; kept in both modes as a
-            # second line of defence.
+            # A sanity check, not a sizing input: availableBalance never reduces
+            # the allocation, it only refuses an order whose margin the account
+            # demonstrably cannot post.
             order["status"] = "SKIPPED"
             order["error"] = "insufficient margin for configured size"
         return order

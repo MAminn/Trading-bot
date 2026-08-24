@@ -20,6 +20,8 @@ const { resolveWalletDisplay } = await import("./wallet-display.ts");
 
 const DASHBOARD = "src/routes/app.dashboard.tsx";
 const REPORTS = "src/routes/app.reports.tsx";
+const CONFIGURE = "src/routes/app.configure.tsx";
+const ENGINE = "src/routes/app.engine.tsx";
 
 /** A heartbeat recent enough to count as live. */
 const NOW = () => new Date().toISOString();
@@ -168,13 +170,27 @@ test("the strategy curve is labelled as a model, not a balance", () => {
   }
 });
 
-test("capital_usd is still available for sizing", () => {
-  // The fix is about presentation. The strategy still sizes against this value
-  // and the equity curve is still computed from it — removing it would break
-  // sizing rather than fix a label.
+test("capital_usd remains the P&L scaling base, and only that", () => {
+  // capital_usd is no longer an input to live ORDER SIZING — orders are sized
+  // from the user's real Binance totalWalletBalance. It survives solely as the
+  // notional the strategy's percentage returns are scaled by on the reporting
+  // pages, which is a presentation quantity and is labelled as one.
   const src = readFileSync(DASHBOARD, "utf8");
   assert.ok(src.includes("capital_usd"));
   assert.ok(src.includes("computeMetrics"));
+});
+
+test("no page sizes an order from a configured capital figure", () => {
+  // The sizing helpers take a wallet balance, never a config column. If a page
+  // fed capital_usd into them it would be the old model wearing a new name.
+  for (const page of [DASHBOARD, CONFIGURE, ENGINE, REPORTS]) {
+    const src = readFileSync(page, "utf8");
+    assert.equal(
+      /(targetNotional|allocatedMargin)\([^)]*capital_usd/.test(src),
+      false,
+      `${page} feeds capital_usd into a sizing helper`,
+    );
+  }
 });
 
 test("the wallet figure is never derived from config on the dashboard", () => {

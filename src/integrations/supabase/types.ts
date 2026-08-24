@@ -109,7 +109,6 @@ export type Database = {
       }
       engine_config: {
         Row: {
-          account_size_usd: number | null
           auto_execute_enabled: boolean
           capital_allocation_pct: number
           capital_usd: number
@@ -119,18 +118,13 @@ export type Database = {
           id: string
           is_running: boolean
           leverage: number
-          live_allow_full_capital: boolean
-          live_order_cap_usd: number
           max_daily_loss_usd: number
-          max_notional_usd: number
           max_position_size_usd: number
           mode: string
-          sizing_mode: string
           updated_at: string
           user_id: string
         }
         Insert: {
-          account_size_usd?: number | null
           capital_allocation_pct?: number
           capital_usd?: number
           created_at?: string
@@ -139,18 +133,13 @@ export type Database = {
           id?: string
           is_running?: boolean
           leverage?: number
-          live_allow_full_capital?: boolean
-          live_order_cap_usd?: number
           max_daily_loss_usd?: number
-          max_notional_usd?: number
           max_position_size_usd?: number
           mode?: string
-          sizing_mode?: string
           updated_at?: string
           user_id: string
         }
         Update: {
-          account_size_usd?: number | null
           capital_allocation_pct?: number
           capital_usd?: number
           created_at?: string
@@ -159,13 +148,9 @@ export type Database = {
           id?: string
           is_running?: boolean
           leverage?: number
-          live_allow_full_capital?: boolean
-          live_order_cap_usd?: number
           max_daily_loss_usd?: number
-          max_notional_usd?: number
           max_position_size_usd?: number
           mode?: string
-          sizing_mode?: string
           updated_at?: string
           user_id?: string
         }
@@ -265,8 +250,6 @@ export type Database = {
           blocked_reason: string | null
           created_at: string
           db_execution_mode: string | null
-          live_order_cap_env_max: number | null
-          live_order_cap_usd: number | null
           orders_enabled: boolean | null
           effective_mode: string
           entry_price: number | null
@@ -294,8 +277,6 @@ export type Database = {
           blocked_reason?: string | null
           created_at?: string
           db_execution_mode?: string | null
-          live_order_cap_env_max?: number | null
-          live_order_cap_usd?: number | null
           orders_enabled?: boolean | null
           effective_mode: string
           entry_price?: number | null
@@ -323,8 +304,6 @@ export type Database = {
           blocked_reason?: string | null
           created_at?: string
           db_execution_mode?: string | null
-          live_order_cap_env_max?: number | null
-          live_order_cap_usd?: number | null
           orders_enabled?: boolean | null
           effective_mode?: string
           entry_price?: number | null

@@ -1,12 +1,22 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
-import { Sliders, ExternalLink, Loader2, Check, AlertTriangle, Radio, Info } from "lucide-react";
+import {
+  Sliders,
+  ExternalLink,
+  Loader2,
+  Check,
+  AlertTriangle,
+  Radio,
+  Info,
+  Wallet,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import { useEngineConfig, useUpdateConfig, fmtUSD, type EngineConfigRow } from "@/lib/engine";
 import { useExecutorStatus } from "@/lib/executor";
 import { keysConnected, useBinanceKeyInfo } from "@/lib/binance-keys";
+import { resolveWalletDisplay } from "@/lib/wallet-display";
 import {
   EXECUTOR_CONNECTED_TITLE,
   EXECUTOR_LIVE_ORDER_REQUIREMENTS,
@@ -15,8 +25,6 @@ import {
 } from "@/lib/executor-link";
 import { ExecutorLinkRow } from "@/components/ExecutorLinkRow";
 import {
-  LIVE_ORDER_CAP_MAX_USD,
-  LIVE_ORDER_CAP_MIN_TRADE_USD,
   REQUESTED_EXECUTION_MODES,
   formatViolations,
   isRequestedLiveMode,
@@ -24,16 +32,15 @@ import {
   type RequestedExecutionMode,
 } from "@/lib/live-controls";
 import {
-  ALLOC_MAX,
-  ALLOC_MIN,
-  DEFAULT_SIZING_MODE,
-  LEVERAGE_BY_ALLOC,
-  LEVERAGE_MAX,
-  LEVERAGE_MIN,
-  capitalFromAllocation,
-  isSizingMode,
+  ALLOCATION_PCTS,
+  LEVERAGE_STEPS,
+  allocatedMargin,
   liquidationPct,
-  type SizingMode,
+  targetNotional,
+  toAllocationPct,
+  toLeverageStep,
+  type AllocationPct,
+  type LeverageStep,
 } from "@/lib/sizing";
 
 export const Route = createFileRoute("/app/configure")({
@@ -41,97 +48,49 @@ export const Route = createFileRoute("/app/configure")({
   component: Configure,
 });
 
-// Allocation mode: 10 discrete states, nothing between adjacent steps.
-const allocToIndex = (a: number) => ALLOC_MAX - a;
-const indexToAlloc = (i: number) => ALLOC_MAX - i;
-const clampAlloc = (a: number) =>
-  Math.min(ALLOC_MAX, Math.max(ALLOC_MIN, Math.round(a)));
-const clampLeverage = (l: number) =>
-  Math.min(LEVERAGE_MAX, Math.max(LEVERAGE_MIN, Math.round(l)));
-const allocFromLeverage = (lv: number) => {
-  let best = ALLOC_MAX, bestDiff = Infinity;
-  for (const [a, l] of Object.entries(LEVERAGE_BY_ALLOC)) {
-    const d = Math.abs(l - lv);
-    if (d < bestDiff) { bestDiff = d; best = Number(a); }
-  }
-  return best;
-};
-
 function Configure() {
   const { data: config, isLoading } = useEngineConfig();
   const update = useUpdateConfig();
-  const [sizingMode, setSizingMode] = useState<SizingMode>(DEFAULT_SIZING_MODE);
-  const [accountSize, setAccountSize] = useState("");
-  const [allocPct, setAllocPct] = useState<number>(ALLOC_MAX);
-  // Free leverage, used in full_capital only — kept separate so switching
-  // modes never writes an allocation-derived value into a free field.
-  const [freeLeverage, setFreeLeverage] = useState<number>(LEVERAGE_MIN);
+  // The wallet the engine actually sizes against: this user's own Binance
+  // USD-M totalWalletBalance, as last read by the executor with this user's own
+  // credentials. Read-only here by design — there is no field that can set it,
+  // and no figure typed on this page can become a sizing input.
+  const executor = useExecutorStatus();
+  const keyInfo = useBinanceKeyInfo();
+  const wallet = resolveWalletDisplay(executor.data, { keysConnected: keysConnected(keyInfo) });
+  const walletPending = keyInfo.isLoading || executor.isLoading;
+  const walletUsd = wallet.state === "connected" ? wallet.walletUsd : null;
+
+  // Two independent controls, two independent pieces of state. Nothing derives
+  // one from the other, in either direction.
+  const [allocPct, setAllocPct] = useState<AllocationPct>(ALLOCATION_PCTS[0]);
+  const [leverage, setLeverage] = useState<LeverageStep>(LEVERAGE_STEPS[0]);
 
   useEffect(() => {
     if (!config) return;
-    // An unknown stored mode shows as Allocation — the narrower of the two.
-    setSizingMode(isSizingMode(config.sizing_mode) ? config.sizing_mode : DEFAULT_SIZING_MODE);
-
-    // account_size_usd is now first-class. Fall back to the old lossy
-    // reconstruction only for rows written before the migration.
-    const stored = Number(config.account_size_usd);
-    if (Number.isFinite(stored) && stored > 0) {
-      setAccountSize(String(Math.round(stored)));
-    } else {
-      const pct = Number(config.capital_allocation_pct ?? 100);
-      const cap = Number(config.capital_usd ?? 0);
-      setAccountSize(String(Math.round(pct > 0 ? cap / (pct / 100) : cap)));
-    }
-
-    const rawAlloc = Number(config.capital_allocation_pct);
-    if (Number.isFinite(rawAlloc) && rawAlloc >= ALLOC_MIN && rawAlloc <= ALLOC_MAX) {
-      setAllocPct(clampAlloc(rawAlloc));
-    } else {
-      const rawLev = Number(config.leverage);
-      setAllocPct(Number.isFinite(rawLev) ? allocFromLeverage(rawLev) : ALLOC_MAX);
-    }
-
-    const rawLev = Number(config.leverage);
-    setFreeLeverage(Number.isFinite(rawLev) ? clampLeverage(rawLev) : LEVERAGE_MIN);
+    setAllocPct(toAllocationPct(config.capital_allocation_pct));
+    setLeverage(toLeverageStep(config.leverage));
   }, [config]);
 
-  const isFullCapital = sizingMode === "full_capital";
-  const accountSizeNum = Number(accountSize) || 0;
-  const leverage = isFullCapital ? freeLeverage : (LEVERAGE_BY_ALLOC[allocPct] ?? 1);
-  const capitalUsd = useMemo(
-    () => (isFullCapital ? accountSizeNum : capitalFromAllocation(accountSizeNum, allocPct)),
-    [isFullCapital, accountSizeNum, allocPct],
+  const margin = useMemo(
+    () => (walletUsd === null ? null : allocatedMargin(walletUsd, allocPct)),
+    [walletUsd, allocPct],
   );
+  const notional = useMemo(
+    () => (walletUsd === null ? null : targetNotional(walletUsd, allocPct, leverage)),
+    [walletUsd, allocPct, leverage],
+  );
+
+  const dirty =
+    !!config &&
+    (allocPct !== Number(config.capital_allocation_pct) || leverage !== Number(config.leverage));
 
   async function onSave(e: React.FormEvent) {
     e.preventDefault();
-    if (!(accountSizeNum > 0)) {
-      toast.error("Account size must be greater than 0");
-      return;
-    }
-    if (capitalUsd < 1) {
-      toast.error("Account size is too small for the selected allocation");
-      return;
-    }
     try {
-      // Every sizing patch declares its mode. full_capital deliberately omits
-      // capital_allocation_pct — it is meaningless there and the server rejects it.
-      await update.mutateAsync(
-        isFullCapital
-          ? {
-              sizing_mode: "full_capital",
-              account_size_usd: accountSizeNum,
-              capital_usd: accountSizeNum,
-              leverage,
-            }
-          : {
-              sizing_mode: "allocation",
-              account_size_usd: accountSizeNum,
-              capital_usd: capitalUsd,
-              capital_allocation_pct: allocPct,
-              leverage,
-            },
-      );
+      // Exactly the two independent fields. No capital figure is computed and
+      // saved: the executor multiplies these by the live wallet balance itself.
+      await update.mutateAsync({ capital_allocation_pct: allocPct, leverage });
       toast.success("Configuration saved");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Save failed");
@@ -164,139 +123,81 @@ function Configure() {
           <div className="text-sm text-muted-foreground">Loading…</div>
         ) : (
           <>
-            <div>
-              <span className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">
-                Sizing mode
-              </span>
-              <div className="inline-flex rounded-lg border border-border p-1">
-                <ModeButton
-                  active={!isFullCapital}
-                  label="Allocation"
-                  onClick={() => setSizingMode("allocation")}
-                />
-                <ModeButton
-                  active={isFullCapital}
-                  label="Full capital"
-                  onClick={() => setSizingMode("full_capital")}
-                />
+            {/* The capital base. Read-only, because it is not ours to set: it is
+                whatever this client's own Binance futures wallet holds. */}
+            <div className="rounded-lg border border-border bg-card/40 p-4">
+              <div className="flex items-center justify-between gap-4">
+                <span className="flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-muted-foreground">
+                  <Wallet className="h-3.5 w-3.5" /> Binance wallet
+                </span>
+                <span className="font-mono text-lg font-semibold">
+                  {walletPending ? "…" : walletUsd === null ? "—" : fmtUSD(walletUsd)}
+                </span>
               </div>
               <p className="mt-2 text-xs text-muted-foreground">
-                {isFullCapital
-                  ? "Positions are sized off your full account size, bounded only by available margin and exchange limits."
-                  : "Positions are sized off a fixed percentage of your account, with internal notional caps applied."}
+                {walletUsd !== null ? (
+                  <>
+                    Your connected Binance USD-M wallet balance, read from the
+                    exchange. Every order is sized from this figure — there is no
+                    manual account size.
+                    {wallet.state === "connected" && wallet.stale
+                      ? " This reading is more than a few minutes old."
+                      : null}
+                  </>
+                ) : wallet.state === "awaiting_read" ? (
+                  "Keys are connected; waiting for the executor's first signed read of your account."
+                ) : (
+                  "No Binance account connected yet. Connect one to size orders — the engine will not open a position without a real wallet reading."
+                )}
               </p>
             </div>
 
-            {/* A sizing input, not a balance. Nothing here moves money or
-                reflects a wallet: it is the number the strategy sizes against,
-                and it is capped independently by the live order cap. */}
-            <Field label="Account size (USD)" value={accountSize} onChange={setAccountSize} type="number" />
-            <p className="-mt-2 text-xs text-muted-foreground">
-              Used to size orders. This is not your Binance balance — your real wallet
-              balance is read from Binance and shown on the Dashboard and Engine pages.
-            </p>
+            <StepSelector
+              label="Capital allocation"
+              readout={`${allocPct}%`}
+              steps={ALLOCATION_PCTS}
+              value={allocPct}
+              onChange={setAllocPct}
+              format={(v) => `${v}%`}
+              hint="Percentage of your real wallet balance committed as margin. Independent of leverage — changing this never changes leverage."
+            />
 
-            <div className="grid gap-6 md:grid-cols-2">
-              <div>
-                <div className="flex items-baseline justify-between">
-                  <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Leverage</span>
-                  <span className="font-mono text-lg font-semibold text-primary">{leverage}×</span>
-                </div>
-                {isFullCapital ? (
-                  <>
-                    <Slider
-                      className="mt-3"
-                      min={LEVERAGE_MIN} max={LEVERAGE_MAX} step={1}
-                      value={[freeLeverage]}
-                      onValueChange={(v) => setFreeLeverage(clampLeverage(v[0]))}
-                    />
-                    <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
-                      <span>{LEVERAGE_MIN}×</span><span>{LEVERAGE_MAX}×</span>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <Slider
-                      className="mt-3"
-                      min={0} max={9} step={1}
-                      value={[allocToIndex(allocPct)]}
-                      onValueChange={(v) => setAllocPct(indexToAlloc(v[0]))}
-                    />
-                    <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
-                      <span>1×</span><span>90×</span>
-                    </div>
-                  </>
-                )}
-              </div>
+            <StepSelector
+              label="Leverage"
+              readout={`${leverage}×`}
+              steps={LEVERAGE_STEPS}
+              value={leverage}
+              onChange={setLeverage}
+              format={(v) => `${v}×`}
+              hint="Multiplier applied to the allocated margin. Independent of allocation — changing this never changes allocation. The executor clamps it to the ETHUSDT exchange maximum."
+            />
 
-              {/* Allocation is meaningless in full_capital — hidden, not disabled. */}
-              {!isFullCapital && (
-                <div>
-                  <div className="flex items-baseline justify-between">
-                    <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Capital allocation</span>
-                    <span className="font-mono text-lg font-semibold text-primary">{allocPct}%</span>
-                  </div>
-                  <Slider
-                    className="mt-3"
-                    min={ALLOC_MIN} max={ALLOC_MAX} step={1}
-                    value={[allocPct]}
-                    onValueChange={(v) => setAllocPct(clampAlloc(v[0]))}
-                  />
-                  <div className="mt-2 flex justify-between font-mono text-[10px] text-muted-foreground">
-                    <span>1%</span><span>10%</span>
-                  </div>
-                </div>
-              )}
+            <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-xs text-warning">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span className="text-warning/90">
+                Higher leverage massively increases both gains and losses. At{" "}
+                {leverage}× a roughly{" "}
+                <span className="font-mono font-semibold">
+                  {liquidationPct(leverage).toFixed(2)}%
+                </span>{" "}
+                adverse move liquidates the position.
+              </span>
             </div>
 
-            {isFullCapital ? (
-              <>
-                <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
-                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span className="space-y-1">
-                    <strong className="block">Full capital mode — internal notional caps do not apply.</strong>
-                    <span className="block text-destructive/90">
-                      Order size is bounded only by your available margin and the
-                      exchange's leverage bracket limits. At {leverage}× a roughly{" "}
-                      <span className="font-mono font-semibold">
-                        {liquidationPct(leverage).toFixed(2)}%
-                      </span>{" "}
-                      adverse move liquidates the position.
-                    </span>
-                  </span>
-                </div>
+            <div className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 text-xs md:grid-cols-4">
+              <KV k="Wallet balance" v={walletUsd === null ? "—" : fmtUSD(walletUsd)} />
+              <KV k="Allocated margin" v={margin === null ? "—" : fmtUSD(margin)} />
+              <KV k="Leverage" v={`${leverage}×`} />
+              <KV k="Target notional" v={notional === null ? "—" : fmtUSD(notional)} />
+            </div>
 
-                <div className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 text-xs md:grid-cols-3">
-                  <KV k="Account size" v={fmtUSD(accountSizeNum)} />
-                  <KV k="Leverage" v={`${leverage}×`} />
-                  <KV k="Target notional" v={fmtUSD(accountSizeNum * leverage)} />
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 p-3 text-xs text-warning">
-                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span className="text-warning/90">
-                    Higher leverage massively increases both gains and losses. 70× means a ~1.4% adverse move can liquidate the position.
-                  </span>
-                </div>
-
-                <p className="text-xs text-muted-foreground">
-                  Allocation moves in whole percent only; leverage is derived from it.
-                  Margin committed always equals your allocation — leverage multiplies
-                  exposure, not capital at risk. The executor clamps leverage to the ETHUSDT
-                  exchange maximum and caps order notional independently, so live order size
-                  may be smaller than shown.
-                </p>
-
-                <div className="grid gap-3 rounded-lg border border-border bg-card/40 p-4 text-xs md:grid-cols-4">
-                  <KV k="Strategy capital" v={fmtUSD(capitalUsd)} />
-                  <KV k="Leverage" v={`${leverage}×`} />
-                  <KV k="Allocation" v={`${allocPct}%`} />
-                  <KV k="Notional" v={fmtUSD(capitalUsd * leverage)} />
-                </div>
-              </>
-            )}
+            <p className="text-xs text-muted-foreground">
+              This target is what the executor asks Binance for. Nothing on our
+              side reduces it: the only limits applied after this point are
+              Binance&rsquo;s own leverage-bracket ceiling, its 0.001 lot step and
+              its $20 minimum notional. If your account cannot post the margin,
+              the order is refused outright rather than quietly made smaller.
+            </p>
 
             <div>
               {/* Read-only mirror of the saved mode. The control itself lives in
@@ -318,9 +219,9 @@ function Configure() {
 
         <div className="flex items-center justify-end gap-3">
           <span className="text-xs text-muted-foreground">
-            Current: {config ? `${fmtUSD(Number(config.capital_usd))} · ${config.leverage}× · ${config.sizing_mode === "full_capital" ? "full capital" : `${config.capital_allocation_pct ?? 100}% alloc`}` : "—"}
+            Current: {config ? `${config.capital_allocation_pct}% alloc · ${config.leverage}×` : "—"}
           </span>
-          <button type="submit" disabled={update.isPending || isLoading}
+          <button type="submit" disabled={update.isPending || isLoading || !dirty}
             className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary to-accent px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-60">
             {update.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />} Save
           </button>
@@ -328,6 +229,65 @@ function Configure() {
       </form>
 
       <LiveExecutionSection config={config} />
+    </div>
+  );
+}
+
+/** A slider restricted to a fixed list of values. The slider moves over the
+ *  INDEX, so no value between two adjacent steps is representable and the
+ *  control cannot produce a number the server would reject. The tick labels
+ *  below it are also buttons, so any permitted value is one click away. */
+function StepSelector<T extends number>({
+  label,
+  readout,
+  steps,
+  value,
+  onChange,
+  format,
+  hint,
+}: {
+  label: string;
+  readout: string;
+  steps: readonly T[];
+  value: T;
+  onChange: (v: T) => void;
+  format: (v: T) => string;
+  hint: string;
+}) {
+  const index = Math.max(0, steps.indexOf(value));
+  return (
+    <div>
+      <div className="flex items-baseline justify-between">
+        <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          {label}
+        </span>
+        <span className="font-mono text-lg font-semibold text-primary">{readout}</span>
+      </div>
+      <Slider
+        className="mt-3"
+        min={0}
+        max={steps.length - 1}
+        step={1}
+        value={[index]}
+        onValueChange={(v) => onChange(steps[Math.min(steps.length - 1, Math.max(0, v[0]))])}
+        aria-label={label}
+      />
+      <div className="mt-2 flex flex-wrap justify-between gap-1 font-mono text-[10px] text-muted-foreground">
+        {steps.map((s) => (
+          <button
+            key={s}
+            type="button"
+            onClick={() => onChange(s)}
+            aria-pressed={s === value}
+            className={`rounded px-1 py-0.5 transition-colors ${
+              s === value ? "font-semibold text-primary" : "hover:text-foreground"
+            }`}
+          >
+            {format(s)}
+          </button>
+        ))}
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">{hint}</p>
     </div>
   );
 }
@@ -363,10 +323,8 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
   // fixed for.
   const linkPending = keyInfo.isLoading || executor.isLoading;
   // Fail-closed defaults, matching the database: a row that has never been
-  // configured displays as OFF / $0 / auto disabled / no full-capital consent.
+  // configured displays as OFF / $0 / auto disabled.
   const [execMode, setExecMode] = useState<RequestedExecutionMode>("OFF");
-  const [cap, setCap] = useState("0");
-  const [allowFullCapital, setAllowFullCapital] = useState(false);
   const [autoExecute, setAutoExecute] = useState(false);
 
   useEffect(() => {
@@ -377,13 +335,9 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
         ? (stored as RequestedExecutionMode)
         : "OFF",
     );
-    const storedCap = Number(config.live_order_cap_usd);
-    setCap(String(Number.isFinite(storedCap) && storedCap > 0 ? storedCap : 0));
-    setAllowFullCapital(!!config.live_allow_full_capital);
     setAutoExecute(config.mode === "auto");
   }, [config]);
 
-  const capNum = Number(cap) || 0;
   const isLive = isRequestedLiveMode(execMode);
 
   // The same rule module the server and the database enforce, run against the
@@ -392,12 +346,9 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
     () =>
       validateLiveState({
         execution_mode: execMode,
-        live_order_cap_usd: capNum,
-        live_allow_full_capital: allowFullCapital,
-        sizing_mode: config?.sizing_mode,
         demo_mode: config?.demo_mode,
       }),
-    [execMode, capNum, allowFullCapital, config?.sizing_mode, config?.demo_mode],
+    [execMode, config?.demo_mode],
   );
 
   async function onSave(e: React.FormEvent) {
@@ -408,12 +359,7 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
     }
     try {
       await update.mutateAsync({
-        // The control tuple is always sent as a set: the server rejects a
-        // partial live-execution patch, because validating one field without
-        // the others it pairs with is not validation.
         execution_mode: execMode,
-        live_order_cap_usd: capNum,
-        live_allow_full_capital: allowFullCapital,
         mode: autoExecute ? "auto" : "signal_only",
       });
       toast.success("Live execution settings saved");
@@ -424,10 +370,7 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
 
   const dirty =
     !!config &&
-    (execMode !== config.execution_mode ||
-      capNum !== Number(config.live_order_cap_usd) ||
-      allowFullCapital !== !!config.live_allow_full_capital ||
-      autoExecute !== (config.mode === "auto"));
+    (execMode !== config.execution_mode || autoExecute !== (config.mode === "auto"));
 
   return (
     <form onSubmit={onSave} className="card-elevated space-y-6 p-6">
@@ -477,26 +420,6 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
         <p className="mt-2 text-xs text-muted-foreground">{MODE_COPY[execMode].hint}</p>
       </div>
 
-      <label className="block">
-        <span className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">
-          Live order cap (USD)
-        </span>
-        <input
-          type="number"
-          value={cap}
-          min={0}
-          max={LIVE_ORDER_CAP_MAX_USD}
-          onChange={(e) => setCap(e.target.value)}
-          className="w-full rounded-lg border border-border bg-input/40 px-3 py-2.5 font-mono text-sm focus:border-primary/60 focus:outline-none focus:ring-2 focus:ring-primary/20"
-        />
-        <span className="mt-1 block text-xs text-muted-foreground">
-          Absolute ceiling per order, applied on top of every sizing rule.
-          Maximum ${LIVE_ORDER_CAP_MAX_USD}; live trading requires at least $
-          {LIVE_ORDER_CAP_MIN_TRADE_USD}, since smaller orders fall under the
-          exchange minimum notional.
-        </span>
-      </label>
-
       <ToggleRow
         label="Auto-execute"
         checked={autoExecute}
@@ -509,21 +432,12 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
         }
       />
 
-      <ToggleRow
-        label="Allow full-capital sizing on live"
-        checked={allowFullCapital}
-        onChange={setAllowFullCapital}
-        disabled={update.isPending}
-        tone={allowFullCapital ? "danger" : undefined}
-        hint="Full-capital sizing has no internal notional ceiling. Required before live trading may use it — the executor additionally requires its own environment flag."
-      />
-
       {isLive && (
         <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
           <span>
             {execMode === "LIVE_TRADE"
-              ? `Requesting real orders on Binance mainnet, capped at ${fmtUSD(capNum)} per order.`
+              ? "Requesting real orders on Binance mainnet, sized from your own wallet balance, allocation and leverage. No per-order dollar ceiling is applied."
               : "Requesting mainnet access. Read-only: no order can be placed in this mode."}
           </span>
         </div>
@@ -541,9 +455,7 @@ function LiveExecutionSection({ config }: { config: EngineConfigRow | null | und
         <span className="text-xs text-muted-foreground">
           Saved:{" "}
           {config
-            ? `${config.execution_mode} · ${fmtUSD(Number(config.live_order_cap_usd))} cap · auto ${
-                config.mode === "auto" ? "on" : "off"
-              }`
+            ? `${config.execution_mode} · auto ${config.mode === "auto" ? "on" : "off"}`
             : "—"}
         </span>
         <button
@@ -625,18 +537,6 @@ function ModeButton({ active, label, onClick }: { active: boolean; label: string
     >
       {label}
     </button>
-  );
-}
-
-function Field({ label, value, onChange, type = "text" }: { label: string; value: string; onChange: (v: string) => void; type?: string }) {
-  return (
-    <label className="block">
-      <span className="mb-1 block text-xs font-medium uppercase tracking-wider text-muted-foreground">{label}</span>
-      <input
-        type={type} value={value} onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-lg border border-border bg-input/40 px-3 py-2.5 font-mono text-sm focus:border-primary/60 focus:outline-none focus:ring-2 focus:ring-primary/20"
-      />
-    </label>
   );
 }
 

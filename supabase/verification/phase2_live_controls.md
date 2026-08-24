@@ -1,5 +1,12 @@
 # Phase 2 verification — live-control read/write path
 
+> **Superseded in part.** Migration `20260824120000_single_sizing_model.sql`
+> removed the full-capital system, so the `sizing_mode` and
+> `live_allow_full_capital` invariants described below no longer exist, and the
+> cap ceiling moved from $500 to $1,000,000. The live-mode, minimum-cap and
+> demo-mode invariants are unchanged. See
+> `supabase/verification/single_sizing_model.sql` for the current sizing checks.
+
 Phase 2 adds the app layer over the Phase 1 columns: types, validated server
 functions, and the Configure/Engine UI. **No executor file was touched and no
 order behaviour changed.**

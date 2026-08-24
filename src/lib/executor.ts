@@ -36,8 +36,6 @@ export interface ExecutorStatusRow {
   env_mode_ceiling: ExecutionMode | null;
   db_execution_mode: "OFF" | "LIVE_READ" | "LIVE_TRADE" | null;
   auto_execute_enabled: boolean | null;
-  live_order_cap_usd: number | null;
-  live_order_cap_env_max: number | null;
   orders_enabled: boolean | null;
   blocked_reason: string | null;
   wallet_balance_usd: number | null;

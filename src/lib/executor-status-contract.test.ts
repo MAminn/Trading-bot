@@ -27,8 +27,6 @@ const EXPECTED_FIELDS = [
   "env_mode_ceiling",
   "db_execution_mode",
   "auto_execute_enabled",
-  "live_order_cap_usd",
-  "live_order_cap_env_max",
   "orders_enabled",
   "blocked_reason",
   "wallet_balance_usd",

@@ -29,6 +29,9 @@ function durationStr(entry: string | null, exit: string | null) {
 function History() {
   const status = useEngineStatus();
   const cfg = useEngineConfig();
+  // LEGACY MODEL BASELINE. capital_usd is a config column (default 10,000),
+  // not the Binance wallet, so every USD figure below is the strategy's
+  // percentage return scaled by it — NOT realised Binance P&L.
   const capital = Number(cfg.data?.capital_usd ?? 10000);
   const trades = useTrades(500);
   const orders = useEngineOrders(200);
@@ -85,7 +88,7 @@ function History() {
         <Tile label="Total trades" value={`${trades.data?.length ?? 0}`} />
         <Tile label="Wins" value={`${wins}`} tone="success" />
         <Tile label="Losses" value={`${(trades.data?.length ?? 0) - wins}`} tone="destructive" />
-        <Tile label="Net P&L" value={fmtUSD(totalPnl, true)} tone={totalPnl >= 0 ? "success" : "destructive"} />
+        <Tile label="Net P&L (modelled)" value={fmtUSD(totalPnl, true)} tone={totalPnl >= 0 ? "success" : "destructive"} />
       </div>
 
       <div className="card-elevated overflow-hidden p-0">

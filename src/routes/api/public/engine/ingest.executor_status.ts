@@ -37,8 +37,6 @@ const Body = z.object({
   // env_mode_ceiling and message (the fields that were listed) came through.
   db_execution_mode: z.enum(["OFF", "LIVE_READ", "LIVE_TRADE"]).nullable().optional(),
   auto_execute_enabled: z.boolean().nullable().optional(),
-  live_order_cap_usd: z.number().nullable().optional(),
-  live_order_cap_env_max: z.number().nullable().optional(),
   orders_enabled: z.boolean().nullable().optional(),
   blocked_reason: z.string().max(200).nullable().optional(),
 });

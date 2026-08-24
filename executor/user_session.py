@@ -57,8 +57,6 @@ class HostLimits:
         "base_url",
         "trade_capable",
         "ack_present",
-        "live_order_cap_usd",
-        "env_order_cap_reported",
         "app_api_base",
         "engine_service_token",
         "is_live",
@@ -70,8 +68,6 @@ class HostLimits:
         base_url: str,
         trade_capable: bool,
         ack_present: bool,
-        live_order_cap_usd,
-        env_order_cap_reported,
         app_api_base: str,
         engine_service_token: str,
         is_live: bool,
@@ -80,8 +76,6 @@ class HostLimits:
         self.base_url = base_url
         self.trade_capable = trade_capable
         self.ack_present = ack_present
-        self.live_order_cap_usd = live_order_cap_usd
-        self.env_order_cap_reported = env_order_cap_reported
         self.app_api_base = app_api_base
         self.engine_service_token = engine_service_token
         self.is_live = is_live
@@ -134,11 +128,7 @@ class UserSession:
         if limits.trade_capable:
             from risk_guard import RiskGuard
 
-            self._risk_guard = RiskGuard(
-                max_notional_usd=100,
-                max_leverage=1,
-                live_cap_usd=limits.live_order_cap_usd,
-            )
+            self._risk_guard = RiskGuard(max_leverage=1)
 
         self._consumer = SignalConsumer(
             limits.app_api_base,
@@ -152,7 +142,6 @@ class UserSession:
             # this user's EFFECTIVE mode is trade-capable, so a session begins
             # closed and stays closed until the database has been read.
             binance_trader=None,
-            live_order_cap_usd=limits.live_order_cap_usd,
         )
 
         if not limits.is_live and env_credentials is not None:
@@ -298,8 +287,6 @@ class UserSession:
                     env_mode_ceiling=self._limits.env_mode,
                     db_execution_mode=self._consumer.db_execution_mode,
                     auto_execute_enabled=self._consumer.db_auto_execute_enabled,
-                    live_order_cap_usd=self._consumer.live_order_cap_usd,
-                    live_order_cap_env_max=self._limits.env_order_cap_reported,
                     orders_enabled=self._orders_enabled,
                     blocked_reason=self._blocked_reason,
                     account=account,
@@ -530,7 +517,6 @@ class UserSession:
             db_execution_mode=self._consumer.db_execution_mode,
             auto_execute_enabled=self._consumer.db_auto_execute_enabled,
             is_running=self._consumer.db_is_running,
-            live_order_cap_usd=self._consumer.live_order_cap_usd,
             ack_present=self._limits.ack_present,
         )
         self._orders_enabled = self._blocked_reason is None
@@ -605,7 +591,15 @@ class UserSession:
 
         positions = self._client.get_positions(self._symbol)
         account = self._client.get_account()
-        self._consumer.set_available_balance(Decimal(str(account["availableBalance"])))
+        # The capital base for every OPEN this cycle: THIS user's own
+        # totalWalletBalance, read with THIS user's own credentials. Passed
+        # together with availableBalance, which is only ever a margin sanity
+        # check. Neither figure is stored, and a session can hold no other
+        # user's account.
+        self._consumer.set_account_balances(
+            wallet_balance=account.get("totalWalletBalance"),
+            available_balance=account.get("availableBalance"),
+        )
 
         if not self._startup_done:
             self._startup_done = True

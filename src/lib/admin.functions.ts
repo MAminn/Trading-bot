@@ -18,7 +18,11 @@ export interface AdminUserRow {
   losses: number;
   win_rate: number;
   net_pnl_rate: number; // sum of fractional returns
-  net_pnl_usd: number;  // sum scaled by each user's capital_usd
+  /** LEGACY AND KNOWN-INACCURATE. The strategy's percentage return scaled by
+   *  each user's capital_usd config column, which defaults to 10,000 and is
+   *  unrelated to their Binance wallet. This does NOT equal realised Binance
+   *  P&L and must never be presented as funds. Tracked for its own fix. */
+  net_pnl_usd: number;
   open_positions: number;
   signals_24h: number;
 }

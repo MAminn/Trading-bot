@@ -22,8 +22,6 @@ one place the precedence rule is written down, so it can be tested exhaustively
 and cannot drift from a second copy elsewhere.
 """
 
-from decimal import Decimal, InvalidOperation
-
 # Capability levels. Ordering is the whole mechanism: min() over these is what
 # makes the environment a ceiling rather than a suggestion.
 LEVEL_OFF = 0
@@ -99,50 +97,12 @@ def is_trade_capable(mode: str) -> bool:
     return mode in TRADE_CAPABLE_MODES
 
 
-def _to_decimal(value):
-    """Decimal, or None when the value is absent or unreadable."""
-    if value is None:
-        return None
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError, TypeError, ArithmeticError):
-        return None
-
-
-def resolve_live_order_cap(env_cap, db_cap):
-    """The per-order notional ceiling actually in force: the smallest of the
-    caps that are known.
-
-    The environment cap is the host's hard ceiling and the database cap is the
-    operator's request. Taking the minimum means a database value can only ever
-    lower exposure. An unreadable database cap is treated as absent rather than
-    as zero or as infinity: the mode gate has already failed closed by then, and
-    inventing a number here would either fabricate a block or fabricate room.
-    """
-    caps = [c for c in (_to_decimal(env_cap), _to_decimal(db_cap)) if c is not None]
-    if not caps:
-        return None
-    return min(caps)
-
-
-def allow_full_capital(env_allow: bool, db_allow) -> bool:
-    """Full-capital sizing needs consent from BOTH sources.
-
-    The database toggle records the operator's intent; the environment flag
-    records that someone with access to the host agreed. Either alone is
-    insufficient by design — this is the one sizing path with no internal
-    notional ceiling.
-    """
-    return bool(env_allow) and db_allow is True
-
-
 def placement_block_reason(
     *,
     effective_mode: str,
     db_execution_mode,
     auto_execute_enabled,
     is_running,
-    live_order_cap_usd,
     ack_present: bool,
 ) -> str | None:
     """Why an OPEN may not be placed this cycle, or None when every gate passes.
@@ -165,7 +125,4 @@ def placement_block_reason(
         return "auto_execute_disabled"
     if is_running is not True:
         return "kill_switch_active"
-    cap = _to_decimal(live_order_cap_usd)
-    if cap is None or cap <= 0:
-        return f"live_order_cap_invalid={live_order_cap_usd!r}"
     return None

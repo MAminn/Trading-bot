@@ -14,12 +14,10 @@ from live_controls import (
     DB_MODE_LEVEL,
     ENV_MODE_LEVEL,
     TRADE_CAPABLE_MODES,
-    allow_full_capital,
     db_mode_level,
     is_trade_capable,
     placement_block_reason,
     resolve_effective_mode,
-    resolve_live_order_cap,
 )
 from risk_guard import RiskGuard
 
@@ -36,7 +34,6 @@ def gates(**overrides):
         db_execution_mode="LIVE_TRADE",
         auto_execute_enabled=True,
         is_running=True,
-        live_order_cap_usd=Decimal("30"),
         ack_present=True,
     )
     kwargs.update(overrides)
@@ -157,11 +154,6 @@ def test_missing_ack_blocks_placement_even_with_everything_else_open():
     assert gates(ack_present=False) == "live_trading_ack_missing"
 
 
-@pytest.mark.parametrize("cap", [None, 0, Decimal("0"), -1, "banana"])
-def test_invalid_cap_blocks_placement(cap):
-    assert gates(live_order_cap_usd=cap).startswith("live_order_cap_invalid")
-
-
 def test_db_mode_is_checked_independently_of_effective_mode():
     # Redundant by construction, and deliberately not removed: if a future edit
     # broke the lattice, this second check still refuses.
@@ -177,70 +169,6 @@ def test_auto_execute_requires_exactly_true(truthy):
 @pytest.mark.parametrize("truthy", [1, "true", "yes"])
 def test_is_running_requires_exactly_true(truthy):
     assert gates(is_running=truthy) == "kill_switch_active"
-
-
-# --- the effective cap ----------------------------------------------------- #
-
-def test_effective_cap_is_the_minimum_of_host_and_database():
-    assert resolve_live_order_cap(30, 500) == Decimal("30")
-    assert resolve_live_order_cap(500, 30) == Decimal("30")
-    assert resolve_live_order_cap(30, 30) == Decimal("30")
-
-
-def test_database_can_never_raise_the_cap():
-    for db_cap in (0, 1, 30, 100, 499, 500, 10_000, 10**9):
-        assert resolve_live_order_cap(30, db_cap) <= Decimal("30")
-
-
-def test_absent_database_cap_leaves_the_host_ceiling():
-    assert resolve_live_order_cap(30, None) == Decimal("30")
-
-
-def test_unreadable_database_cap_does_not_widen():
-    for bad in ("banana", "", object()):
-        assert resolve_live_order_cap(30, bad) == Decimal("30")
-
-
-def test_no_cap_anywhere_is_none_rather_than_unlimited():
-    # Only reachable outside LIVE_TRADE, where preflight does not demand one.
-    assert resolve_live_order_cap(None, None) is None
-
-
-def test_database_cap_alone_applies_when_host_has_none():
-    assert resolve_live_order_cap(None, 30) == Decimal("30")
-
-
-# --- the risk guard honours the ceiling ------------------------------------ #
-
-def test_risk_guard_cap_can_be_lowered_but_never_raised():
-    guard = RiskGuard(max_notional_usd=500, max_leverage=90, live_cap_usd=30)
-    guard.set_live_cap(10)
-    assert guard._live_cap_usd == 10
-    guard.set_live_cap(500)
-    assert guard._live_cap_usd == 30  # clamped back to the host ceiling
-    guard.set_live_cap(None)
-    assert guard._live_cap_usd == 30
-
-
-def test_risk_guard_rejects_an_order_above_the_effective_cap():
-    guard = RiskGuard(max_notional_usd=500, max_leverage=90, live_cap_usd=30)
-    guard.set_live_cap(25)
-    order = {
-        "symbol": "ETHUSDT",
-        "intent": "OPEN",
-        "qty": 0.02,
-        "notional_usd": 28,
-        "leverage": 1,
-    }
-    allowed, reason = guard.evaluate(order, 0, None)
-    assert allowed is False
-    assert "live cap" in reason
-
-
-def test_risk_guard_unreadable_cap_falls_back_to_ceiling():
-    guard = RiskGuard(max_notional_usd=500, max_leverage=90, live_cap_usd=30)
-    guard.set_live_cap("banana")
-    assert guard._live_cap_usd == 30
 
 
 # --- an idle cycle must not strand the refresh flag ------------------------ #
@@ -284,9 +212,93 @@ def test_config_is_refreshed_every_cycle():
     assert CONFIG_REFRESH_EVERY_CYCLES == 1
 
 
+# --- no per-order dollar cap exists anywhere ------------------------------- #
+
+def test_no_cap_resolution_helper_remains():
+    """resolve_live_order_cap() combined a host env ceiling with a database
+    request to produce a per-order dollar limit. Order size is now the client's
+    own wallet x allocation x leverage, so a helper whose only purpose is to
+    produce a competing number must not exist."""
+    import inspect
+
+    import live_controls
+
+    assert not hasattr(live_controls, "resolve_live_order_cap")
+    src = inspect.getsource(live_controls)
+    assert "live_order_cap" not in src
+    assert "LIVE_ORDER_CAP" not in src
+
+
+def test_placement_gates_take_no_cap_argument():
+    """Every remaining gate is binary. None of them can change order SIZE — a
+    control that resizes rather than halts is a sizing model in disguise."""
+    import inspect
+
+    params = set(inspect.signature(placement_block_reason).parameters)
+    assert params == {
+        "effective_mode",
+        "db_execution_mode",
+        "auto_execute_enabled",
+        "is_running",
+        "ack_present",
+    }
+
+
+def test_placement_is_allowed_with_no_cap_configured_anywhere():
+    """The old gate refused to place unless a positive cap existed. With the cap
+    gone, an otherwise fully-open host must place."""
+    assert gates() is None
+
+
+def test_risk_guard_has_no_cap_api():
+    import inspect
+
+    import risk_guard as risk_guard_module
+
+    assert not hasattr(RiskGuard, "set_live_cap")
+    src = inspect.getsource(risk_guard_module)
+    assert "live_cap" not in src
+    assert "notional >" not in src  # no upper notional test survives
+
+
+def test_main_has_no_cap_constant_or_telemetry_reader():
+    assert not hasattr(main, "LIVE_ORDER_CAP_MAX_USD")
+    assert not hasattr(main, "LIVE_ORDER_CAP_ENV")
+    assert not hasattr(main, "read_env_order_cap_for_telemetry")
+    # The name survives only so a host that still sets it is warned.
+    assert main.RETIRED_ORDER_CAP_ENV == "LIVE_ORDER_CAP_USD"
+
+
+def test_live_trade_starts_without_a_cap(monkeypatch):
+    """The cap used to be mandatory in LIVE_TRADE. It no longer exists, so its
+    absence must not refuse the start."""
+    monkeypatch.delenv("LIVE_ORDER_CAP_USD", raising=False)
+    monkeypatch.setenv("LIVE_TRADING_ACK", ACK)
+    assert main.live_preflight("LIVE_TRADE") is None
+
+
+def test_a_stale_cap_variable_is_ignored_but_announced(monkeypatch, caplog):
+    """An operator with the old value still in .env must be told it does
+    nothing, rather than silently believing orders are bounded by it."""
+    import logging
+
+    monkeypatch.setenv("LIVE_TRADING_ACK", ACK)
+    monkeypatch.setenv("LIVE_ORDER_CAP_USD", "500")
+    with caplog.at_level(logging.WARNING, logger="executor"):
+        assert main.live_preflight("LIVE_TRADE") is None
+    assert "IGNORING LIVE_ORDER_CAP_USD" in caplog.text
+
+
+def test_ack_is_still_required(monkeypatch):
+    """Removing the cap must not weaken the control that actually gates real
+    money."""
+    monkeypatch.delenv("LIVE_TRADING_ACK", raising=False)
+    assert main.live_preflight("LIVE_TRADE") == 1
+
+
 # --- the idle heartbeat must carry the control state, not nulls ------------ #
 
-def idle_snapshot(env_cap=None):
+def idle_snapshot():
     """The snapshot the effective-OFF idle path builds, as main.py builds it."""
     from executor_status import build_snapshot
 
@@ -296,7 +308,6 @@ def idle_snapshot(env_cap=None):
         db_execution_mode="OFF",
         auto_execute_enabled=False,
         is_running=False,
-        live_order_cap_usd=Decimal("0"),
         ack_present=False,
     )
     return build_snapshot(
@@ -304,8 +315,6 @@ def idle_snapshot(env_cap=None):
         env_mode_ceiling="LIVE_READ",
         db_execution_mode="OFF",
         auto_execute_enabled=False,
-        live_order_cap_usd=Decimal("0"),
-        live_order_cap_env_max=env_cap,
         orders_enabled=reason is None,
         blocked_reason=reason,
         account=None,
@@ -313,7 +322,7 @@ def idle_snapshot(env_cap=None):
         reconcile=None,
         keys_present=True,
         permission_status=None,
-        message=f"idle: effective OFF (env LIVE_READ, database OFF)",
+        message="idle: effective OFF (env LIVE_READ, database OFF)",
     )
 
 
@@ -323,78 +332,40 @@ def test_idle_telemetry_reports_the_control_state_rather_than_nulls():
     The regression this pins: these fields arrived null in production because
     the ingest route's schema omitted them, so an idle executor looked
     indistinguishable from one that had never reported a control state."""
-    s = idle_snapshot(env_cap=Decimal("30"))
+    s = idle_snapshot()
     assert s["effective_mode"] == "OFF"
     assert s["env_mode_ceiling"] == "LIVE_READ"
     assert s["db_execution_mode"] == "OFF"
     assert s["auto_execute_enabled"] is False
-    assert s["live_order_cap_usd"] == 0.0
-    assert s["live_order_cap_env_max"] == 30.0
     assert s["orders_enabled"] is False
     assert s["blocked_reason"] == "effective_mode=OFF"
     for field in (
         "db_execution_mode",
         "auto_execute_enabled",
-        "live_order_cap_usd",
-        "live_order_cap_env_max",
         "orders_enabled",
         "blocked_reason",
     ):
         assert s[field] is not None, field
 
 
-def test_idle_telemetry_env_cap_is_none_only_when_the_host_has_none():
-    """None here must mean "this host configured no cap", never "we did not
-    bother to look"."""
-    assert idle_snapshot(env_cap=None)["live_order_cap_env_max"] is None
+def test_telemetry_no_longer_reports_a_cap():
+    """A dashboard tile reading "Effective order cap: $500" would now be false."""
+    s = idle_snapshot()
+    assert "live_order_cap_usd" not in s
+    assert "live_order_cap_env_max" not in s
 
 
-def test_env_cap_telemetry_parse_is_lenient_and_never_guesses(monkeypatch):
-    import main
+# --- the full-capital consent path is gone entirely ------------------------ #
 
-    for raw, expected in (
-        ("30", Decimal("30")),
-        ("  30  ", Decimal("30")),
-        ("0.5", Decimal("0.5")),
-        ("", None),
-        ("banana", None),
-        ("0", None),
-        ("-5", None),
-    ):
-        monkeypatch.setenv("LIVE_ORDER_CAP_USD", raw)
-        assert main.read_env_order_cap_for_telemetry() == expected, raw
-    monkeypatch.delenv("LIVE_ORDER_CAP_USD", raising=False)
-    assert main.read_env_order_cap_for_telemetry() is None
+def test_no_full_capital_consent_helper_remains():
+    """allow_full_capital() required a host env flag AND a database column, and
+    was the gate on the second sizing path. Both halves are removed, so the
+    helper must not exist for anything to call."""
+    import inspect
 
+    import live_controls
 
-def test_env_cap_telemetry_does_not_reach_the_enforcement_path(monkeypatch):
-    """The reporting parse must not become a second source of the real cap:
-    live_preflight still refuses to supply one outside LIVE_TRADE."""
-    import main
-
-    monkeypatch.setenv("LIVE_ORDER_CAP_USD", "30")
-    monkeypatch.setenv("LIVE_TRADING_ACK", ACK)
-    refusal, enforced_cap = main.live_preflight("LIVE_READ")
-    assert refusal is None
-    assert enforced_cap is None  # unchanged: LIVE_READ enforces no cap
-    assert main.read_env_order_cap_for_telemetry() == Decimal("30")
-
-
-# --- full capital needs both consents -------------------------------------- #
-
-@pytest.mark.parametrize(
-    "env_allow,db_allow,expected",
-    [
-        (False, False, False),
-        (False, True, False),  # database alone is not enough
-        (True, False, False),  # host alone is not enough
-        (True, True, True),
-    ],
-)
-def test_full_capital_requires_both_consents(env_allow, db_allow, expected):
-    assert allow_full_capital(env_allow, db_allow) is expected
-
-
-@pytest.mark.parametrize("db_allow", [None, "true", 1, "1", [], object()])
-def test_full_capital_database_consent_must_be_exactly_true(db_allow):
-    assert allow_full_capital(True, db_allow) is False
+    assert not hasattr(live_controls, "allow_full_capital")
+    src = inspect.getsource(live_controls)
+    assert "full_capital" not in src
+    assert "FULL_CAPITAL" not in src

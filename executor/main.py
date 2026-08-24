@@ -25,7 +25,6 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
 
 ALLOWED_MODES = (
     "OFF",
@@ -86,13 +85,11 @@ LEGACY_LIVE_SECRET_ENV = "BINANCE_LIVE_API_SECRET"
 LIVE_TRADING_ACK_ENV = "LIVE_TRADING_ACK"
 LIVE_TRADING_ACK_VALUE = "I_UNDERSTAND_REAL_MONEY"
 
-# LIVE_TRADE will not start unless a positive per-order notional cap is set.
-# It is an absolute ceiling applied on top of, and independently of, every
-# config-driven sizing rule — including full_capital, which has no internal
-# notional ceiling of its own.
-LIVE_ORDER_CAP_ENV = "LIVE_ORDER_CAP_USD"
-# The cap itself may not exceed the guard's absolute allocation-mode backstop.
-LIVE_ORDER_CAP_MAX_USD = Decimal("500")
+# RETIRED. The per-order dollar cap is gone: it could silently reduce a
+# correctly-sized order, which made it a second sizing model rather than a
+# safety control. The name is kept ONLY so a host that still has the variable
+# set is told, at startup, that it does nothing.
+RETIRED_ORDER_CAP_ENV = "LIVE_ORDER_CAP_USD"
 
 SYMBOL = "ETHUSDT"
 
@@ -108,32 +105,6 @@ log = logging.getLogger("executor")
 # an `except FatalConfigError` against the wrong one would silently stop
 # matching — turning a refusal-to-trade into an unhandled crash.
 from user_session import EnforcementError, FatalConfigError  # noqa: E402,F401
-
-
-def read_env_order_cap_for_telemetry():
-    """This host's configured LIVE_ORDER_CAP_USD, for REPORTING only.
-
-    live_preflight() deliberately parses the cap only in LIVE_TRADE — it is the
-    mode where the cap is mandatory and where refusing to start on a bad value
-    is correct. Every other mode leaves it None, which is right for enforcement
-    (a mode that cannot place needs no cap) but wrong for telemetry: the
-    dashboard then shows "host ceiling: —" on a host that plainly has one
-    configured, and the operator cannot see the ceiling they would be bounded
-    by until they are already trading.
-
-    So this reads the same variable leniently and independently. It feeds the
-    heartbeat and nothing else — it is never passed to the RiskGuard, the
-    consumer, or any sizing path, so it cannot change what is traded. An
-    unreadable or non-positive value reports None rather than guessing.
-    """
-    raw = os.environ.get(LIVE_ORDER_CAP_ENV, "").strip()
-    if not raw:
-        return None
-    try:
-        cap = Decimal(raw)
-    except (InvalidOperation, ValueError):
-        return None
-    return cap if cap > 0 else None
 
 
 def _live_env_keys_present() -> bool:
@@ -206,18 +177,26 @@ def run_off() -> int:
         time.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
-def live_preflight(mode: str) -> tuple[int | None, Decimal | None]:
+def live_preflight(mode: str) -> int | None:
     """Gate the LIVE_* modes before any client is built.
 
-    Returns (exit_code, live_order_cap_usd). A non-None exit_code means refuse
-    to start; the caller returns it unchanged. The cap is None for every mode
-    that is not LIVE_TRADE.
+    Returns None to proceed, or an exit code meaning refuse to start; the caller
+    returns it unchanged.
+
+    There is deliberately no per-order dollar ceiling here any more. Order size
+    is the user's own configuration — wallet balance x allocation x leverage —
+    and an environment variable that could quietly reduce it was a second sizing
+    model wearing the name of a safety control. The controls that DO stop a live
+    host are unchanged and are all binary: EXECUTION_MODE, LIVE_TRADING_ACK,
+    the database's execution_mode, auto_execute_enabled, and the is_running kill
+    switch. Each of them stops trading outright rather than silently trading a
+    different size than the client asked for.
 
     Nothing here reads or echoes a credential — only its presence is checked,
     upstream in the caller.
     """
     if mode not in LIVE_MODES:
-        return None, None
+        return None
 
     # LIVE_READ needs no acknowledgement: it cannot place. LIVE_TRADE does.
     if mode != "LIVE_TRADE":
@@ -225,7 +204,7 @@ def live_preflight(mode: str) -> tuple[int | None, Decimal | None]:
             "LIVE_READ | mainnet read-only | placement is structurally "
             "unavailable in this mode"
         )
-        return None, None
+        return None
 
     ack = os.environ.get(LIVE_TRADING_ACK_ENV, "").strip()
     if ack != LIVE_TRADING_ACK_VALUE:
@@ -238,43 +217,31 @@ def live_preflight(mode: str) -> tuple[int | None, Decimal | None]:
             LIVE_TRADING_ACK_VALUE,
             "an empty value" if not ack else "a different value",
         )
-        return 1, None
+        return 1
 
-    raw_cap = os.environ.get(LIVE_ORDER_CAP_ENV, "").strip()
-    if not raw_cap:
-        log.error(
-            "REFUSING TO START | %s is mandatory in LIVE_TRADE — it is the "
-            "absolute per-order notional ceiling and has no default",
-            LIVE_ORDER_CAP_ENV,
+    if os.environ.get(RETIRED_ORDER_CAP_ENV, "").strip():
+        # Retired, and loudly: an operator who still has it set would otherwise
+        # believe orders were bounded by it.
+        log.warning(
+            "IGNORING %s | the per-order dollar cap has been removed. Order size "
+            "is the client's own wallet balance x allocation x leverage, and "
+            "nothing on this host reduces it. Use EXECUTION_MODE, the database "
+            "execution_mode, auto-execute or the Stop switch to stop trading.",
+            RETIRED_ORDER_CAP_ENV,
         )
-        return 1, None
-    try:
-        cap = Decimal(raw_cap)
-    except (InvalidOperation, ValueError):
-        log.error("REFUSING TO START | %s=%r is not a number", LIVE_ORDER_CAP_ENV, raw_cap)
-        return 1, None
-    if cap <= 0:
-        log.error("REFUSING TO START | %s=%s must be positive", LIVE_ORDER_CAP_ENV, cap)
-        return 1, None
-    if cap > LIVE_ORDER_CAP_MAX_USD:
-        log.error(
-            "REFUSING TO START | %s=%s exceeds the %s ceiling this build permits",
-            LIVE_ORDER_CAP_ENV,
-            cap,
-            LIVE_ORDER_CAP_MAX_USD,
-        )
-        return 1, None
 
     log.warning("=" * 60)
     log.warning("LIVE_TRADE | REAL MONEY | mainnet USD-M futures")
     log.warning("acknowledgement accepted via %s", LIVE_TRADING_ACK_ENV)
-    log.warning("absolute per-order cap | %s=%s USD", LIVE_ORDER_CAP_ENV, cap)
+    log.warning(
+        "order size = the client's Binance totalWalletBalance x their "
+        "allocation %% x their leverage, bounded only by Binance's own limits"
+    )
     log.warning("=" * 60)
-    return None, cap
+    return None
 
 
-def build_host_limits(mode: str, live_order_cap_usd, app_api_base: str,
-                      engine_service_token: str):
+def build_host_limits(mode: str, app_api_base: str, engine_service_token: str):
     """What this host permits, for every user on it.
 
     Assembled once and passed to every session. A session never reads the
@@ -292,8 +259,6 @@ def build_host_limits(mode: str, live_order_cap_usd, app_api_base: str,
         ack_present=(
             os.environ.get(LIVE_TRADING_ACK_ENV, "").strip() == LIVE_TRADING_ACK_VALUE
         ),
-        live_order_cap_usd=live_order_cap_usd,
-        env_order_cap_reported=read_env_order_cap_for_telemetry(),
         app_api_base=app_api_base,
         engine_service_token=engine_service_token,
         is_live=mode in LIVE_MODES,
@@ -335,7 +300,7 @@ def run_executor(mode: str) -> int:
     from user_credentials import CredentialsUnavailable, UserCredentialsClient
     from user_session import UserSession
 
-    refusal, live_order_cap_usd = live_preflight(mode)
+    refusal = live_preflight(mode)
     if refusal is not None:
         return refusal
 
@@ -424,9 +389,7 @@ def run_executor(mode: str) -> int:
             )
             return 1
 
-    limits = build_host_limits(
-        mode, live_order_cap_usd, app_api_base, engine_service_token
-    )
+    limits = build_host_limits(mode, app_api_base, engine_service_token)
 
     log.info("=" * 60)
     log.info("executor starting | mode=%s | symbol=%s", mode, SYMBOL)

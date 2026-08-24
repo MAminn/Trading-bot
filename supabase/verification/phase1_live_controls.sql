@@ -1,4 +1,16 @@
 -- =========================================================
+-- SUPERSEDED — HISTORICAL. Do not run against a current database.
+-- =========================================================
+-- Migration 20260824120000_single_sizing_model.sql removed the full-capital
+-- system: sizing_mode, account_size_usd, live_allow_full_capital and
+-- max_notional_usd are dropped columns, and the live order cap ceiling moved
+-- from 500 to 1000000. Several blocks below assert the Phase 1 state and will
+-- now fail.
+--
+-- The current equivalent is supabase/verification/single_sizing_model.sql.
+-- This file is kept as the record of what Phase 1 verified.
+--
+-- =========================================================
 -- Phase 1 verification: engine_config live-control columns + privileges
 -- =========================================================
 -- Run against a STAGING database after applying:

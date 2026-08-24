@@ -165,8 +165,6 @@ def test_snapshot_never_fabricates_a_control_state():
     for control in (
         "db_execution_mode",
         "auto_execute_enabled",
-        "live_order_cap_usd",
-        "live_order_cap_env_max",
         "orders_enabled",
         "blocked_reason",
     ):
@@ -178,15 +176,11 @@ def test_snapshot_reports_the_control_values_it_is_given():
     s = snapshot(
         db_execution_mode="LIVE_TRADE",
         auto_execute_enabled=True,
-        live_order_cap_usd=30,
-        live_order_cap_env_max=30,
         orders_enabled=False,
         blocked_reason="auto_execute_disabled",
     )
     assert s["db_execution_mode"] == "LIVE_TRADE"
     assert s["auto_execute_enabled"] is True
-    assert s["live_order_cap_usd"] == 30.0
-    assert s["live_order_cap_env_max"] == 30.0
     assert s["orders_enabled"] is False
     assert s["blocked_reason"] == "auto_execute_disabled"
 

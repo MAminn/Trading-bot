@@ -13,6 +13,7 @@ import {
   MODE_LABEL, PERMISSION_LABEL, resolveWalletDisplay, type ExecutorStatusRow,
 } from "@/lib/executor";
 import { keysConnected, useBinanceKeyInfo } from "@/lib/binance-keys";
+import { allocatedMargin, targetNotional } from "@/lib/sizing";
 import { resolveExecutorLink, type ExecutorLinkState } from "@/lib/executor-link";
 import { ExecutorLinkRow } from "@/components/ExecutorLinkRow";
 import { Switch } from "@/components/ui/switch";
@@ -45,16 +46,19 @@ function EnginePage() {
   const state = liveState(status.data, !!config.data?.is_running);
   const isRunning = !!config.data?.is_running;
   const demoMode = !!config.data?.demo_mode;
-  const isFullCapital = config.data?.sizing_mode === "full_capital";
-  // account_size_usd is nullable on rows written before the sizing migration.
-  const rawAccountSize = Number(config.data?.account_size_usd);
-  const accountSize = Number.isFinite(rawAccountSize) ? rawAccountSize : null;
-  // What the engine aims for before caps: full capital sizes off the account,
-  // allocation off the allocated slice of it.
-  const sizingBase = isFullCapital ? accountSize : Number(config.data?.capital_usd);
-  const targetNotional =
-    config.data && sizingBase !== null && Number.isFinite(sizingBase)
-      ? sizingBase * Number(config.data.leverage)
+  // The capital base is the exchange reading, never a configured figure: this
+  // user own Binance USD-M totalWalletBalance as last reported by the executor.
+  const walletDisplay = resolveWalletDisplay(executor.data, {
+    keysConnected: keysConnected(keyInfo),
+  });
+  const walletUsd = walletDisplay.state === "connected" ? walletDisplay.walletUsd : null;
+  const allocPct = Number(config.data?.capital_allocation_pct);
+  const leverage = Number(config.data?.leverage);
+  const allocatedMarginUsd =
+    walletUsd !== null && Number.isFinite(allocPct) ? allocatedMargin(walletUsd, allocPct) : null;
+  const targetNotionalUsd =
+    walletUsd !== null && Number.isFinite(allocPct) && Number.isFinite(leverage)
+      ? targetNotional(walletUsd, allocPct, leverage)
       : null;
 
   async function toggle() {
@@ -178,15 +182,17 @@ function EnginePage() {
                 execution, and reading it as "signal only" while the executor
                 runs LIVE_TRADE is exactly the confusion to avoid. */}
             <KV k="Signal mode (app)" v={config.data.mode} />
-            <KV k="Strategy capital" v={fmtUSD(Number(config.data.capital_usd))} />
+            <KV k="Binance wallet" v={walletUsd === null ? "—" : fmtUSD(walletUsd)} />
+            <KV k="Allocation" v={`${config.data.capital_allocation_pct}%`} />
             <KV
-              k="Allocation"
-              v={isFullCapital ? "n/a" : `${config.data.capital_allocation_pct ?? 100}%`}
+              k="Allocated margin"
+              v={allocatedMarginUsd === null ? "—" : fmtUSD(allocatedMarginUsd)}
             />
             <KV k="Leverage" v={`${config.data.leverage}×`} />
-            <KV k="Sizing mode" v={isFullCapital ? "FULL CAPITAL" : "ALLOCATION"} tone={isFullCapital ? "warn" : undefined} />
-            <KV k="Account size" v={accountSize === null ? "—" : fmtUSD(accountSize)} />
-            <KV k="Target notional" v={targetNotional === null ? "—" : fmtUSD(targetNotional)} />
+            <KV
+              k="Target notional"
+              v={targetNotionalUsd === null ? "—" : fmtUSD(targetNotionalUsd)}
+            />
             <KV k="Updated" v={fmtAgo(config.data.updated_at)} />
           </div>
         ) : (
@@ -417,14 +423,6 @@ function ExecutorCard({
         <KV
           k="Auto-execute"
           v={row.auto_execute_enabled === null ? "—" : row.auto_execute_enabled ? "ON" : "OFF"}
-        />
-        <KV
-          k="Effective order cap"
-          v={row.live_order_cap_usd === null ? "—" : fmtUSD(row.live_order_cap_usd)}
-        />
-        <KV
-          k="Host cap ceiling"
-          v={row.live_order_cap_env_max === null ? "—" : fmtUSD(row.live_order_cap_env_max)}
         />
       </div>
 
