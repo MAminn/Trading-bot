@@ -50,6 +50,10 @@ import {
   realTotalsForDay,
   fmtCommission,
   netTone,
+  accountingIsUnavailable,
+  ACCOUNTING_UNAVAILABLE_TITLE,
+  ACCOUNTING_UNAVAILABLE_BODY,
+  ACCOUNTING_UNAVAILABLE_SHORT,
 } from "@/lib/accounting";
 import { keysConnected, useBinanceKeyInfo } from "@/lib/binance-keys";
 import { EXECUTOR_LINK_LABEL, resolveExecutorLink } from "@/lib/executor-link";
@@ -116,6 +120,8 @@ function Dashboard() {
   useAccountingRealtime();
   const realAll = realPerformance(executed.data ?? []);
   const todayReal = realTotalsForDay(executed.data ?? []);
+  // "We could not read the accounting feed" is not "you had no trades today".
+  const accountingDown = accountingIsUnavailable(executed);
 
   // Map trade_id → related open/closed records for status derivation.
   const openByTid = new Map((opens.data ?? []).map((p) => [p.trade_id, p]));
@@ -346,18 +352,27 @@ function Dashboard() {
             muted={wallet.state !== "connected"}
             icon={<Wallet className="h-4 w-4" />}
           />
+          {/* Every real-money tile below reads "—" when the accounting feed
+              could not be read. A failed query used to arrive here as an empty
+              array, which rendered as "$0.00 · no trades closed today" — the
+              dashboard asserting the client's account was flat when the truth
+              was that we had not managed to look. */}
           <BigStat
             label="Today Net P&L"
-            value={todayReal.trades ? fmtUSD(todayReal.netPnl, true) : "—"}
-            delta={
-              todayReal.trades
-                ? "Real Binance · after commission"
-                : "Real Binance · no trades closed today"
+            value={
+              accountingDown ? "—" : todayReal.trades ? fmtUSD(todayReal.netPnl, true) : "—"
             }
-            tone={todayReal.trades ? netTone(todayReal.netPnl) : "muted"}
+            delta={
+              accountingDown
+                ? ACCOUNTING_UNAVAILABLE_SHORT
+                : todayReal.trades
+                  ? "Real Binance · after commission"
+                  : "Real Binance · no trades closed today"
+            }
+            tone={accountingDown || !todayReal.trades ? "muted" : netTone(todayReal.netPnl)}
             strong
             icon={
-              todayReal.netPnl >= 0 ? (
+              !accountingDown && todayReal.netPnl >= 0 ? (
                 <ArrowUpRight className="h-4 w-4" />
               ) : (
                 <ArrowDownRight className="h-4 w-4" />
@@ -368,24 +383,49 @@ function Dashboard() {
             label="Today Commission"
             // fmtCommission renders the stored positive cost with a minus sign,
             // so a fee never reads as something the client received.
-            value={todayReal.trades ? fmtCommission(todayReal.commission) : "—"}
-            delta={todayReal.trades ? "Actual Binance fees" : "Actual Binance fees · none today"}
-            tone={todayReal.trades && todayReal.commission > 0 ? "destructive" : "muted"}
+            value={
+              accountingDown ? "—" : todayReal.trades ? fmtCommission(todayReal.commission) : "—"
+            }
+            delta={
+              accountingDown
+                ? ACCOUNTING_UNAVAILABLE_SHORT
+                : todayReal.trades
+                  ? "Actual Binance fees"
+                  : "Actual Binance fees · none today"
+            }
+            tone={
+              !accountingDown && todayReal.trades && todayReal.commission > 0
+                ? "destructive"
+                : "muted"
+            }
             strong
             icon={<Receipt className="h-4 w-4" />}
           />
           <BigStat
             label="Real trades today"
-            value={`${todayReal.trades}`}
+            value={accountingDown ? "—" : `${todayReal.trades}`}
             delta={
-              todayReal.incompleteTrades
-                ? `${todayReal.incompleteTrades} awaiting exact accounting`
-                : `${realAll.trades} completed all-time`
+              accountingDown
+                ? ACCOUNTING_UNAVAILABLE_SHORT
+                : todayReal.incompleteTrades
+                  ? `${todayReal.incompleteTrades} awaiting exact accounting`
+                  : `${realAll.trades} completed all-time`
             }
-            tone={todayReal.incompleteTrades ? "destructive" : "muted"}
+            tone={!accountingDown && todayReal.incompleteTrades ? "destructive" : "muted"}
             icon={<Activity className="h-4 w-4" />}
           />
         </div>
+        {accountingDown && (
+          <div className="mt-3 flex items-start gap-3 rounded-lg border border-warning/40 bg-warning/10 p-3 text-sm">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+            <div>
+              <div className="font-medium text-warning">{ACCOUNTING_UNAVAILABLE_TITLE}</div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {ACCOUNTING_UNAVAILABLE_BODY}
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* ========================= MODELLED STRATEGY =========================

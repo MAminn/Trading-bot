@@ -29,6 +29,17 @@ export const EXECUTED_TRADES_KEY = ["accounting", "executed_trades"] as const;
  *
  * RLS restricts the result to `auth.uid() = user_id`; the service role writes
  * every customer's rows into one table and no client can read another's.
+ *
+ * A QUERY ERROR IS AN ERROR. It used to be swallowed into an empty array, on
+ * the reasoning that a missing table on an app deployed ahead of its migration
+ * is "no accounting yet". The effect was worse than the problem: a dropped
+ * connection, an RLS misconfiguration, a schema drift or a Supabase outage all
+ * rendered as "No completed Binance trades" and "Today Net P&L $0.00" — the
+ * app stating, in the customer's own currency, that nothing happened today.
+ *
+ * "We could not read your accounting" and "you have no trades" are different
+ * facts and the UI must be able to tell them apart, so the error is rethrown
+ * and every consumer renders an explicit unavailable state.
  */
 export function useExecutedTrades(limit = 500) {
   return useQuery({
@@ -39,10 +50,7 @@ export function useExecutedTrades(limit = 500) {
         .select("*")
         .order("exit_time", { ascending: false })
         .limit(limit);
-      // The table may not exist yet on an app deployed ahead of its migration.
-      // That is "no real accounting yet", not a page-breaking error — and it
-      // renders as an explicit empty state, never as zeros.
-      if (error) return [] as ExecutedTradeRow[];
+      if (error) throw error;
       return (data ?? []) as unknown as ExecutedTradeRow[];
     },
     refetchInterval: POLL,
@@ -81,5 +89,14 @@ export {
   closeSourceLabel,
   UNAVAILABLE,
   EMPTY_REAL_PERFORMANCE,
+  accountingAvailability,
+  accountingIsUnavailable,
+  ACCOUNTING_UNAVAILABLE_TITLE,
+  ACCOUNTING_UNAVAILABLE_BODY,
+  ACCOUNTING_UNAVAILABLE_SHORT,
 } from "./accounting-math";
-export type { ExecutedTradeRow, RealPerformance } from "./accounting-math";
+export type {
+  ExecutedTradeRow,
+  RealPerformance,
+  AccountingAvailability,
+} from "./accounting-math";

@@ -31,6 +31,11 @@ const {
   incompleteLabel,
   closeSourceLabel,
   UNAVAILABLE,
+  accountingAvailability,
+  accountingIsUnavailable,
+  ACCOUNTING_UNAVAILABLE_TITLE,
+  ACCOUNTING_UNAVAILABLE_BODY,
+  ACCOUNTING_UNAVAILABLE_SHORT,
 } = await import("./accounting-math.ts");
 
 type Row = import("./accounting-math.ts").ExecutedTradeRow;
@@ -43,6 +48,20 @@ const TRADE_ROUTE = "src/routes/api/public/engine/accounting.trade.ts";
 const ORDERS_ROUTE = "src/routes/api/public/engine/accounting.orders.ts";
 
 const src = (p: string) => readFileSync(p, "utf8");
+
+/**
+ * Executable source only — JSX comments, block comments and line comments
+ * removed.
+ *
+ * These files document the bugs they exist to prevent, quoting the exact
+ * strings that used to be wrong. Scanning raw text would make the explanation
+ * fail the test that the explanation is about.
+ */
+const code = (p: string) =>
+  src(p)
+    .replace(/\{\/\*[\s\S]*?\*\/\}/g, "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "");
 
 /** One COMPLETE trade.
  *
@@ -259,9 +278,11 @@ test("the dashboard's real tiles are fed by executed_trades, not by capital_usd"
   assert.match(s, /useExecutedTrades\(/);
   assert.match(s, /realTotalsForDay\(/);
   // The real tiles read todayReal.*; the modelled tile reads todayPnl, which is
-  // the only one allowed near tradePnlUsd/capital.
-  assert.match(s, /value=\{todayReal\.trades \? fmtUSD\(todayReal\.netPnl, true\) : "—"\}/);
-  assert.match(s, /value=\{todayReal\.trades \? fmtCommission\(todayReal\.commission\) : "—"\}/);
+  // the only one allowed near tradePnlUsd/capital. The exact expressions are
+  // pinned by the availability tests below, which also gate them on the feed
+  // state — asserted here only as "these tiles come from the real feed".
+  assert.match(s, /fmtUSD\(todayReal\.netPnl, true\)/);
+  assert.match(s, /fmtCommission\(todayReal\.commission\)/);
 });
 
 test("the modelled P&L is labelled as modelled wherever it appears", () => {
@@ -600,4 +621,143 @@ test("a COMPLETE row must name at least one closing order", () => {
   // Without this a trade could be stored as fully priced while claiming nothing
   // ever closed it.
   assert.match(src(MIGRATION), /AND exit_order_count > 0/);
+});
+
+// --------------------------------------------------------------------------
+// Accounting availability: three states, never two
+//
+// The bug: `useExecutedTrades` swallowed a query error into an empty array. A
+// dropped connection, an RLS misconfiguration, a schema drift or a Supabase
+// outage then rendered as "No completed Binance trades" and "Today Net P&L
+// $0.00" — the app telling a client, in their own currency, that their account
+// did nothing today, on the strength of a question it never got an answer to.
+// --------------------------------------------------------------------------
+
+test("a failed query is unavailable, not empty", () => {
+  assert.equal(accountingAvailability({ isError: true }), "unavailable");
+  assert.equal(accountingIsUnavailable({ isError: true }), true);
+});
+
+test("a successful query with zero rows is a genuine empty state", () => {
+  assert.equal(accountingAvailability({ isError: false, isLoading: false }), "available");
+  assert.equal(accountingIsUnavailable({ isError: false, isLoading: false }), false);
+  // And an empty result really does total to zero — that part was never wrong.
+  const p = realPerformance([]);
+  assert.equal(p.trades, 0);
+  assert.equal(p.netPnl, 0);
+});
+
+test("a first load is loading, and is not mistaken for empty", () => {
+  assert.equal(accountingAvailability({ isLoading: true }), "loading");
+  assert.equal(accountingAvailability({ isPending: true }), "loading");
+  assert.equal(accountingIsUnavailable({ isLoading: true }), false);
+});
+
+test("an error while refetching still reads as unavailable", () => {
+  // React Query keeps a failing query in a refetching state. Testing isLoading
+  // first would show a spinner over a broken feed, then fall through to the
+  // empty state once it cleared.
+  assert.equal(accountingAvailability({ isError: true, isLoading: true }), "unavailable");
+});
+
+test("the hook rethrows a query error instead of returning an empty list", () => {
+  const s = src("src/lib/accounting.ts");
+  assert.match(s, /if \(error\) throw error;/);
+  assert.ok(
+    !/if \(error\) return \[\]/.test(s),
+    "a query error is still being swallowed into an empty result",
+  );
+});
+
+test("one wording for the unavailable state, shared by every page", () => {
+  assert.match(ACCOUNTING_UNAVAILABLE_TITLE, /Accounting unavailable/);
+  assert.match(ACCOUNTING_UNAVAILABLE_BODY, /could not be loaded/);
+  assert.match(ACCOUNTING_UNAVAILABLE_BODY, /until the accounting feed recovers/);
+  assert.match(ACCOUNTING_UNAVAILABLE_SHORT, /unavailable/i);
+  for (const page of [DASHBOARD, HISTORY, REPORTS]) {
+    assert.ok(
+      /ACCOUNTING_UNAVAILABLE_(TITLE|BODY|SHORT)/.test(src(page)),
+      `${page} does not render the unavailable state`,
+    );
+  }
+});
+
+test("the dashboard shows a dash, not a figure, when accounting is down", () => {
+  const s = src(DASHBOARD);
+  assert.match(s, /const accountingDown = accountingIsUnavailable\(executed\)/);
+  // Both headline money tiles are gated on it.
+  assert.match(s, /accountingDown \? "—" : todayReal\.trades \? fmtUSD\(todayReal\.netPnl, true\)/);
+  assert.match(s, /accountingDown \? "—" : todayReal\.trades \? fmtCommission\(todayReal\.commission\)/);
+  // And the trade count too, so "0 trades" is never asserted from a failure.
+  assert.match(s, /value=\{accountingDown \? "—" : `\$\{todayReal\.trades\}`\}/);
+});
+
+test("the dashboard never says 'no trades today' on a failed query", () => {
+  const s = code(DASHBOARD);
+  // Every empty-state message must sit in a ternary whose FIRST branch is the
+  // unavailable wording, so a failed feed can never reach the reassuring copy.
+  const messages = ["no trades closed today", "none today"];
+  let found = 0;
+  for (const message of messages) {
+    let at = s.indexOf(message);
+    while (at !== -1) {
+      found += 1;
+      const preceding = s.slice(Math.max(0, at - 500), at);
+      const gate = preceding.lastIndexOf("accountingDown");
+      const short = preceding.lastIndexOf("ACCOUNTING_UNAVAILABLE_SHORT");
+      assert.ok(
+        gate !== -1 && short > gate,
+        `"${message}" is not gated behind the unavailable branch`,
+      );
+      at = s.indexOf(message, at + 1);
+    }
+  }
+  assert.ok(found >= 2, "the dashboard empty-state wording was not found at all");
+});
+
+test("history renders an availability state, not a loading boolean", () => {
+  const s = src(HISTORY);
+  assert.match(s, /state: AccountingAvailability/);
+  assert.match(s, /state=\{accountingAvailability\(executed\)\}/);
+  assert.match(s, /const down = state === "unavailable"/);
+  // The unavailable branch is checked BEFORE the empty-trades branch.
+  const table = s.slice(s.indexOf("function RealBinanceTrades"));
+  assert.ok(
+    table.indexOf("{down ? (") < table.indexOf("rows.length > 0 ?"),
+    "history falls through to the empty state on a failed query",
+  );
+});
+
+test("history does not offer a CSV built from a feed it could not read", () => {
+  // A CSV of zero rows is a document asserting the client made no trades.
+  assert.match(src(HISTORY), /const exportable = !down && rows\.length > 0/);
+});
+
+test("reports shows the real section as unavailable rather than as zeros", () => {
+  const s = src(REPORTS);
+  assert.match(s, /state: AccountingAvailability/);
+  assert.match(s, /state=\{accountingState\}/);
+  const section = s.slice(s.indexOf("function RealBinancePerformance"));
+  assert.ok(
+    section.indexOf("{down ? (") < section.indexOf("rows.length === 0 ?"),
+    "reports falls through to the empty state on a failed query",
+  );
+  // The KPI grid — where the $0.00 totals live — is on the far side of both.
+  assert.ok(section.indexOf("{down ? (") < section.indexOf('label="Real Net P&L"'));
+});
+
+test("reports keeps the strategy section working when accounting is down", () => {
+  const s = src(REPORTS);
+  // The modelled KPIs are computed from metrics.*, which never touches the
+  // accounting feed, and are rendered outside the gated block.
+  assert.match(s, /label="Net P&L \(modelled\)"/);
+  const modelled = s.slice(s.indexOf('label="Net P&L (modelled)"'));
+  assert.ok(!/accountingDown/.test(modelled.slice(0, 600)));
+});
+
+test("no page can export or headline a real figure from a failed feed", () => {
+  const reports = src(REPORTS);
+  assert.match(reports, /onClick=\{exportRealCSV\} disabled=\{accountingDown \|\| !realFiltered\.length\}/);
+  // The page header counts real trades; it must not read 0 from a failure.
+  assert.match(reports, /accountingDown \? "real Binance accounting unavailable"/);
 });

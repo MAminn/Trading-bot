@@ -88,7 +88,7 @@ def one_real_trade(monkeypatch):
     monkeypatch.setattr(accounting_sync.BinanceAccountingClient, "sync_clock", lambda self: None)
     monkeypatch.setattr(
         accounting_sync, "_get_orders",
-        lambda base, token, user_id, symbol: [order("OPEN", "LONG", "100"),
+        lambda base, token, user_id, symbol, since=None: [order("OPEN", "LONG", "100"),
                                               order("CLOSE", "LONG", "200")],
     )
     monkeypatch.setattr(

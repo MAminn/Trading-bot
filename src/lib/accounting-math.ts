@@ -221,6 +221,54 @@ export function realTradesCsv(rows: readonly ExecutedTradeRow[]): string {
 /** What a customer should read when a figure is not established. */
 export const UNAVAILABLE = "unavailable";
 
+// ----- Feed availability -----
+
+/**
+ * Three states, never two.
+ *
+ * The bug this exists to prevent: collapsing "the accounting query failed" into
+ * "there are no trades". Those render identically as $0.00 and an empty table,
+ * and a customer reading that is being told their account did nothing today
+ * when the truth is that we could not find out.
+ */
+export type AccountingAvailability = "loading" | "available" | "unavailable";
+
+/**
+ * Resolve the feed state from a query result.
+ *
+ * Error is checked FIRST. React Query keeps a failing query in a refetching
+ * state, so testing `isLoading` first would show a spinner over a feed that is
+ * actually broken — and, worse, fall through to the empty state once the
+ * spinner cleared.
+ */
+export function accountingAvailability(feed: {
+  isError?: boolean;
+  isLoading?: boolean;
+  isPending?: boolean;
+}): AccountingAvailability {
+  if (feed.isError) return "unavailable";
+  if (feed.isLoading || feed.isPending) return "loading";
+  return "available";
+}
+
+/** True when no money figure may be rendered at all. */
+export function accountingIsUnavailable(feed: {
+  isError?: boolean;
+  isLoading?: boolean;
+  isPending?: boolean;
+}): boolean {
+  return accountingAvailability(feed) === "unavailable";
+}
+
+// The customer-facing wording, defined once so the dashboard, history and
+// reports pages cannot drift into three different explanations of one state.
+export const ACCOUNTING_UNAVAILABLE_TITLE = "Accounting unavailable";
+export const ACCOUNTING_UNAVAILABLE_BODY =
+  "Real Binance figures could not be loaded. No P&L or commission figure is being " +
+  "shown until the accounting feed recovers.";
+/** Short form, for a stat tile that has one line to say it in. */
+export const ACCOUNTING_UNAVAILABLE_SHORT = "Real Binance accounting unavailable";
+
 /**
  * Commission always reads as money leaving the account.
  *

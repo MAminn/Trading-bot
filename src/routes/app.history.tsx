@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
-import { Download, Inbox, Receipt } from "lucide-react";
+import { AlertTriangle, Download, Inbox, Receipt } from "lucide-react";
 import { useTrades, useEngineConfig, useEngineStatus, fmtUSD, fmtPct, liveState, tradePnlUsd, type TradeRow } from "@/lib/engine";
 import { SignalStatusBadge } from "@/components/SignalStatusBadge";
 import { SignalTimelinePanel } from "@/components/SignalTimelinePanel";
@@ -11,7 +11,9 @@ import {
 import {
   useExecutedTrades, useAccountingRealtime, realPerformance, realTradesCsv,
   isComplete, fmtCommission, netTone, incompleteLabel, closeSourceLabel, UNAVAILABLE,
-  type ExecutedTradeRow,
+  accountingAvailability,
+  ACCOUNTING_UNAVAILABLE_TITLE, ACCOUNTING_UNAVAILABLE_BODY, ACCOUNTING_UNAVAILABLE_SHORT,
+  type ExecutedTradeRow, type AccountingAvailability,
 } from "@/lib/accounting";
 
 export const Route = createFileRoute("/app/history")({
@@ -102,7 +104,7 @@ function History() {
           describes the result. */}
       <RealBinanceTrades
         rows={executed.data ?? []}
-        loading={executed.isLoading}
+        state={accountingAvailability(executed)}
         onExport={() =>
           download(realTradesCsv(executed.data ?? []), `helix-binance-accounting-${Date.now()}.csv`)
         }
@@ -334,15 +336,20 @@ function ExchangeOrders({ rows, loading }: { rows: EngineOrderRow[]; loading: bo
  */
 function RealBinanceTrades({
   rows,
-  loading,
+  state,
   onExport,
 }: {
   rows: ExecutedTradeRow[];
-  loading: boolean;
+  /** loading | available | unavailable — never collapsed to a boolean. */
+  state: AccountingAvailability;
   onExport: () => void;
 }) {
   const perf = realPerformance(rows);
-  const exportable = rows.length > 0;
+  const down = state === "unavailable";
+  const loading = state === "loading";
+  // Nothing may be exported from a feed we could not read: a CSV of zero rows
+  // is a document asserting the client made no trades.
+  const exportable = !down && rows.length > 0;
 
   return (
     <div className="space-y-4">
@@ -364,27 +371,41 @@ function RealBinanceTrades({
         </button>
       </div>
 
+      {/* Every tile reads "—" when the feed is down. A failed query must never
+          reach the client as a summed figure, however small. */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
-        <Tile label="Real Net P&L" value={perf.trades ? fmtUSD(perf.netPnl, true) : "—"}
-          tone={perf.trades ? netTone(perf.netPnl) : undefined} strong />
-        <Tile label="Gross P&L" value={perf.trades ? fmtUSD(perf.grossPnl, true) : "—"} />
-        <Tile label="Commission" value={perf.trades ? fmtCommission(perf.commission) : "—"}
-          tone={perf.trades && perf.commission > 0 ? "destructive" : undefined} />
-        <Tile label="Funding" value={perf.trades ? fmtUSD(perf.funding, true) : "—"}
-          tone={perf.trades && perf.funding !== 0 ? netTone(perf.funding) : undefined} />
+        <Tile label="Real Net P&L" value={!down && perf.trades ? fmtUSD(perf.netPnl, true) : "—"}
+          tone={!down && perf.trades ? netTone(perf.netPnl) : undefined} strong />
+        <Tile label="Gross P&L" value={!down && perf.trades ? fmtUSD(perf.grossPnl, true) : "—"} />
+        <Tile label="Commission" value={!down && perf.trades ? fmtCommission(perf.commission) : "—"}
+          tone={!down && perf.trades && perf.commission > 0 ? "destructive" : undefined} />
+        <Tile label="Funding" value={!down && perf.trades ? fmtUSD(perf.funding, true) : "—"}
+          tone={!down && perf.trades && perf.funding !== 0 ? netTone(perf.funding) : undefined} />
         <Tile
           label="Completed trades"
-          value={`${perf.trades}`}
+          value={down ? "—" : `${perf.trades}`}
           sub={
-            perf.incompleteTrades
-              ? `${perf.incompleteTrades} incomplete`
-              : `${perf.wins}W / ${perf.losses}L`
+            down
+              ? ACCOUNTING_UNAVAILABLE_SHORT
+              : perf.incompleteTrades
+                ? `${perf.incompleteTrades} incomplete`
+                : `${perf.wins}W / ${perf.losses}L`
           }
         />
       </div>
 
       <div className="card-elevated overflow-hidden p-0 ring-1 ring-primary/20">
-        {rows.length > 0 ? (
+        {down ? (
+          <div className="flex flex-col items-center gap-3 p-10 text-center">
+            <AlertTriangle className="h-6 w-6 text-warning" />
+            <div className="text-sm font-medium text-warning">
+              {ACCOUNTING_UNAVAILABLE_TITLE}
+            </div>
+            <p className="max-w-md text-xs text-muted-foreground">
+              {ACCOUNTING_UNAVAILABLE_BODY}
+            </p>
+          </div>
+        ) : rows.length > 0 ? (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-card/60 text-left text-xs uppercase tracking-wider text-muted-foreground">

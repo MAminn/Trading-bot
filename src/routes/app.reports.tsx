@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { format, subDays } from "date-fns";
-import { FileJson, FileSpreadsheet, Inbox, Printer, RefreshCw, Wallet } from "lucide-react";
+import { AlertTriangle, FileJson, FileSpreadsheet, Inbox, Printer, RefreshCw, Wallet } from "lucide-react";
 import {
   Area, AreaChart, Bar as RBar, BarChart, CartesianGrid, Cell, Line, LineChart,
   ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -15,7 +15,9 @@ import {
 } from "@/lib/engine";
 import {
   useExecutedTrades, useAccountingRealtime, realPerformance, realTradesCsv,
-  fmtCommission, netTone, type ExecutedTradeRow, type RealPerformance,
+  fmtCommission, netTone, accountingAvailability,
+  ACCOUNTING_UNAVAILABLE_TITLE, ACCOUNTING_UNAVAILABLE_BODY,
+  type ExecutedTradeRow, type RealPerformance, type AccountingAvailability,
 } from "@/lib/accounting";
 
 export const Route = createFileRoute("/app/reports")({
@@ -46,6 +48,9 @@ function Reports() {
     return rows.filter((t) => new Date(t.exit_time).getTime() >= cutoff);
   }, [executedQ.data, range]);
   const real = useMemo(() => realPerformance(realFiltered), [realFiltered]);
+  // A failed accounting query is its own state, never an empty result set.
+  const accountingState = accountingAvailability(executedQ);
+  const accountingDown = accountingState === "unavailable";
 
   const filtered = useMemo(() => {
     if (range === "all") return allTrades;
@@ -155,7 +160,8 @@ function Reports() {
           <div className="text-xs uppercase tracking-[0.2em] text-primary">Performance</div>
           <h1 className="mt-2 font-display text-3xl font-semibold">Reports</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {range.toUpperCase()} · {real.trades} real Binance trades ·{" "}
+            {range.toUpperCase()} ·{" "}
+            {accountingDown ? "real Binance accounting unavailable" : `${real.trades} real Binance trades`} ·{" "}
             {metrics.totalTrades} strategy trades (modelled on a {fmtUSD(capital)} baseline)
           </p>
         </div>
@@ -170,9 +176,9 @@ function Reports() {
             ))}
           </div>
           <Button variant="outline" size="sm" onClick={() => { tradesQ.refetch(); executedQ.refetch(); }}><RefreshCw className="mr-1.5 h-3.5 w-3.5" /> Refresh</Button>
-          <Button variant="outline" size="sm" onClick={exportRealCSV} disabled={!realFiltered.length}><FileSpreadsheet className="mr-1.5 h-3.5 w-3.5" /> Binance CSV</Button>
+          <Button variant="outline" size="sm" onClick={exportRealCSV} disabled={accountingDown || !realFiltered.length}><FileSpreadsheet className="mr-1.5 h-3.5 w-3.5" /> Binance CSV</Button>
           <Button variant="outline" size="sm" onClick={exportCSV} disabled={!filtered.length}><FileSpreadsheet className="mr-1.5 h-3.5 w-3.5" /> Strategy CSV</Button>
-          <Button variant="outline" size="sm" onClick={exportJSON} disabled={!filtered.length && !realFiltered.length}><FileJson className="mr-1.5 h-3.5 w-3.5" /> JSON</Button>
+          <Button variant="outline" size="sm" onClick={exportJSON} disabled={!filtered.length && (accountingDown || !realFiltered.length)}><FileJson className="mr-1.5 h-3.5 w-3.5" /> JSON</Button>
           <Button variant="outline" size="sm" onClick={() => window.print()}><Printer className="mr-1.5 h-3.5 w-3.5" /> Print</Button>
         </div>
       </div>
@@ -180,7 +186,7 @@ function Reports() {
       <RealBinancePerformance
         perf={real}
         rows={realFiltered}
-        loading={executedQ.isLoading}
+        state={accountingState}
         range={range}
       />
 
@@ -291,14 +297,17 @@ function Reports() {
 function RealBinancePerformance({
   perf,
   rows,
-  loading,
+  state,
   range,
 }: {
   perf: RealPerformance;
   rows: ExecutedTradeRow[];
-  loading: boolean;
+  /** loading | available | unavailable — never collapsed to a boolean. */
+  state: AccountingAvailability;
   range: RangeKey;
 }) {
+  const down = state === "unavailable";
+  const loading = state === "loading";
   return (
     <div className="space-y-4">
       <div>
@@ -312,7 +321,23 @@ function RealBinancePerformance({
         </p>
       </div>
 
-      {rows.length === 0 ? (
+      {/* Three states. The unavailable branch comes first and never falls
+          through to the KPI grid: rendering perf.* here would put "$0.00" and
+          a "0.0% win rate" under a heading that says Real Binance, on the
+          strength of a query that failed. */}
+      {down ? (
+        <div className="card-elevated flex flex-col items-center justify-center gap-2 border-warning/40 py-12 text-center">
+          <AlertTriangle className="h-6 w-6 text-warning" />
+          <div className="text-sm font-medium text-warning">
+            {ACCOUNTING_UNAVAILABLE_TITLE}
+          </div>
+          <p className="max-w-md text-xs text-muted-foreground">{ACCOUNTING_UNAVAILABLE_BODY}</p>
+          <p className="max-w-md text-xs text-muted-foreground">
+            The strategy figures below are unaffected — they are modelled from the
+            strategy&apos;s own returns and do not come from this feed.
+          </p>
+        </div>
+      ) : rows.length === 0 ? (
         <div className="card-elevated flex flex-col items-center justify-center gap-2 py-12 text-center">
           <Inbox className="h-6 w-6 text-muted-foreground" />
           <div className="text-sm font-medium">

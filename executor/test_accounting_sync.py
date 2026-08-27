@@ -21,6 +21,7 @@ import inspect
 import io
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -644,7 +645,7 @@ def test_one_users_sync_never_sends_another_users_id(monkeypatch):
     monkeypatch.setattr(BinanceAccountingClient, "sync_clock", lambda self: None)
     monkeypatch.setattr(
         accounting_sync, "_get_orders",
-        lambda base, token, user_id, symbol: [order("OPEN", "LONG", "100"), order("CLOSE", "LONG", "200")],
+        lambda base, token, user_id, symbol, since=None: [order("OPEN", "LONG", "100"), order("CLOSE", "LONG", "200")],
     )
     monkeypatch.setattr(
         accounting_sync, "fetch_recent_fills",
@@ -787,7 +788,7 @@ def test_no_credential_ever_reaches_the_log(monkeypatch, caplog):
     monkeypatch.setattr(BinanceAccountingClient, "sync_clock", lambda self: None)
     monkeypatch.setattr(
         accounting_sync, "_get_orders",
-        lambda base, token, user_id, symbol: [order("OPEN", "LONG", "100"), order("CLOSE", "LONG", "200")],
+        lambda base, token, user_id, symbol, since=None: [order("OPEN", "LONG", "100"), order("CLOSE", "LONG", "200")],
     )
     monkeypatch.setattr(
         accounting_sync, "fetch_recent_fills",
@@ -832,7 +833,7 @@ def test_dry_run_computes_and_logs_but_writes_nothing(monkeypatch, caplog):
     monkeypatch.setattr(BinanceAccountingClient, "sync_clock", lambda self: None)
     monkeypatch.setattr(
         accounting_sync, "_get_orders",
-        lambda base, token, user_id, symbol: [order("OPEN", "LONG", "100"), order("CLOSE", "LONG", "200")],
+        lambda base, token, user_id, symbol, since=None: [order("OPEN", "LONG", "100"), order("CLOSE", "LONG", "200")],
     )
     monkeypatch.setattr(
         accounting_sync, "fetch_recent_fills",
@@ -1452,7 +1453,7 @@ def test_no_user_can_be_written_under_another_users_id(monkeypatch):
     monkeypatch.setattr(BinanceAccountingClient, "sync_clock", lambda self: None)
     monkeypatch.setattr(
         accounting_sync, "_get_orders",
-        lambda base, token, user_id, symbol: [order("OPEN", "LONG", "100"),
+        lambda base, token, user_id, symbol, since=None: [order("OPEN", "LONG", "100"),
                                               order("CLOSE", "LONG", "200")],
     )
     monkeypatch.setattr(
@@ -1494,7 +1495,7 @@ def test_funding_attribution_is_not_shared_between_users(monkeypatch):
     monkeypatch.setattr(BinanceAccountingClient, "sync_clock", lambda self: None)
     monkeypatch.setattr(
         accounting_sync, "_get_orders",
-        lambda base, token, user_id, symbol: [order("OPEN", "LONG", "100"),
+        lambda base, token, user_id, symbol, since=None: [order("OPEN", "LONG", "100"),
                                               order("CLOSE", "LONG", "200")],
     )
     monkeypatch.setattr(
@@ -1513,3 +1514,489 @@ def test_funding_attribution_is_not_shared_between_users(monkeypatch):
     assert len(posted) == 2
     for p in posted:
         assert Decimal(p["funding_usd"]) == Decimal("-1.25")
+
+
+
+# =========================================================================== #
+# ORDER ATTRIBUTION MUST NOT SILENTLY TRUNCATE OR SKIP
+#
+# These rows decide which Binance order ids came from Helix. An id missing from
+# the set makes the position it opened look like the client's own trading, and a
+# real trade with real commission disappears from their P&L with no error and no
+# log line.
+#
+# Two bugs live here, and the second is subtler than the first.
+#
+#   1. The feed was a single `limit=2000` request against an endpoint capped at
+#      exactly 2000. The numbers agreed, so a customer with more orders than that
+#      lost the oldest ones silently.
+#
+#   2. Paginating that feed by OFFSET is unsound, because engine_orders is NOT
+#      append-only. ingest/order_update sets `status` (INTENT_LOGGED -> SENT ->
+#      FILLED) and populates `binance_order_id` on rows that already exist — and
+#      those are the two columns this feed filters on. A row created an hour ago
+#      can therefore ENTER the filtered set midway through a walk, shifting every
+#      later offset by one. The duplicate half of that is harmless; the skip half
+#      can drop the OPEN that attributes a real trade.
+#
+# Keyset pagination on (created_at, id) fixes the second: a cursor names a
+# position in a total ordering, not a count, so rows appearing behind it cannot
+# move the rows ahead of it.
+# =========================================================================== #
+
+BASE_TIME = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+
+def ts(seconds: int) -> str:
+    """A timestamptz as Postgres renders it — with an offset, and microseconds."""
+    return (BASE_TIME + timedelta(seconds=seconds)).isoformat(timespec="microseconds")
+
+
+def row_uuid(n: int) -> str:
+    return f"00000000-0000-4000-8000-{n:012d}"
+
+
+def engine_order(oid, intent="OPEN", side="LONG", symbol=SYMBOL,
+                 created_at=None, row_id=None, eligible=True, seq=None):
+    """One engine_orders row as the accounting feed serves it.
+
+    `eligible` models the pre-SENT state: a row that exists but is filtered out
+    because its status is INTENT_LOGGED or its binance_order_id is still null.
+    """
+    n = seq if seq is not None else (int(oid) if str(oid).isdigit() else abs(hash(str(oid))) % 10**9)
+    return {
+        "id": row_id or row_uuid(n),
+        "created_at": created_at or ts(n),
+        "intent": intent,
+        "side": side,
+        "binance_order_id": str(oid),
+        "symbol": symbol,
+        "status": "FILLED",
+        "_eligible": eligible,
+    }
+
+
+class FakeOrderFeed:
+    """The keyset-paginated accounting/orders endpoint, in memory.
+
+    Implements the real route's contract: ordering by (created_at, id), the
+    strict keyset predicate, the snapshot upper bound, and has_more/next_cursor.
+    `rows` may be mutated between calls to model a row becoming eligible, or a
+    new row being created, while the walk is in progress.
+    """
+
+    def __init__(self, rows, page_size=None, fail_on_page=None,
+                 lie_about_more=False, repeat_cursor=False, drop_snapshot=False,
+                 moving_snapshot=False, on_page=None):
+        self.rows = rows
+        self.page_size = page_size
+        self.fail_on_page = fail_on_page
+        self.lie_about_more = lie_about_more
+        self.repeat_cursor = repeat_cursor
+        self.drop_snapshot = drop_snapshot
+        self.moving_snapshot = moving_snapshot
+        self.on_page = on_page
+        self.calls = []
+        self._first_cursor = None
+        self._snapshot = None
+
+    def _pin_snapshot(self) -> str:
+        """The server's 'now' at the moment page one is served.
+
+        Pinned once, from the rows that exist then, so a row created later in
+        the walk falls outside it — which is exactly what snapshot_before is for.
+        """
+        if self._snapshot is None:
+            newest = max((r["created_at"] for r in self.rows), default=ts(0))
+            self._snapshot = newest
+        return self._snapshot
+
+    def __call__(self, url, params=None, headers=None, timeout=None):
+        params = params or {}
+        self.calls.append(dict(params))
+        page_index = len(self.calls) - 1
+        if self.on_page:
+            # Lets a test mutate the feed between pages.
+            self.on_page(page_index, self)
+        if self.fail_on_page is not None and page_index == self.fail_on_page:
+            return FakeResponse(500, text="upstream exploded")
+
+        snapshot = params.get("snapshot_before") or self._pin_snapshot()
+        if self.moving_snapshot:
+            snapshot = ts(10**6 + page_index)  # a different view on every page
+
+        limit = self.page_size or int(params.get("limit", 1000))
+        after = (params.get("after_created_at"), params.get("after_id"))
+
+        visible = [
+            r for r in self.rows
+            if r.get("_eligible", True)
+            and r["symbol"] == params.get("symbol", r["symbol"])
+            and r["created_at"] <= snapshot
+        ]
+        visible.sort(key=lambda r: (r["created_at"], r["id"]))
+        if after[0] and after[1]:
+            visible = [
+                r for r in visible
+                if (r["created_at"], r["id"]) > (after[0], after[1])
+            ]
+
+        window = visible[:limit]
+        has_more = len(visible) > limit
+        if self.lie_about_more:
+            window, has_more = [], True
+
+        last = window[-1] if window else None
+        cursor = {"created_at": last["created_at"], "id": last["id"]} if last else None
+        if self.repeat_cursor:
+            self._first_cursor = self._first_cursor or cursor
+            cursor = self._first_cursor
+            has_more = True
+
+        body = {
+            "orders": [{k: v for k, v in r.items() if k != "_eligible"} for r in window],
+            "count": len(window),
+            "has_more": has_more,
+            "next_cursor": cursor,
+        }
+        if not self.drop_snapshot:
+            body["snapshot_before"] = snapshot
+        return FakeResponse(200, body)
+
+
+def fetch_orders(monkeypatch, feed, since=None):
+    monkeypatch.setattr(accounting_sync.requests, "get", feed)
+    return accounting_sync._get_orders("http://app", "svc", ALICE, SYMBOL, since=since)
+
+
+def ids_of(orders):
+    return [o["binance_order_id"] for o in orders]
+
+
+# --------------------------------------------------------------------------- #
+# page shapes
+# --------------------------------------------------------------------------- #
+
+def test_fewer_orders_than_one_page_is_a_single_request(monkeypatch):
+    feed = FakeOrderFeed([engine_order(i) for i in range(10)])
+    orders = fetch_orders(monkeypatch, feed)
+    assert len(orders) == 10
+    assert len(feed.calls) == 1
+
+
+def test_exactly_one_full_page_still_checks_for_more(monkeypatch):
+    """The off-by-one that hides a customer's history.
+
+    A page that comes back exactly full is indistinguishable from a truncated
+    one unless the server says which it is. Here the feed holds exactly one
+    page: the walk must be told there is no more, and stop.
+    """
+    size = accounting_sync.ORDER_PAGE_SIZE
+    feed = FakeOrderFeed([engine_order(i) for i in range(size)])
+    orders = fetch_orders(monkeypatch, feed)
+    assert len(orders) == size
+    assert len(feed.calls) == 1
+
+
+def test_more_than_two_thousand_orders_are_all_retrieved_by_keyset(monkeypatch):
+    """The exact case the old single 2000-row request lost."""
+    total = 2500
+    feed = FakeOrderFeed([engine_order(i) for i in range(total)], page_size=1000)
+    orders = fetch_orders(monkeypatch, feed)
+    assert len(orders) == total
+    assert ids_of(orders) == [str(i) for i in range(total)]
+    assert len(feed.calls) == 3
+    # No offset anywhere: the walk advances by cursor.
+    assert all("offset" not in c for c in feed.calls)
+    assert "after_created_at" not in feed.calls[0]
+    assert feed.calls[1]["after_created_at"] == ts(999)
+    assert feed.calls[2]["after_created_at"] == ts(1999)
+
+
+def test_rows_sharing_a_timestamp_are_all_recovered_by_the_id_tiebreaker(monkeypatch):
+    """A bare created_at cursor would either skip these or loop on them.
+
+    Every row here is stamped at the same microsecond, which is what a batch
+    insert produces. `> created_at` alone would skip the whole group after the
+    first page; `>= created_at` would re-serve it forever.
+    """
+    same = ts(500)
+    rows = [engine_order(i, created_at=same, row_id=row_uuid(i), seq=i) for i in range(2500)]
+    feed = FakeOrderFeed(rows, page_size=1000)
+    orders = fetch_orders(monkeypatch, feed)
+    assert len(orders) == 2500
+    assert sorted(ids_of(orders), key=int) == [str(i) for i in range(2500)]
+    # The cursor advanced on id, since created_at never changed.
+    assert feed.calls[1]["after_created_at"] == same
+    assert feed.calls[1]["after_id"] == row_uuid(999)
+    assert feed.calls[2]["after_id"] == row_uuid(1999)
+
+
+def test_every_helix_open_id_survives_the_walk(monkeypatch):
+    """Attribution is the point: the id set must be complete.
+
+    The oldest OPEN sits on page one and the newest on page three. Both — and
+    every one between — must reach helix_order_ids, or the trades they opened
+    are silently reclassified as the client's own.
+    """
+    rows = [engine_order(i, intent="OPEN" if i % 2 == 0 else "CLOSE") for i in range(2500)]
+    feed = FakeOrderFeed(rows, page_size=1000)
+    orders = fetch_orders(monkeypatch, feed)
+    opens, closes = accounting_sync.helix_order_ids(orders, SYMBOL)
+    assert opens == {str(i) for i in range(0, 2500, 2)}
+    assert closes == {str(i) for i in range(1, 2500, 2)}
+    assert "0" in opens and "2498" in opens
+
+
+# --------------------------------------------------------------------------- #
+# concurrent mutation: the reason offset paging was wrong
+# --------------------------------------------------------------------------- #
+
+def test_a_row_created_after_page_one_does_not_shift_later_pages(monkeypatch):
+    """A new row appended mid-walk must not duplicate or displace anything."""
+    rows = [engine_order(i) for i in range(2500)]
+
+    def append_after_first_page(page_index, feed):
+        if page_index == 1:
+            feed.rows.append(engine_order(9999, seq=9999))
+
+    feed = FakeOrderFeed(rows, page_size=1000, on_page=append_after_first_page)
+    orders = fetch_orders(monkeypatch, feed)
+    got = ids_of(orders)
+    assert len(got) == len(set(got)), "a row was returned twice"
+    assert got == [str(i) for i in range(2500)]
+    # The snapshot kept the new row out of this walk entirely.
+    assert "9999" not in got
+
+
+def test_a_row_becoming_eligible_mid_walk_cannot_cause_a_skip(monkeypatch):
+    """The offset bug, reproduced against the keyset walk.
+
+    Row `late` was created before the walk began but was still INTENT_LOGGED
+    with a null binance_order_id, so it was filtered out. Its status flips while
+    page one is being served. Under offset paging it would enter the set behind
+    the cursor and push one row across the page boundary, skipping it. Under
+    keyset paging every other row must still arrive exactly once.
+    """
+    # A distinct order id: reusing one of the fillers would make the assertions
+    # below pass for the wrong reason.
+    late = engine_order("late-777", created_at=ts(1), row_id=row_uuid(777),
+                        eligible=False, seq=777)
+    rows = [engine_order(i, seq=i) for i in range(2500)]
+    rows.append(late)
+
+    def make_eligible(page_index, feed):
+        if page_index == 1:
+            late["_eligible"] = True
+
+    feed = FakeOrderFeed(rows, page_size=1000, on_page=make_eligible)
+    orders = fetch_orders(monkeypatch, feed)
+    got = ids_of(orders)
+    assert len(got) == len(set(got)), "a row was returned twice"
+    # Not one of the 2500 originals was lost — that is the property that matters.
+    assert set(got) >= {str(i) for i in range(2500)}
+    # The late row sat behind the cursor, so it is simply absent this run.
+    assert "late-777" not in got
+
+
+def test_a_row_that_became_eligible_too_late_is_recovered_next_run(monkeypatch):
+    """Temporary absence, not permanent loss.
+
+    The row missed above must be picked up by the following accounting run,
+    which starts with a fresh cursor. Its trade is then upserted on the unique
+    (user_id, close_binance_order_id) key, so nothing is double counted.
+    """
+    # A distinct order id: reusing one of the fillers would make the assertions
+    # below pass for the wrong reason.
+    late = engine_order("late-777", created_at=ts(1), row_id=row_uuid(777),
+                        eligible=False, seq=777)
+    rows = [engine_order(i, seq=i) for i in range(2500)]
+    rows.append(late)
+
+    feed = FakeOrderFeed(rows, page_size=1000,
+                         on_page=lambda i, f: late.__setitem__("_eligible", True) if i == 1 else None)
+    first = ids_of(fetch_orders(monkeypatch, feed))
+    assert "late-777" not in first
+
+    # A second run, fresh cursor, nothing else changed.
+    second_feed = FakeOrderFeed(rows, page_size=1000)
+    second = ids_of(fetch_orders(monkeypatch, second_feed))
+    assert "late-777" in second
+    assert len(second) == 2501
+
+
+def test_the_snapshot_is_fixed_on_page_one_and_reused(monkeypatch):
+    feed = FakeOrderFeed([engine_order(i) for i in range(2500)], page_size=1000)
+    fetch_orders(monkeypatch, feed)
+    assert "snapshot_before" not in feed.calls[0]
+    snapshots = [c["snapshot_before"] for c in feed.calls[1:]]
+    assert len(set(snapshots)) == 1, "the walk did not pin one snapshot"
+
+
+def test_a_snapshot_that_moves_mid_walk_is_refused(monkeypatch):
+    """Pages from different views of the feed do not compose into one answer."""
+    feed = FakeOrderFeed([engine_order(i) for i in range(2500)],
+                         page_size=1000, moving_snapshot=True)
+    with pytest.raises(AccountingError, match="changed snapshot_before"):
+        fetch_orders(monkeypatch, feed)
+
+
+def test_a_feed_without_a_snapshot_is_refused(monkeypatch):
+    feed = FakeOrderFeed([engine_order(i) for i in range(10)], drop_snapshot=True)
+    with pytest.raises(AccountingError, match="no snapshot_before"):
+        fetch_orders(monkeypatch, feed)
+
+
+# --------------------------------------------------------------------------- #
+# a walk that cannot finish stops the user
+# --------------------------------------------------------------------------- #
+
+def test_a_failed_page_stops_the_user_rather_than_truncating(monkeypatch):
+    """Half an attribution set is not a smaller answer, it is a wrong one."""
+    feed = FakeOrderFeed([engine_order(i) for i in range(2500)],
+                         page_size=1000, fail_on_page=1)
+    with pytest.raises(AccountingError, match="accounting/orders -> HTTP 500"):
+        fetch_orders(monkeypatch, feed)
+
+
+def test_a_repeated_cursor_is_refused_not_looped(monkeypatch):
+    feed = FakeOrderFeed([engine_order(i) for i in range(2500)],
+                         page_size=1000, repeat_cursor=True)
+    with pytest.raises(AccountingError, match="repeated cursor"):
+        fetch_orders(monkeypatch, feed)
+    # It stopped on the second sighting, not after exhausting the page budget.
+    assert len(feed.calls) == 2
+
+
+def test_a_feed_that_never_ends_is_refused(monkeypatch):
+    feed = FakeOrderFeed([engine_order(i) for i in range(10)], lie_about_more=True)
+    with pytest.raises(AccountingError, match="incomplete attribution set"):
+        fetch_orders(monkeypatch, feed)
+    assert len(feed.calls) == 1
+
+
+def test_a_missing_cursor_with_more_rows_is_refused(monkeypatch):
+    class NoCursor(FakeOrderFeed):
+        def __call__(self, *a, **k):
+            r = super().__call__(*a, **k)
+            r._payload["next_cursor"] = None
+            r._payload["has_more"] = True
+            return r
+
+    feed = NoCursor([engine_order(i) for i in range(10)], page_size=5)
+    with pytest.raises(AccountingError, match="without a cursor"):
+        fetch_orders(monkeypatch, feed)
+
+
+def test_the_page_budget_is_a_refusal_not_a_silent_stop(monkeypatch):
+    feed = FakeOrderFeed([engine_order(i) for i in range(50)], page_size=1)
+    monkeypatch.setattr(accounting_sync, "MAX_ORDER_PAGES", 5)
+    with pytest.raises(AccountingError, match="exceeded 5 pages"):
+        fetch_orders(monkeypatch, feed)
+
+
+# --------------------------------------------------------------------------- #
+# scoping, and the end-to-end effect on a real trade
+# --------------------------------------------------------------------------- #
+
+def test_the_walk_is_user_and_symbol_scoped(monkeypatch):
+    feed = FakeOrderFeed([engine_order(i) for i in range(2500)], page_size=1000)
+    fetch_orders(monkeypatch, feed)
+    for call in feed.calls:
+        assert call["user_id"] == ALICE
+        assert call["symbol"] == SYMBOL
+
+
+def test_the_walk_bounds_itself_to_the_accounting_window(monkeypatch):
+    feed = FakeOrderFeed([engine_order(1)])
+    fetch_orders(monkeypatch, feed, since=accounting_sync.order_lookback_since(30))
+    assert feed.calls[0]["since"].endswith("Z")
+
+
+def test_the_order_window_is_wider_than_the_fill_window():
+    """An order sent just before the window whose fills landed just inside it."""
+    since = accounting_sync.order_lookback_since(30)
+    cutoff = datetime.fromisoformat(since.replace("Z", "+00:00"))
+    age_days = (datetime.now(timezone.utc) - cutoff).days
+    assert age_days >= 30 + accounting_sync.ORDER_LOOKBACK_MARGIN_DAYS - 1
+
+
+def test_orders_from_other_symbols_are_never_attributed():
+    mixed = [
+        engine_order("1", intent="OPEN", seq=1),
+        engine_order("2", intent="OPEN", symbol="BTCUSDT", seq=2),
+        engine_order("3", intent="CLOSE", seq=3),
+    ]
+    opens, closes = accounting_sync.helix_order_ids(mixed, SYMBOL)
+    assert opens == {"1"}
+    assert closes == {"3"}
+
+
+def test_a_bot_trade_on_a_later_page_is_still_attributed(monkeypatch):
+    """End to end: an OPEN beyond the old 2000 cap still produces a real trade."""
+    rows = [engine_order(f"filler-{i}", seq=i) for i in range(2400)]
+    rows.append(engine_order("100", intent="OPEN", seq=2400))
+    rows.append(engine_order("200", intent="CLOSE", seq=2401))
+    feed = FakeOrderFeed(rows, page_size=1000)
+    orders = fetch_orders(monkeypatch, feed)
+    opens, closes = accounting_sync.helix_order_ids(orders, SYMBOL)
+
+    fills = [
+        fill("100", "1", "3000", "0.6", side="BUY", t=T_ENTRY, fid="1"),
+        fill("200", "1", "3012.5", "0.6", side="SELL", realized="12.5", t=T_EXIT, fid="2"),
+    ]
+    (episode,) = accounting_sync.reconstruct_episodes(fills, opens)
+    payload = accounting_sync.build_episode_payload(
+        ALICE, SYMBOL, episode, opens, closes, [], set()
+    )
+    assert payload is not None, "a Helix trade was reclassified as the client's own"
+    assert payload["accounting_status"] == "COMPLETE"
+    assert payload["close_source"] == "HELIX"
+
+
+def test_the_same_trade_is_lost_when_attribution_is_truncated():
+    """The negative control, proving the test above tests something.
+
+    With only the first page — which is what the old single capped request
+    effectively returned — the OPEN id is absent and the position reads as the
+    client's own. That is the customer-visible bug.
+    """
+    rows = [engine_order(f"filler-{i}", seq=i) for i in range(2400)]
+    rows.append(engine_order("100", intent="OPEN", seq=2400))
+    truncated = rows[:1000]
+    opens, _ = accounting_sync.helix_order_ids(truncated, SYMBOL)
+    assert "100" not in opens
+
+    fills = [
+        fill("100", "1", "3000", "0.6", side="BUY", t=T_ENTRY, fid="1"),
+        fill("200", "1", "3012.5", "0.6", side="SELL", realized="12.5", t=T_EXIT, fid="2"),
+    ]
+    assert accounting_sync.reconstruct_episodes(fills, opens) == []
+
+
+def test_the_endpoint_and_the_client_agree_on_the_keyset_contract():
+    route = (
+        Path(accounting_sync.__file__).resolve().parents[1]
+        / "src/routes/api/public/engine/accounting.orders.ts"
+    ).read_text(encoding="utf-8")
+    for signal in ("has_more", "next_cursor", "snapshot_before",
+                   "after_created_at", "after_id"):
+        assert signal in route, signal
+    assert "MAX_ORDER_PAGE = 1000" in route
+    assert accounting_sync.ORDER_PAGE_SIZE == 1000
+    # Deterministic total ordering, and the strict keyset predicate.
+    assert 'order("created_at", { ascending: true })' in route
+    assert 'order("id", { ascending: true })' in route
+    assert "created_at.gt." in route
+    assert "created_at.eq." in route
+    assert "id.gt." in route
+    assert '.lte("created_at", snapshot_before)' in route
+    # Offset paging is gone from both sides.
+    code = "\n".join(l for l in route.splitlines() if not l.strip().startswith("*"))
+    assert ".range(" not in code
+    assert "next_offset" not in code
+    assert "offset" not in accounting_sync._get_orders.__code__.co_varnames
+    # Still read-only, still scoped.
+    assert '.eq("user_id", parsed.user_id)' in route
+    for verb in (".insert(", ".update(", ".upsert(", ".delete("):
+        assert verb not in route

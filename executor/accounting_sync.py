@@ -111,6 +111,19 @@ REQUEST_TIMEOUT = 15
 MAX_ROWS_PER_WINDOW = 1000
 WINDOW_DAYS = 7
 
+# Order-feed pagination. The page size matches the endpoint's own maximum; the
+# page budget is a runaway guard, not a limit on how many orders a customer may
+# have — 200 pages is 200,000 orders, and exceeding it raises rather than
+# quietly accounting from a partial attribution set.
+ORDER_PAGE_SIZE = 1000
+MAX_ORDER_PAGES = 200
+
+# Orders are fetched from a little before the fill window. An order row is only
+# needed when its fills are inside the window, and a row is written at the
+# moment its order is sent, so the two are near-simultaneous; the margin covers
+# clock skew and an order sent just before the boundary that filled just after.
+ORDER_LOOKBACK_MARGIN_DAYS = 2
+
 # The ACCOUNTING roster: customers with Binance credentials on file.
 #
 # Deliberately not /api/public/engine/users/active, which is the EXECUTION
@@ -375,16 +388,126 @@ def fetch_funding_events(client: BinanceAccountingClient, symbol: str, days: int
     return sorted(rows.values(), key=lambda r: int(r["time"]))
 
 
-def _get_orders(app_base: str, token: str, user_id: str, symbol: str) -> list[dict]:
-    r = requests.get(
-        f"{app_base.rstrip('/')}/api/public/engine/accounting/orders",
-        params={"user_id": user_id, "symbol": symbol, "limit": 2000},
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=REQUEST_TIMEOUT,
+def order_lookback_since(days: int) -> str:
+    """The `since` bound for the order feed: the fill window, plus a margin.
+
+    Bounding the feed by time is what keeps pagination cheap on a long-lived
+    account. The margin is deliberate slack — an order sent just before the
+    window opened whose fills landed just inside it must still be attributable.
+    """
+    start = datetime.now(timezone.utc) - timedelta(days=days + ORDER_LOOKBACK_MARGIN_DAYS)
+    return start.isoformat().replace("+00:00", "Z")
+
+
+def _get_orders(app_base: str, token: str, user_id: str, symbol: str,
+                since: str | None = None) -> list[dict]:
+    """Every Helix order for this user and symbol in the window, across pages.
+
+    ATTRIBUTION DEPENDS ON THIS BEING COMPLETE. These rows decide which Binance
+    order ids came from Helix; an id missing from the set makes the position it
+    opened look like the client's own trading, and a real trade with real
+    commission vanishes from their P&L without a word.
+
+    So the feed is walked to its end rather than sampled. It used to be a single
+    `limit=2000` request against an endpoint that capped at 2000 and said
+    nothing when it truncated — the two numbers agreed exactly, so a customer
+    with more orders than that lost the oldest ones silently.
+
+    KEYSET, NOT OFFSET. engine_orders rows are not append-only: the app's
+    ingest/order_update route sets `status` and `binance_order_id` on rows that
+    already exist, and those are the two columns this feed filters on. A row
+    created an hour ago can therefore ENTER the result set midway through a walk
+    and shift every later offset by one, making an offset walk skip a row —
+    possibly the OPEN that attributes a real trade. A (created_at, id) cursor
+    names a position rather than a count, so rows appearing behind it cannot
+    move the rows ahead of it, and a snapshot_before fixed on page 1 stops rows
+    created during the walk from extending it.
+
+    A row that becomes eligible BEHIND the cursor is not seen this run and is
+    picked up by the next one. That is the deliberate trade: a trade briefly
+    absent is safe, a trade wrongly attributed is not.
+
+    If the walk cannot be completed — a failed page, a malformed or repeated
+    cursor, a snapshot that moves mid-walk, or the page budget — this raises.
+    Accounting for that user stops rather than proceeding from an attribution
+    set known to be partial.
+    """
+    url = f"{app_base.rstrip('/')}/api/public/engine/accounting/orders"
+    headers = {"Authorization": f"Bearer {token}"}
+    orders: list[dict] = []
+    cursor: tuple[str, str] | None = None
+    snapshot: str | None = None
+    seen_cursors: set[tuple[str, str]] = set()
+
+    for page in range(MAX_ORDER_PAGES):
+        params: dict = {"user_id": user_id, "symbol": symbol, "limit": ORDER_PAGE_SIZE}
+        if since:
+            params["since"] = since
+        if snapshot:
+            # Pinned from page 1, so rows created while this walk is running
+            # cannot keep extending it.
+            params["snapshot_before"] = snapshot
+        if cursor:
+            params["after_created_at"], params["after_id"] = cursor
+
+        r = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+        if not 200 <= r.status_code < 300:
+            raise AccountingError(
+                f"accounting/orders -> HTTP {r.status_code} on page {page}: {r.text[:300]}"
+            )
+        body = r.json()
+        batch = body.get("orders") or []
+        orders.extend(batch)
+
+        page_snapshot = body.get("snapshot_before")
+        if not page_snapshot:
+            raise AccountingError(
+                "accounting/orders returned no snapshot_before; refusing to account "
+                "from an unbounded walk"
+            )
+        if snapshot is None:
+            snapshot = page_snapshot
+        elif page_snapshot != snapshot:
+            # The upper bound moved mid-walk, so the pages do not describe one
+            # consistent view of the feed.
+            raise AccountingError(
+                "accounting/orders changed snapshot_before mid-walk; refusing to "
+                "account from an inconsistent attribution set"
+            )
+
+        if not body.get("has_more"):
+            return orders
+
+        if not batch:
+            # has_more with nothing in it cannot advance the cursor.
+            raise AccountingError(
+                "accounting/orders reported more rows but returned none; "
+                "refusing to account from an incomplete attribution set"
+            )
+
+        nxt = body.get("next_cursor") or {}
+        created_at, row_id = nxt.get("created_at"), nxt.get("id")
+        if not created_at or not row_id:
+            raise AccountingError(
+                "accounting/orders reported more rows without a cursor; refusing to "
+                "account from an incomplete attribution set"
+            )
+        nxt_cursor = (str(created_at), str(row_id))
+        if nxt_cursor in seen_cursors:
+            # A cursor that repeats would walk the same page forever and grow
+            # `orders` without bound.
+            raise AccountingError(
+                "accounting/orders returned a repeated cursor; refusing to account "
+                "from an incomplete attribution set"
+            )
+        seen_cursors.add(nxt_cursor)
+        cursor = nxt_cursor
+
+    raise AccountingError(
+        f"accounting/orders exceeded {MAX_ORDER_PAGES} pages "
+        f"({len(orders)} orders read); refusing to account from an incomplete "
+        "attribution set"
     )
-    if not 200 <= r.status_code < 300:
-        raise AccountingError(f"accounting/orders -> HTTP {r.status_code}: {r.text[:300]}")
-    return r.json().get("orders") or []
 
 
 def helix_order_ids(orders: list[dict], symbol: str) -> tuple[set[str], set[str]]:
@@ -930,8 +1053,16 @@ def sync_user(
     client = BinanceAccountingClient(cred.credentials.api_key, cred.credentials.api_secret)
     client.sync_clock()
 
-    orders = _get_orders(app_base, service_token, user_id, symbol)
+    # Paginated to the end of the feed. Bounded by the same lookback the fills
+    # use, plus a margin: an order matters only when its fills are in the window,
+    # and the row is written when the order is sent, so the two are contemporary.
+    orders = _get_orders(app_base, service_token, user_id, symbol,
+                         since=order_lookback_since(days))
     open_ids, close_ids = helix_order_ids(orders, symbol)
+    log.info(
+        "attribution set loaded | user=%s symbol=%s orders=%d helix_opens=%d helix_closes=%d",
+        user_id, symbol, len(orders), len(open_ids), len(close_ids),
+    )
     fills = fetch_recent_fills(client, symbol, days)
     funding_events = fetch_funding_events(client, symbol, days)
     episodes = reconstruct_episodes(fills, open_ids)
