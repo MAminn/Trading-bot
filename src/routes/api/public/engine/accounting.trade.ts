@@ -61,9 +61,13 @@ export const Route = createFileRoute("/api/public/engine/accounting/trade")({
           updated_at: new Date().toISOString(),
         };
 
-        const { data, error } = await supabaseAdmin
+        // executed_trades is introduced by the same deployment as this route;
+        // generated Supabase client types can lag one migration. Keep that
+        // compile-time concern local to this reporting-only boundary.
+        const db = supabaseAdmin as any;
+        const { data, error } = await db
           .from("executed_trades")
-          .upsert(row as never, { onConflict: "user_id,close_binance_order_id" })
+          .upsert(row, { onConflict: "user_id,close_binance_order_id" })
           .select("id,commission_usd,net_pnl_usd")
           .single();
 
