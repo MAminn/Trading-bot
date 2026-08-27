@@ -35,6 +35,9 @@ import { Route as ApiPublicEngineIngestOrder_updateRouteImport } from './routes/
 import { Route as ApiPublicEngineIngestOrderRouteImport } from './routes/api/public/engine/ingest.order'
 import { Route as ApiPublicEngineIngestOpen_positionsRouteImport } from './routes/api/public/engine/ingest.open_positions'
 import { Route as ApiPublicEngineIngestExecutor_statusRouteImport } from './routes/api/public/engine/ingest.executor_status'
+import { Route as ApiPublicEngineAccountingUsersRouteImport } from './routes/api/public/engine/accounting.users'
+import { Route as ApiPublicEngineAccountingTradeRouteImport } from './routes/api/public/engine/accounting.trade'
+import { Route as ApiPublicEngineAccountingOrdersRouteImport } from './routes/api/public/engine/accounting.orders'
 
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
@@ -177,6 +180,24 @@ const ApiPublicEngineIngestExecutor_statusRoute =
     path: '/api/public/engine/ingest/executor_status',
     getParentRoute: () => rootRouteImport,
   } as any)
+const ApiPublicEngineAccountingUsersRoute =
+  ApiPublicEngineAccountingUsersRouteImport.update({
+    id: '/api/public/engine/accounting/users',
+    path: '/api/public/engine/accounting/users',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const ApiPublicEngineAccountingTradeRoute =
+  ApiPublicEngineAccountingTradeRouteImport.update({
+    id: '/api/public/engine/accounting/trade',
+    path: '/api/public/engine/accounting/trade',
+    getParentRoute: () => rootRouteImport,
+  } as any)
+const ApiPublicEngineAccountingOrdersRoute =
+  ApiPublicEngineAccountingOrdersRouteImport.update({
+    id: '/api/public/engine/accounting/orders',
+    path: '/api/public/engine/accounting/orders',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
@@ -196,6 +217,9 @@ export interface FileRoutesByFullPath {
   '/api/public/engine/demo-tick': typeof ApiPublicEngineDemoTickRoute
   '/api/public/engine/eth-price': typeof ApiPublicEngineEthPriceRoute
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
+  '/api/public/engine/accounting/orders': typeof ApiPublicEngineAccountingOrdersRoute
+  '/api/public/engine/accounting/trade': typeof ApiPublicEngineAccountingTradeRoute
+  '/api/public/engine/accounting/users': typeof ApiPublicEngineAccountingUsersRoute
   '/api/public/engine/ingest/executor_status': typeof ApiPublicEngineIngestExecutor_statusRoute
   '/api/public/engine/ingest/open_positions': typeof ApiPublicEngineIngestOpen_positionsRoute
   '/api/public/engine/ingest/order': typeof ApiPublicEngineIngestOrderRoute
@@ -223,6 +247,9 @@ export interface FileRoutesByTo {
   '/api/public/engine/demo-tick': typeof ApiPublicEngineDemoTickRoute
   '/api/public/engine/eth-price': typeof ApiPublicEngineEthPriceRoute
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
+  '/api/public/engine/accounting/orders': typeof ApiPublicEngineAccountingOrdersRoute
+  '/api/public/engine/accounting/trade': typeof ApiPublicEngineAccountingTradeRoute
+  '/api/public/engine/accounting/users': typeof ApiPublicEngineAccountingUsersRoute
   '/api/public/engine/ingest/executor_status': typeof ApiPublicEngineIngestExecutor_statusRoute
   '/api/public/engine/ingest/open_positions': typeof ApiPublicEngineIngestOpen_positionsRoute
   '/api/public/engine/ingest/order': typeof ApiPublicEngineIngestOrderRoute
@@ -252,6 +279,9 @@ export interface FileRoutesById {
   '/api/public/engine/demo-tick': typeof ApiPublicEngineDemoTickRoute
   '/api/public/engine/eth-price': typeof ApiPublicEngineEthPriceRoute
   '/api/public/engine/heartbeat': typeof ApiPublicEngineHeartbeatRoute
+  '/api/public/engine/accounting/orders': typeof ApiPublicEngineAccountingOrdersRoute
+  '/api/public/engine/accounting/trade': typeof ApiPublicEngineAccountingTradeRoute
+  '/api/public/engine/accounting/users': typeof ApiPublicEngineAccountingUsersRoute
   '/api/public/engine/ingest/executor_status': typeof ApiPublicEngineIngestExecutor_statusRoute
   '/api/public/engine/ingest/open_positions': typeof ApiPublicEngineIngestOpen_positionsRoute
   '/api/public/engine/ingest/order': typeof ApiPublicEngineIngestOrderRoute
@@ -282,6 +312,9 @@ export interface FileRouteTypes {
     | '/api/public/engine/demo-tick'
     | '/api/public/engine/eth-price'
     | '/api/public/engine/heartbeat'
+    | '/api/public/engine/accounting/orders'
+    | '/api/public/engine/accounting/trade'
+    | '/api/public/engine/accounting/users'
     | '/api/public/engine/ingest/executor_status'
     | '/api/public/engine/ingest/open_positions'
     | '/api/public/engine/ingest/order'
@@ -309,6 +342,9 @@ export interface FileRouteTypes {
     | '/api/public/engine/demo-tick'
     | '/api/public/engine/eth-price'
     | '/api/public/engine/heartbeat'
+    | '/api/public/engine/accounting/orders'
+    | '/api/public/engine/accounting/trade'
+    | '/api/public/engine/accounting/users'
     | '/api/public/engine/ingest/executor_status'
     | '/api/public/engine/ingest/open_positions'
     | '/api/public/engine/ingest/order'
@@ -337,6 +373,9 @@ export interface FileRouteTypes {
     | '/api/public/engine/demo-tick'
     | '/api/public/engine/eth-price'
     | '/api/public/engine/heartbeat'
+    | '/api/public/engine/accounting/orders'
+    | '/api/public/engine/accounting/trade'
+    | '/api/public/engine/accounting/users'
     | '/api/public/engine/ingest/executor_status'
     | '/api/public/engine/ingest/open_positions'
     | '/api/public/engine/ingest/order'
@@ -357,6 +396,9 @@ export interface RootRouteChildren {
   ApiPublicEngineDemoTickRoute: typeof ApiPublicEngineDemoTickRoute
   ApiPublicEngineEthPriceRoute: typeof ApiPublicEngineEthPriceRoute
   ApiPublicEngineHeartbeatRoute: typeof ApiPublicEngineHeartbeatRoute
+  ApiPublicEngineAccountingOrdersRoute: typeof ApiPublicEngineAccountingOrdersRoute
+  ApiPublicEngineAccountingTradeRoute: typeof ApiPublicEngineAccountingTradeRoute
+  ApiPublicEngineAccountingUsersRoute: typeof ApiPublicEngineAccountingUsersRoute
   ApiPublicEngineIngestExecutor_statusRoute: typeof ApiPublicEngineIngestExecutor_statusRoute
   ApiPublicEngineIngestOpen_positionsRoute: typeof ApiPublicEngineIngestOpen_positionsRoute
   ApiPublicEngineIngestOrderRoute: typeof ApiPublicEngineIngestOrderRoute
@@ -552,6 +594,27 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiPublicEngineIngestExecutor_statusRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/public/engine/accounting/users': {
+      id: '/api/public/engine/accounting/users'
+      path: '/api/public/engine/accounting/users'
+      fullPath: '/api/public/engine/accounting/users'
+      preLoaderRoute: typeof ApiPublicEngineAccountingUsersRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/public/engine/accounting/trade': {
+      id: '/api/public/engine/accounting/trade'
+      path: '/api/public/engine/accounting/trade'
+      fullPath: '/api/public/engine/accounting/trade'
+      preLoaderRoute: typeof ApiPublicEngineAccountingTradeRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/api/public/engine/accounting/orders': {
+      id: '/api/public/engine/accounting/orders'
+      path: '/api/public/engine/accounting/orders'
+      fullPath: '/api/public/engine/accounting/orders'
+      preLoaderRoute: typeof ApiPublicEngineAccountingOrdersRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -590,6 +653,9 @@ const rootRouteChildren: RootRouteChildren = {
   ApiPublicEngineDemoTickRoute: ApiPublicEngineDemoTickRoute,
   ApiPublicEngineEthPriceRoute: ApiPublicEngineEthPriceRoute,
   ApiPublicEngineHeartbeatRoute: ApiPublicEngineHeartbeatRoute,
+  ApiPublicEngineAccountingOrdersRoute: ApiPublicEngineAccountingOrdersRoute,
+  ApiPublicEngineAccountingTradeRoute: ApiPublicEngineAccountingTradeRoute,
+  ApiPublicEngineAccountingUsersRoute: ApiPublicEngineAccountingUsersRoute,
   ApiPublicEngineIngestExecutor_statusRoute:
     ApiPublicEngineIngestExecutor_statusRoute,
   ApiPublicEngineIngestOpen_positionsRoute:

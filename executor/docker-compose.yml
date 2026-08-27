@@ -3,3 +3,36 @@ services:
     build: .
     restart: unless-stopped
     env_file: .env
+
+  # Read-only Binance accounting. A SEPARATE service on purpose.
+  #
+  # It shares the image only so it has the same Python and the same code
+  # directory; it shares nothing else with the executor. Its command is
+  # accounting_loop.py, which overrides the image's `CMD ["python", "main.py"]`,
+  # so this container never runs the trading executor — and EXECUTION_MODE is
+  # pinned to OFF underneath that, so even a hand-run main.py inside this
+  # container could not place an order.
+  #
+  # It is not linked to the executor by depends_on, a network alias or a shared
+  # volume. Accounting keeps running when the executor is stopped, which is the
+  # point: a trade that already happened still needs its commission and net P&L
+  # synchronised, and a client who has pressed Stop is exactly the client most
+  # likely to be reading their final numbers.
+  #
+  # Started explicitly, never as part of `docker compose up`:
+  #     docker compose up -d accounting
+  accounting:
+    build: .
+    container_name: helix-accounting
+    restart: unless-stopped
+    env_file: .env
+    command: ["python", "accounting_loop.py"]
+    environment:
+      # Defence in depth. accounting_loop.py cannot reach main.py, but if this
+      # container were ever entered by hand, the executor it could start would
+      # be one that is structurally unable to trade.
+      EXECUTION_MODE: "OFF"
+      ACCOUNTING_INTERVAL_SECONDS: "300"
+    # Opt-in: `docker compose up -d` alone will not start accounting, so
+    # deploying the executor can never silently start writing accounting rows.
+    profiles: ["accounting"]

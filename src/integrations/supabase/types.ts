@@ -243,6 +243,95 @@ export type Database = {
         }
         Relationships: []
       }
+      executed_trades: {
+        Row: {
+          accounting_status: string
+          close_binance_order_id: string
+          close_source: string
+          commission_usd: number | null
+          created_at: string
+          entry_avg_price: number | null
+          entry_commission_usd: number | null
+          entry_fill_count: number
+          entry_time: string
+          exit_avg_price: number | null
+          exit_commission_usd: number | null
+          exit_fill_count: number
+          exit_order_count: number
+          exit_time: string
+          funding_event_count: number
+          funding_usd: number | null
+          gross_pnl_usd: number | null
+          id: string
+          incomplete_reason: string | null
+          net_pnl_usd: number | null
+          open_binance_order_id: string
+          qty: number | null
+          side: string
+          source: string
+          symbol: string
+          synced_at: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          accounting_status?: string
+          close_binance_order_id: string
+          close_source?: string
+          created_at?: string
+          entry_avg_price?: number | null
+          entry_commission_usd?: number | null
+          entry_fill_count?: number
+          entry_time: string
+          exit_avg_price?: number | null
+          exit_commission_usd?: number | null
+          exit_fill_count?: number
+          exit_order_count?: number
+          exit_time: string
+          funding_event_count?: number
+          funding_usd?: number | null
+          gross_pnl_usd?: number | null
+          id?: string
+          incomplete_reason?: string | null
+          open_binance_order_id: string
+          qty?: number | null
+          side: string
+          source?: string
+          symbol?: string
+          synced_at?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          accounting_status?: string
+          close_binance_order_id?: string
+          close_source?: string
+          created_at?: string
+          entry_avg_price?: number | null
+          entry_commission_usd?: number | null
+          entry_fill_count?: number
+          entry_time?: string
+          exit_avg_price?: number | null
+          exit_commission_usd?: number | null
+          exit_fill_count?: number
+          exit_order_count?: number
+          exit_time?: string
+          funding_event_count?: number
+          funding_usd?: number | null
+          gross_pnl_usd?: number | null
+          id?: string
+          incomplete_reason?: string | null
+          open_binance_order_id?: string
+          qty?: number | null
+          side?: string
+          source?: string
+          symbol?: string
+          synced_at?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
       executor_status: {
         Row: {
           auto_execute_enabled: boolean | null

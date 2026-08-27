@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
-import { Download, Inbox } from "lucide-react";
+import { Download, Inbox, Receipt } from "lucide-react";
 import { useTrades, useEngineConfig, useEngineStatus, fmtUSD, fmtPct, liveState, tradePnlUsd, type TradeRow } from "@/lib/engine";
 import { SignalStatusBadge } from "@/components/SignalStatusBadge";
 import { SignalTimelinePanel } from "@/components/SignalTimelinePanel";
@@ -8,6 +8,11 @@ import {
   useEngineOrders, ORDER_STATUS_LABEL, ORDER_REACHED_EXCHANGE, ORDER_FILLED,
   type EngineOrderRow,
 } from "@/lib/executor";
+import {
+  useExecutedTrades, useAccountingRealtime, realPerformance, realTradesCsv,
+  isComplete, fmtCommission, netTone, incompleteLabel, closeSourceLabel, UNAVAILABLE,
+  type ExecutedTradeRow,
+} from "@/lib/accounting";
 
 export const Route = createFileRoute("/app/history")({
   head: () => ({ meta: [{ title: "Trade History — Helix" }] }),
@@ -35,6 +40,10 @@ function History() {
   const capital = Number(cfg.data?.capital_usd ?? 10000);
   const trades = useTrades(500);
   const orders = useEngineOrders(200);
+  // The real Binance accounting layer. Its own hook, its own table, its own
+  // section below — never merged into the strategy rows.
+  const executed = useExecutedTrades(500);
+  useAccountingRealtime();
   const [filter, setFilter] = useState<Filter>("All");
   const [timelineId, setTimelineId] = useState<string | null>(null);
 
@@ -53,34 +62,69 @@ function History() {
   const wins = (trades.data ?? []).filter((t) => Number(t.net_pnl_rate ?? 0) > 0).length;
   const state = liveState(status.data);
 
-  function exportCsv() {
-    const header = "id,trade_id,side,setup,entry_t,exit_t,entry,exit,tp,sl,prob,exit_reason,net_pnl_rate,pnl_usd";
+  function download(csv: string, name: string) {
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /** The MODELLED strategy export. `pnl_usd` here is net_pnl_rate x capital_usd,
+   *  which the column name below says outright — it is not the client's money,
+   *  and the real Binance export is a separate file. */
+  function exportStrategyCsv() {
+    const header = "id,trade_id,side,setup,entry_t,exit_t,entry,exit,tp,sl,prob,exit_reason,net_pnl_rate,modelled_pnl_usd";
     const csv = [header,
       ...(trades.data ?? []).map((t: TradeRow) =>
         [t.id, t.trade_id ?? "", t.side ?? "", t.setup_name ?? "", t.entry_t ?? "", t.exit_t ?? "",
          t.entry ?? "", t.exit ?? "", t.tp ?? "", t.sl ?? "", t.prob ?? "",
          t.exit_reason ?? "", t.net_pnl_rate ?? "", tradePnlUsd(t, capital).toFixed(2)].join(",")),
     ].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `helix-trades-${Date.now()}.csv`; a.click();
-    URL.revokeObjectURL(url);
+    download(csv, `helix-strategy-trades-modelled-${Date.now()}.csv`);
   }
 
   return (
-    <div className="space-y-8">
-      <div className="flex flex-wrap items-end justify-between gap-4">
+    <div className="space-y-10">
+      <div>
+        <div className="text-xs uppercase tracking-[0.2em] text-primary">History</div>
+        <h1 className="mt-2 font-display text-3xl font-semibold">Trade history</h1>
+        <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+          Three separate records, in order of what they mean to you: what{" "}
+          <strong>Binance</strong> actually charged and paid you, what the{" "}
+          <strong>executor</strong> sent to Binance, and what the{" "}
+          <strong>strategy</strong> modelled.
+        </p>
+      </div>
+
+      {/* Layer 3, and the only one that is money. First on the page for that
+          reason — the two below it describe intent and execution, this one
+          describes the result. */}
+      <RealBinanceTrades
+        rows={executed.data ?? []}
+        loading={executed.isLoading}
+        onExport={() =>
+          download(realTradesCsv(executed.data ?? []), `helix-binance-accounting-${Date.now()}.csv`)
+        }
+      />
+
+      <div className="flex flex-wrap items-end justify-between gap-4 border-t border-border pt-8">
         <div>
-          <div className="text-xs uppercase tracking-[0.2em] text-primary">History</div>
-          <h1 className="mt-2 font-display text-3xl font-semibold">Closed trades</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            What the <strong>strategy</strong> did. Real Binance orders are listed separately below.
+          <h2 className="font-display text-2xl font-semibold">
+            Strategy trades{" "}
+            <span className="align-middle text-xs uppercase tracking-widest text-muted-foreground">
+              modelled
+            </span>
+          </h2>
+          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+            What the <strong>strategy</strong> did, priced against the{" "}
+            {fmtUSD(capital)} model baseline. These are simulated returns, not your
+            Binance result.
           </p>
         </div>
-        <button onClick={exportCsv} disabled={!trades.data?.length}
-          className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary to-accent px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-50">
-          <Download className="h-4 w-4" /> Export CSV
+        <button onClick={exportStrategyCsv} disabled={!trades.data?.length}
+          className="inline-flex items-center gap-2 rounded-lg border border-border bg-card/40 px-4 py-2 text-sm font-semibold hover:bg-card/70 disabled:opacity-50">
+          <Download className="h-4 w-4" /> Export strategy CSV (modelled)
         </button>
       </div>
 
@@ -276,12 +320,188 @@ function ExchangeOrders({ rows, loading }: { rows: EngineOrderRow[]; loading: bo
   );
 }
 
-function Tile({ label, value, tone }: { label: string; value: string; tone?: "success" | "destructive" }) {
-  const color = tone === "success" ? "text-success" : tone === "destructive" ? "text-destructive" : "text-foreground";
+/** The real accounting layer: what Binance charged and paid.
+ *
+ *  The rows here are built from Binance's own fills and income records, not
+ *  from a strategy return and not from a fee percentage. Deliberately its own
+ *  table, above and apart from the strategy list, because a modelled +$120 and
+ *  a realised +$11.66 are different kinds of fact.
+ *
+ *  Net P&L is the strongest column on the page: it is the only figure that
+ *  answers "what did this trade do to my balance". Commission is always
+ *  rendered with a leading minus, because a fee is money leaving the account
+ *  even though it is stored as a positive cost.
+ */
+function RealBinanceTrades({
+  rows,
+  loading,
+  onExport,
+}: {
+  rows: ExecutedTradeRow[];
+  loading: boolean;
+  onExport: () => void;
+}) {
+  const perf = realPerformance(rows);
+  const exportable = rows.length > 0;
+
   return (
-    <div className="card-elevated p-5">
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2">
+            <Receipt className="h-4 w-4 text-primary" />
+            <h2 className="font-display text-2xl font-semibold">Real Binance completed trades</h2>
+          </div>
+          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+            Your <strong>actual</strong> result. Gross P&amp;L, commission and funding are read
+            from Binance&apos;s own fill and income records — every commission is the amount
+            Binance charged, never a fee-rate estimate.
+          </p>
+        </div>
+        <button onClick={onExport} disabled={!exportable}
+          className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-primary to-accent px-4 py-2 text-sm font-semibold text-primary-foreground disabled:opacity-50">
+          <Download className="h-4 w-4" /> Export Binance accounting CSV
+        </button>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
+        <Tile label="Real Net P&L" value={perf.trades ? fmtUSD(perf.netPnl, true) : "—"}
+          tone={perf.trades ? netTone(perf.netPnl) : undefined} strong />
+        <Tile label="Gross P&L" value={perf.trades ? fmtUSD(perf.grossPnl, true) : "—"} />
+        <Tile label="Commission" value={perf.trades ? fmtCommission(perf.commission) : "—"}
+          tone={perf.trades && perf.commission > 0 ? "destructive" : undefined} />
+        <Tile label="Funding" value={perf.trades ? fmtUSD(perf.funding, true) : "—"}
+          tone={perf.trades && perf.funding !== 0 ? netTone(perf.funding) : undefined} />
+        <Tile
+          label="Completed trades"
+          value={`${perf.trades}`}
+          sub={
+            perf.incompleteTrades
+              ? `${perf.incompleteTrades} incomplete`
+              : `${perf.wins}W / ${perf.losses}L`
+          }
+        />
+      </div>
+
+      <div className="card-elevated overflow-hidden p-0 ring-1 ring-primary/20">
+        {rows.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-card/60 text-left text-xs uppercase tracking-wider text-muted-foreground">
+                <tr>
+                  <th className="px-4 py-3">Time</th>
+                  <th className="px-4 py-3">Side</th>
+                  <th className="px-4 py-3 text-right">Qty</th>
+                  <th className="px-4 py-3 text-right">Entry</th>
+                  <th className="px-4 py-3 text-right">Exit</th>
+                  <th className="px-4 py-3 text-right">Gross P&amp;L</th>
+                  <th className="px-4 py-3 text-right">Commission</th>
+                  <th className="px-4 py-3 text-right">Funding</th>
+                  <th className="px-4 py-3 text-right">Net P&amp;L</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border font-mono text-sm">
+                {rows.map((t) => {
+                  const complete = isComplete(t);
+                  const sideUp = (t.side ?? "").toUpperCase();
+                  const net = Number(t.net_pnl_usd);
+                  // An incomplete row shows the trade and refuses the numbers.
+                  // Rendering "$0.00" for something we could not price would be
+                  // the estimate this whole layer exists to avoid.
+                  const dash = <span className="text-muted-foreground">{UNAVAILABLE}</span>;
+                  return (
+                    <tr key={t.id} className="hover:bg-card/40">
+                      <td className="px-4 py-3 text-xs text-muted-foreground">
+                        {new Date(t.exit_time).toLocaleString()}
+                        {(t.entry_fill_count > 1 || t.exit_fill_count > 1) && (
+                          <div className="text-[10px]">
+                            {t.entry_fill_count} entry / {t.exit_fill_count} exit fills
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`rounded px-2 py-0.5 text-xs ${sideUp === "LONG" ? "bg-success/15 text-success" : "bg-destructive/15 text-destructive"}`}>
+                          {sideUp || "—"}
+                        </span>
+                        {/* Helix opened this position; if it did not close it,
+                            the client needs to see that — the money is the same
+                            either way, but the story of the trade is not. */}
+                        {closeSourceLabel(t.close_source) && (
+                          <div className="mt-1 text-[10px] text-warning">
+                            {closeSourceLabel(t.close_source)}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-right">{t.qty ?? "—"}</td>
+                      <td className="px-4 py-3 text-right">
+                        {t.entry_avg_price != null ? `$${Number(t.entry_avg_price).toFixed(2)}` : "—"}
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        {t.exit_avg_price != null ? `$${Number(t.exit_avg_price).toFixed(2)}` : "—"}
+                      </td>
+                      <td className="px-4 py-3 text-right text-muted-foreground">
+                        {complete ? fmtUSD(Number(t.gross_pnl_usd), true) : dash}
+                      </td>
+                      <td className="px-4 py-3 text-right text-destructive">
+                        {complete ? fmtCommission(Number(t.commission_usd)) : dash}
+                      </td>
+                      <td className="px-4 py-3 text-right text-muted-foreground">
+                        {complete ? fmtUSD(Number(t.funding_usd), true) : dash}
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        {complete ? (
+                          <span
+                            className={`font-semibold ${net >= 0 ? "text-success" : "text-destructive"}`}
+                          >
+                            {fmtUSD(net, true)}
+                          </span>
+                        ) : (
+                          <span className="text-xs text-warning" title={t.incomplete_reason ?? ""}>
+                            {incompleteLabel(t.incomplete_reason)}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-3 p-10 text-center">
+            <Inbox className="h-6 w-6 text-muted-foreground" />
+            <div className="text-sm font-medium">
+              {loading ? "Loading Binance accounting…" : "No completed Binance trades yet"}
+            </div>
+            <p className="max-w-md text-xs text-muted-foreground">
+              A trade appears here once a position has opened and closed on your Binance
+              account and the accounting sync has read its fills. Until then nothing is
+              shown — an empty result is never rendered as a zero.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Tile({
+  label, value, tone, sub, strong,
+}: {
+  label: string;
+  value: string;
+  tone?: "success" | "destructive" | "muted";
+  sub?: string;
+  strong?: boolean;
+}) {
+  const color = tone === "success" ? "text-success" : tone === "destructive" ? "text-destructive" : tone === "muted" ? "text-muted-foreground" : "text-foreground";
+  return (
+    <div className={`card-elevated p-5 ${strong ? "ring-1 ring-primary/25" : ""}`}>
       <div className="text-xs uppercase tracking-widest text-muted-foreground">{label}</div>
-      <div className={`mt-2 font-mono text-2xl font-semibold ${color}`}>{value}</div>
+      <div className={`mt-2 font-mono font-semibold ${strong ? "text-3xl" : "text-2xl"} ${color}`}>
+        {value}
+      </div>
+      {sub && <div className="mt-1 text-xs text-muted-foreground">{sub}</div>}
     </div>
   );
 }

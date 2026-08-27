@@ -11,6 +11,7 @@ import {
   Cpu,
   Inbox,
   Wallet,
+  Receipt,
 } from "lucide-react";
 import { Sparkline } from "@/components/Sparkline";
 
@@ -42,6 +43,14 @@ import {
   useExecutorStatus, executionModeLabel, executorFresh, executorTone, canPlaceOrders,
   resolveWalletDisplay,
 } from "@/lib/executor";
+import {
+  useExecutedTrades,
+  useAccountingRealtime,
+  realPerformance,
+  realTotalsForDay,
+  fmtCommission,
+  netTone,
+} from "@/lib/accounting";
 import { keysConnected, useBinanceKeyInfo } from "@/lib/binance-keys";
 import { EXECUTOR_LINK_LABEL, resolveExecutorLink } from "@/lib/executor-link";
 import { useLivePrice } from "@/lib/live-price";
@@ -96,9 +105,17 @@ function Dashboard() {
   });
 
   const today = new Date().toDateString();
+  // MODELLED. net_pnl_rate x capital_usd — the strategy's simulated result.
   const todayPnl = (trades.data ?? [])
     .filter((t) => t.exit_t && new Date(t.exit_t).toDateString() === today)
     .reduce((a, t) => a + tradePnlUsd(t, capital), 0);
+
+  // REAL. Binance's own realised P&L, per-fill commission and funding, read
+  // from executed_trades. Never mixed into the modelled figures above.
+  const executed = useExecutedTrades(500);
+  useAccountingRealtime();
+  const realAll = realPerformance(executed.data ?? []);
+  const todayReal = realTotalsForDay(executed.data ?? []);
 
   // Map trade_id → related open/closed records for status derivation.
   const openByTid = new Map((opens.data ?? []).map((p) => [p.trade_id, p]));
@@ -293,57 +310,127 @@ function Dashboard() {
         </div>
       )}
 
-      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-        {/* Wallet, not "Equity". This tile used to render capital_usd plus
-            strategy P&L under the label "Equity" — for a new user, the 10,000
-            default of a config column presented as money in their account.
-            A number appears here only when it came from a signed read of their
-            own Binance wallet. */}
-        <BigStat
-          label="Wallet balance"
-          value={
-            wallet.state === "connected" ? fmtUSD(wallet.walletUsd) :
-            wallet.state === "awaiting_read" ? "—" :
-            "Not connected"
-          }
-          // The sub-label is the same sentence Configure and the Engine page
-          // use for this state, so the three pages cannot drift apart.
-          delta={
-            wallet.state === "connected" && wallet.stale
-              ? `${EXECUTOR_LINK_LABEL[link]} · reading is stale`
-              : EXECUTOR_LINK_LABEL[link]
-          }
-          up={wallet.state === "connected" && !wallet.stale}
-          muted={wallet.state !== "connected"}
-          icon={<Wallet className="h-4 w-4" />}
-        />
-        <BigStat
-          label="Today P&L"
-          value={fmtUSD(todayPnl, true)}
-          delta="strategy · closed today"
-          up={todayPnl >= 0}
-          icon={
-            todayPnl >= 0 ? (
-              <ArrowUpRight className="h-4 w-4" />
-            ) : (
-              <ArrowDownRight className="h-4 w-4" />
-            )
-          }
-        />
-        <BigStat
-          label="Win rate"
-          value={metrics.totalTrades ? `${metrics.winRate.toFixed(1)}%` : "—"}
-          delta={`${metrics.totalTrades} trades`}
-          up={metrics.winRate >= 50}
-          icon={<Activity className="h-4 w-4" />}
-        />
-        <BigStat
-          label="Max drawdown"
-          value={metrics.totalTrades ? fmtPct(metrics.maxDrawdown) : "—"}
-          delta={`PF ${Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : "∞"}`}
-          icon={<ArrowDownRight className="h-4 w-4" />}
-          muted
-        />
+      {/* ============================ REAL MONEY ============================
+          Everything in this block came from the client's own Binance account:
+          a signed wallet read, or `executed_trades` rows built from Binance
+          fills and income records. No figure here is scaled from capital_usd
+          and none is derived from a fee percentage. */}
+      <div>
+        <div className="mb-3 flex items-center gap-2">
+          <Wallet className="h-4 w-4 text-primary" />
+          <h2 className="text-xs font-semibold uppercase tracking-[0.2em] text-primary">
+            Your money · real Binance
+          </h2>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+          {/* Wallet, not "Equity". This tile used to render capital_usd plus
+              strategy P&L under the label "Equity" — for a new user, the 10,000
+              default of a config column presented as money in their account.
+              A number appears here only when it came from a signed read of their
+              own Binance wallet. */}
+          <BigStat
+            label="Wallet balance"
+            value={
+              wallet.state === "connected" ? fmtUSD(wallet.walletUsd) :
+              wallet.state === "awaiting_read" ? "—" :
+              "Not connected"
+            }
+            // The sub-label is the same sentence Configure and the Engine page
+            // use for this state, so the three pages cannot drift apart.
+            delta={
+              wallet.state === "connected" && wallet.stale
+                ? `${EXECUTOR_LINK_LABEL[link]} · reading is stale`
+                : EXECUTOR_LINK_LABEL[link]
+            }
+            up={wallet.state === "connected" && !wallet.stale}
+            muted={wallet.state !== "connected"}
+            icon={<Wallet className="h-4 w-4" />}
+          />
+          <BigStat
+            label="Today Net P&L"
+            value={todayReal.trades ? fmtUSD(todayReal.netPnl, true) : "—"}
+            delta={
+              todayReal.trades
+                ? "Real Binance · after commission"
+                : "Real Binance · no trades closed today"
+            }
+            tone={todayReal.trades ? netTone(todayReal.netPnl) : "muted"}
+            strong
+            icon={
+              todayReal.netPnl >= 0 ? (
+                <ArrowUpRight className="h-4 w-4" />
+              ) : (
+                <ArrowDownRight className="h-4 w-4" />
+              )
+            }
+          />
+          <BigStat
+            label="Today Commission"
+            // fmtCommission renders the stored positive cost with a minus sign,
+            // so a fee never reads as something the client received.
+            value={todayReal.trades ? fmtCommission(todayReal.commission) : "—"}
+            delta={todayReal.trades ? "Actual Binance fees" : "Actual Binance fees · none today"}
+            tone={todayReal.trades && todayReal.commission > 0 ? "destructive" : "muted"}
+            strong
+            icon={<Receipt className="h-4 w-4" />}
+          />
+          <BigStat
+            label="Real trades today"
+            value={`${todayReal.trades}`}
+            delta={
+              todayReal.incompleteTrades
+                ? `${todayReal.incompleteTrades} awaiting exact accounting`
+                : `${realAll.trades} completed all-time`
+            }
+            tone={todayReal.incompleteTrades ? "destructive" : "muted"}
+            icon={<Activity className="h-4 w-4" />}
+          />
+        </div>
+      </div>
+
+      {/* ========================= MODELLED STRATEGY =========================
+          Separated from the block above by more than a heading, because these
+          are not the client's money. Every USD figure below is the strategy's
+          fractional return multiplied by the capital_usd config column. */}
+      <div className="rounded-xl border border-dashed border-border/70 p-4">
+        <div className="mb-3 flex items-center gap-2">
+          <Cpu className="h-4 w-4 text-muted-foreground" />
+          <h2 className="text-xs font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+            Strategy · modelled
+          </h2>
+          <span className="text-[11px] text-muted-foreground">
+            simulated on a {fmtUSD(capital)} baseline — not your Binance result
+          </span>
+        </div>
+        <div className="grid gap-4 md:grid-cols-3">
+          <BigStat
+            label="Strategy P&L (modelled)"
+            value={fmtUSD(todayPnl, true)}
+            delta="modelled · strategy closed today"
+            up={todayPnl >= 0}
+            icon={
+              todayPnl >= 0 ? (
+                <ArrowUpRight className="h-4 w-4" />
+              ) : (
+                <ArrowDownRight className="h-4 w-4" />
+              )
+            }
+          />
+          <BigStat
+            label="Win rate (modelled)"
+            value={metrics.totalTrades ? `${metrics.winRate.toFixed(1)}%` : "—"}
+            delta={`${metrics.totalTrades} strategy trades`}
+            up={metrics.winRate >= 50}
+            icon={<Activity className="h-4 w-4" />}
+          />
+          <BigStat
+            label="Max drawdown (modelled)"
+            value={metrics.totalTrades ? fmtPct(metrics.maxDrawdown) : "—"}
+            delta={`PF ${Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : "∞"}`}
+            icon={<ArrowDownRight className="h-4 w-4" />}
+            muted
+          />
+        </div>
       </div>
 
       <div className="grid gap-6 lg:grid-cols-3">
@@ -519,23 +606,35 @@ function Dashboard() {
         </div>
       </div>
 
-      <div className="card-elevated p-6">
-        <div className="font-display text-lg font-semibold">Performance</div>
+      {/* Every figure in this card is metrics.* — the strategy's fractional
+          returns scaled by capital_usd. It sat under the bare label
+          "Performance" with a "Net P&L" row, which on a trading dashboard reads
+          as the client's money. The real equivalent is on the Reports page,
+          under Real Binance performance, computed from executed_trades. */}
+      <div className="card-elevated border-dashed p-6">
+        <div className="flex flex-wrap items-baseline gap-2">
+          <div className="font-display text-lg font-semibold">Strategy performance</div>
+          <span className="text-xs uppercase tracking-widest text-muted-foreground">modelled</span>
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Simulated on the {fmtUSD(capital)} strategy baseline. For your actual Binance result
+          after commission, see <Link to="/app/reports" className="text-primary hover:underline">Reports</Link>.
+        </p>
         {metrics.totalTrades > 0 ? (
           <div className="mt-4 grid gap-3 md:grid-cols-2 lg:grid-cols-4">
-            <Stat label="Win rate" value={`${metrics.winRate.toFixed(1)}%`} bar={metrics.winRate} />
+            <Stat label="Win rate (modelled)" value={`${metrics.winRate.toFixed(1)}%`} bar={metrics.winRate} />
             <Stat
-              label="Profit factor"
+              label="Profit factor (modelled)"
               value={Number.isFinite(metrics.profitFactor) ? metrics.profitFactor.toFixed(2) : "∞"}
               bar={Math.min(100, metrics.profitFactor * 30)}
             />
             <Stat
-              label="Net P&L"
+              label="Net P&L (modelled)"
               value={fmtUSD(metrics.netPnl, true)}
               bar={Math.min(100, Math.abs(metrics.netPnl / capital) * 100)}
             />
             <Stat
-              label="Max drawdown"
+              label="Max drawdown (modelled)"
               value={fmtPct(metrics.maxDrawdown)}
               bar={Math.min(100, Math.abs(metrics.maxDrawdown) * 5)}
               tone="warn"
@@ -654,6 +753,12 @@ function CurrentSignalCard({
   );
 }
 
+/**
+ * `tone` states the colour outright; `up`/`muted` remain for the tiles that
+ * derive it from a comparison. `strong` is for the real-money headline figures,
+ * which are the largest and the only ones whose VALUE carries the colour — a
+ * client scanning the page should land on their actual net result first.
+ */
 function BigStat({
   label,
   value,
@@ -661,6 +766,8 @@ function BigStat({
   up,
   icon,
   muted,
+  tone,
+  strong,
 }: {
   label: string;
   value: string;
@@ -668,23 +775,28 @@ function BigStat({
   up?: boolean;
   icon: React.ReactNode;
   muted?: boolean;
+  tone?: "success" | "destructive" | "muted";
+  strong?: boolean;
 }) {
+  const resolved = tone ?? (muted ? "muted" : up ? "success" : "destructive");
+  const color =
+    resolved === "success"
+      ? "text-success"
+      : resolved === "destructive"
+        ? "text-destructive"
+        : "text-muted-foreground";
   return (
-    <div className="card-elevated p-5">
+    <div className={`card-elevated p-5 ${strong ? "ring-1 ring-primary/25" : ""}`}>
       <div className="flex items-center justify-between text-xs uppercase tracking-widest text-muted-foreground">
         <span>{label}</span>
-        <span
-          className={muted ? "text-muted-foreground" : up ? "text-success" : "text-destructive"}
-        >
-          {icon}
-        </span>
+        <span className={color}>{icon}</span>
       </div>
-      <div className="mt-2 font-mono text-2xl font-semibold">{value}</div>
       <div
-        className={`mt-1 text-xs ${muted ? "text-muted-foreground" : up ? "text-success" : "text-destructive"}`}
+        className={`mt-2 font-mono font-semibold ${strong ? `text-3xl ${color}` : "text-2xl"}`}
       >
-        {delta}
+        {value}
       </div>
+      <div className={`mt-1 text-xs ${color}`}>{delta}</div>
     </div>
   );
 }
