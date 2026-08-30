@@ -32,15 +32,62 @@ auto-execute at all:
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+import signal_consumer
 from risk_guard import RiskGuard
 from user_session import HostLimits, UserSession
 
 SYMBOL = "ETHUSDT"
 USER = "aaaaaaaa-1111-1111-1111-111111111111"
-BAR = "2026-08-24T00:00:00Z"
+
+# A real completed 15m signal bar, on the 15m grid. The consumer suppresses an
+# OPEN once the clock leaves the signal's INTENDED ENTRY BAR — the bar after the
+# signal bar — so these gate tests only mean what they say while "now" sits
+# inside [BAR+15m, BAR+30m).
+#
+# Both ends are therefore fixed. A wall-clock "now" made this module's control
+# test pass or fail depending on the minute it was run in: a real clock can
+# cross BAR+30m midway through the suite. Freezing the clock the consumer sees
+# removes that dependency without touching production code.
+BAR_DT = datetime(2026, 8, 30, 11, 30, tzinfo=timezone.utc)
+BAR = BAR_DT.replace(tzinfo=None).isoformat() + "Z"
+
+# Five minutes into the entry bar [11:45, 12:00): unambiguously fresh, and far
+# from either edge, so no rounding or ordering can drift it across a boundary.
+FROZEN_NOW = BAR_DT + timedelta(minutes=20)
+
+
+class _FrozenDatetime(datetime):
+    """datetime with only now() pinned.
+
+    Everything else — fromisoformat, arithmetic, isinstance — is inherited
+    unchanged, so the freshness rule is still genuinely evaluated against BAR.
+    Nothing here stubs open_is_fresh or bypasses the stale-open logic: shift
+    FROZEN_NOW past BAR+30m and these tests fail, which is the point.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        frozen = FROZEN_NOW if tz is not None else FROZEN_NOW.replace(tzinfo=None)
+        return cls(
+            frozen.year,
+            frozen.month,
+            frozen.day,
+            frozen.hour,
+            frozen.minute,
+            frozen.second,
+            frozen.microsecond,
+            frozen.tzinfo,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _frozen_consumer_clock(monkeypatch):
+    """Pin only the clock signal_consumer reads. Scoped to this module."""
+    monkeypatch.setattr(signal_consumer, "datetime", _FrozenDatetime)
 
 # A client mid-trade: 0.5 ETH long, opened before the maintenance window.
 OPEN_POSITION_AMT = "0.5"

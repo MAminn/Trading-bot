@@ -23,7 +23,7 @@ from decimal import ROUND_DOWN, Decimal
 import requests
 
 from binance_client import BinanceAPIError, BinanceFuturesClient
-from reconciler import Reconciler, ReconcilerError
+from reconciler import FLAT_EPSILON, Reconciler, ReconcilerError
 
 log = logging.getLogger("executor.consumer")
 
@@ -52,6 +52,48 @@ def is_accepted_open_signal(signal: dict) -> bool:
     if expected is None:
         return False
     return signal.get("rule_side") == expected
+
+
+# Freshness bound for an OPEN, derived from the engine's execution contract
+# rather than chosen: the signal is computed on the closed bar [T, T+15m) and its
+# intended entry is the NEXT 15m open, so the entry bar is [T+15m, T+30m). Once
+# the clock reaches T+30m that bar has closed and the price the model was
+# evaluated against is no longer reachable.
+#
+# This is an OPERATIONAL SAFETY BOUNDARY, not backtest-price parity: a signal
+# delivered at T+16m still fills at the T+16m market price, never the historical
+# next-bar open. It bounds how far reality may drift from the modelled entry.
+#
+# A CLOSE is never age-gated. The executor places only MARKET orders, so a
+# position's sole exit is the engine's close signal; an old CLOSE is more urgent,
+# never less.
+BAR_SECONDS = 900
+MAX_OPEN_AGE_SECONDS = 2 * BAR_SECONDS
+
+
+def open_is_fresh(signal: dict, now_utc: datetime | None = None) -> bool:
+    """True while the clock is still inside the signal's intended entry bar.
+
+    Ages on bar_time, never created_at: created_at is the row's insert time, so a
+    signal redelivered by the engine bridge's durable outbox arrives with a fresh
+    created_at while its bar_time is unchanged. Only bar_time is truthful.
+
+    Fails safe — an absent or unparseable bar_time is treated as stale, because
+    opening on a signal whose age cannot be established is the dangerous
+    direction.
+    """
+    raw = signal.get("bar_time")
+    if raw is None:
+        return False
+    try:
+        bar = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if bar.tzinfo is None:
+        bar = bar.replace(tzinfo=timezone.utc)
+    now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+    return (now - bar).total_seconds() < MAX_OPEN_AGE_SECONDS
+
 
 # After placing an order, poll the position until Binance reflects the fill so a
 # same-cycle follow-up (e.g. a CLOSE after an OPEN) sizes against the real state.
@@ -135,6 +177,10 @@ class SignalConsumer:
         # None in TESTNET_READ/OFF keeps those paths free of any write calls.
         self._binance_trader = binance_trader
         self._last_order_time: float | None = None
+        # Set by _process_intent from the app's 409 response: True when the
+        # intent's idempotency key was already recorded, i.e. this signal is
+        # being replayed after a previously completed transition.
+        self._last_intent_duplicate: bool = False
         # Last successful reconcile, for telemetry only. Never read by any
         # decision path; a stale or absent value cannot affect placement.
         self.last_reconcile: dict | None = None
@@ -968,35 +1014,98 @@ class SignalConsumer:
         # so a later signal (e.g. a CLOSE after an OPEN) must size against the
         # settled value, not the stale cycle-start read.
         current_amt = position_amt
+        trade_capable = self._binance_trader is not None
         for signal in signals:
-            # A signal may carry both a close (closed_reason + position_after
-            # FLAT) and an entry (rule_side +/-1) — e.g. a reversal. Process the
-            # CLOSE first, then the OPEN, as independent intents each with its
-            # own idempotency key and guard evaluation.
-            if (
+            # A signal may carry both a close and an entry on the SAME bar: the
+            # engine closes a position and opens the next one from one decision
+            # (154 of the 2922 historical trades, 85 of them side reversals).
+            #
+            # The close is identified by position_before, NOT by
+            # position_after == "FLAT". On a close+open bar position_after is the
+            # NEW side, so keying on FLAT silently skipped the close half and
+            # left a real position open with no exit.
+            #
+            # Process the CLOSE first, then the OPEN, as independent intents each
+            # with its own idempotency key and guard evaluation.
+            close_required = (
                 signal.get("closed_reason") is not None
-                and signal.get("position_after") == "FLAT"
-            ):
-                close_order = self._build_close_intent(signal, ref_price, current_amt)
-                if close_order is None:
-                    log.warning(
-                        "CLOSE signal with unusable position_before=%r, skipping | "
-                        "bar_time=%s",
+                and signal.get("position_before") in ("LONG", "SHORT")
+            )
+            close_satisfied = True
+
+            if close_required:
+                if abs(float(current_amt or 0)) < FLAT_EPSILON:
+                    # Already flat: either the CLOSE executed before a crash and
+                    # this is a replay, or this account never held the position.
+                    # Nothing to reduce, and building an intent here would post a
+                    # malformed qty=0 CLOSE.
+                    log.info(
+                        "CLOSE already satisfied (position flat) | "
+                        "position_before=%s | bar_time=%s",
                         signal.get("position_before"),
                         signal.get("bar_time"),
                     )
                 else:
-                    current_amt = self._process_intent(
-                        close_order, current_amt, opens_blocked, block_reason
+                    close_order = self._build_close_intent(
+                        signal, ref_price, current_amt
                     )
+                    if close_order is None:
+                        log.warning(
+                            "CLOSE signal with unusable position_before=%r, skipping | "
+                            "bar_time=%s",
+                            signal.get("position_before"),
+                            signal.get("bar_time"),
+                        )
+                        close_satisfied = False
+                    else:
+                        current_amt = self._process_intent(
+                            close_order, current_amt, opens_blocked, block_reason
+                        )
+                        # A duplicate idempotency key means this exact CLOSE was
+                        # recorded in an earlier run, so the transition is being
+                        # replayed and the live position is the REPLACEMENT one.
+                        # Reading that as an unflattened close would emit a false
+                        # suppression error; the OPEN below is stopped from
+                        # repeating by its own idempotency key, not by this flag.
+                        #
+                        # A read-only mode places nothing, so its position can
+                        # never flatten. Treating the close as satisfied there
+                        # keeps dry-run intent logging exactly as it was.
+                        close_satisfied = (
+                            not trade_capable
+                            or abs(float(current_amt or 0)) < FLAT_EPSILON
+                            or self._last_intent_duplicate
+                        )
 
             if is_accepted_open_signal(signal):
-                current_amt = self._process_intent(
-                    self._build_intent(signal, ref_price),
-                    current_amt,
-                    opens_blocked,
-                    block_reason,
-                )
+                if not close_satisfied:
+                    # Explicit, rather than leaving it to the risk guard's
+                    # generic "position already open" rejection: that guard
+                    # exists for a different purpose and its message would
+                    # misdescribe what happened here.
+                    log.error(
+                        "OPEN SUPPRESSED | required CLOSE did not flatten the "
+                        "position (amt=%s) | bar_time=%s",
+                        current_amt,
+                        signal.get("bar_time"),
+                    )
+                else:
+                    stale_open = not open_is_fresh(signal)
+                    if stale_open:
+                        log.warning(
+                            "OPEN STALE | intended entry bar has elapsed "
+                            "(bar_time=%s) | recording SKIPPED, placing nothing",
+                            signal.get("bar_time"),
+                        )
+                    # Routed through the existing opens-blocked path so the
+                    # intent is still recorded SKIPPED with a reason and never
+                    # placed — no second execution mechanism.
+                    current_amt = self._process_intent(
+                        self._build_intent(signal, ref_price),
+                        current_amt,
+                        opens_blocked or stale_open,
+                        block_reason if opens_blocked else "stale: entry bar elapsed",
+                    )
             elif signal.get("rule_side") in (1, -1):
                 log.info(
                     "NO OPEN | rule_side=%r not an accepted open "
@@ -1055,6 +1164,7 @@ class SignalConsumer:
             order["idempotency_key"],
         )
         created = self._post_order(order)
+        self._last_intent_duplicate = not created
         if created and order["status"] == "INTENT_LOGGED":
             # Feed the guard's min-interval check from allowed OPEN intents only;
             # a CLOSE must never block the OPEN half of a same-cycle reversal.

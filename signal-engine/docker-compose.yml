@@ -1,0 +1,55 @@
+services:
+  # The canonical ETHUSDT 15m signal/model engine.
+  #
+  # Deliberately NOT named v22-engine: that name belongs to the previous
+  # generation in worker/, which stays on disk as rollback and must never run
+  # at the same time as this service. Both write signals to the same API, and
+  # two engines posting for the same bar is a correctness problem, not just a
+  # duplicate.
+  #
+  # Opt-in start, following the same pattern executor/docker-compose.yml uses
+  # for the accounting service: a bare `docker compose up -d` in this directory
+  # starts NOTHING. Bringing the engine up is explicit:
+  #
+  #     docker compose --profile engine up -d
+  #
+  # This exists because this engine posts to the production signal API the
+  # moment it completes a live bar. Remove the profile at cutover if you want
+  # ordinary compose semantics back.
+  signal-engine:
+    build: .
+    container_name: signal-engine
+    restart: unless-stopped
+    profiles: ["engine"]
+    env_file: .env
+    environment:
+      ENGINE_BASE_DIR: /app/runtime
+      OUTBOX_DB_PATH: /app/outbox/outbox.db
+    volumes:
+      # ARTIFACTS + ENGINE-WRITTEN DATA.
+      #
+      # Host-mounted rather than a named volume so the read-only artifacts can be
+      # staged, hashed and rotated with ordinary file tools instead of through an
+      # opaque /var/lib/docker/volumes path. Covers, in one mount:
+      #   read-only : the four historical enriched CSVs (at this level — find_csv
+      #               globs BASE_DIR itself), eth_feature_shortlist_outputs/, the
+      #               10 frozen artifacts and v22_live_engine_export/run_*/
+      #   writable  : model files/runtime_cache/          (RealAgg 1m cache; without
+      #                 persistence, four days of aggTrades zips re-download on
+      #                 every restart)
+      #               model files/shadow_live_v22_candidate_match_audit/
+      #                 (the five audit files, including shadow_live_state.json —
+      #                  the ground truth outbox recovery compares against)
+      #
+      # initialize_clean_audit_files() RAISES on any unexpected file in the audit
+      # directory, so nothing else may be written there.
+      - /opt/trading-bot/signal-engine/runtime:/app/runtime
+
+      # DURABLE INTEGRATION STATE — a DIRECTORY mount, never a single file.
+      #
+      # SQLite runs in WAL mode and needs outbox.db, outbox.db-wal and
+      # outbox.db-shm side by side; a file-level bind would break WAL. Kept
+      # separate from the artifact tree on purpose: an artifact deployment that
+      # ever ran with --delete against runtime/ must not be able to erase
+      # undelivered CLOSE signals.
+      - /opt/trading-bot/signal-engine/state:/app/outbox
